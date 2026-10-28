@@ -1,0 +1,1228 @@
+"""
+Unit tests for ai.modules.task.task_server.TaskServer.
+
+TaskServer is the central orchestrator. Its ``__init__`` spawns two
+background asyncio tasks (``_cleanup_tasks`` and ``_monitor_ttl``) and
+binds to a WebServer instance, so real construction touches a lot of
+machinery. Tests therefore bypass ``__init__`` via ``__new__`` and seed
+just the attributes the method under test consults.
+
+Focus areas:
+
+- ``release_unauthed_slot`` — IP rate-limit slot accounting
+- ``_next_connection_id`` — monotonic id generator
+- ``assign_port`` / ``release_port`` — managed port pool
+- ``get_task_control`` / ``get_task_control_by_public_key`` / ``get_task``
+- ``_dapbase_on_connected`` / ``_dapbase_on_disconnected``
+- ``broadcast_server_event`` / ``broadcast_task_event`` — error tolerance
+- ``store`` property — lazy initialization
+"""
+
+from __future__ import annotations
+
+import errno
+import socket
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from ai.modules.task import task_server as task_server_module
+from ai.modules.task.task_server import TaskServer
+from ai.modules.task.types import TaskError
+
+
+def _make_server(*, config=None, web_server=None):
+    """
+    Build a TaskServer with ``__init__`` bypassed.
+
+    Tests seed the attributes the method under test actually reads. Background
+    tasks are not started (no asyncio.create_task call), so there is nothing
+    to cancel at teardown.
+
+    Args:
+        config: optional config dict the server should expose as ``_config``.
+        web_server: optional parent WebServer stand-in (sets ``_server``).
+
+    Returns:
+        TaskServer: a test-ready instance.
+    """
+    ts = TaskServer.__new__(TaskServer)
+    ts._task_control = {}
+    ts._connections = {}
+    ts._connection_id = 0
+    ts._unauthed_by_ip = {}
+    ts._allocated_ports = []
+    ts._reserved_ports = set()
+    ts._store_instance = None
+    ts._config = config if config is not None else {}
+    ts._server = web_server or MagicMock()
+    ts.debug_message = MagicMock()
+    return ts
+
+
+def _make_control(*, token='tk_1', user_id='user-1', team_id='team-1', public_auth=None, task=None):
+    """
+    Build a TASK_CONTROL-shaped stand-in carrying the attributes
+    TaskServer.get_task_control / get_task / get_task_control_by_public_key
+    read.
+
+    Args:
+        token: task token (lookup key in ``_task_control``).
+        user_id: owner user id (used by cross-tenant checks).
+        team_id: owning team id (used by permission resolution).
+        public_auth: pk_-style public auth key, if any.
+        task: the underlying Task stand-in (defaults to a MagicMock).
+
+    Returns:
+        SimpleNamespace: control structure stand-in.
+    """
+    return SimpleNamespace(
+        id='task-name',
+        token=token,
+        userId=user_id,
+        teamId=team_id,
+        public_auth=public_auth,
+        task=task or MagicMock(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# release_unauthed_slot
+# ---------------------------------------------------------------------------
+
+
+def test_release_unauthed_slot_decrements_count():
+    """A non-final release reduces the per-IP count by 1."""
+    ts = _make_server()
+    ts._unauthed_by_ip = {'1.2.3.4': 3}
+    ts.release_unauthed_slot('1.2.3.4')
+    assert ts._unauthed_by_ip['1.2.3.4'] == 2
+
+
+def test_release_unauthed_slot_removes_entry_at_one():
+    """When the count is 1, the entry is removed entirely (no zero-valued keys)."""
+    ts = _make_server()
+    ts._unauthed_by_ip = {'1.2.3.4': 1}
+    ts.release_unauthed_slot('1.2.3.4')
+    assert '1.2.3.4' not in ts._unauthed_by_ip
+
+
+def test_release_unauthed_slot_handles_missing_ip():
+    """Releasing an IP that was never tracked is a no-op (no KeyError)."""
+    ts = _make_server()
+    ts.release_unauthed_slot('5.6.7.8')  # must not raise
+    assert ts._unauthed_by_ip == {}
+
+
+def test_release_unauthed_slot_ignores_empty_ip():
+    """Empty-string IP is a no-op (defensive guard)."""
+    ts = _make_server()
+    ts._unauthed_by_ip = {'1.2.3.4': 2}
+    ts.release_unauthed_slot('')
+    assert ts._unauthed_by_ip == {'1.2.3.4': 2}
+
+
+# ---------------------------------------------------------------------------
+# _next_connection_id
+# ---------------------------------------------------------------------------
+
+
+def test_next_connection_id_starts_at_one_and_monotonic():
+    """First call returns 1; subsequent calls strictly increase."""
+    ts = _make_server()
+    assert ts._next_connection_id() == 1
+    assert ts._next_connection_id() == 2
+    assert ts._next_connection_id() == 3
+
+
+# ---------------------------------------------------------------------------
+# assign_port / release_port
+# ---------------------------------------------------------------------------
+
+
+def _patch_probe(monkeypatch, probe):
+    """
+    Install a stand-in for the port probe.
+
+    _probe_port is a staticmethod, so a bare function assigned to the class
+    would be bound and receive self; the wrapping lives here rather than in
+    every test.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): fixture performing the swap.
+        probe (Callable[[int], Optional[int]]): verdict for a given port.
+
+    Returns:
+        None
+    """
+    monkeypatch.setattr(TaskServer, '_probe_port', staticmethod(probe))
+
+
+@pytest.fixture
+def all_ports_bindable(monkeypatch):
+    """
+    Report every port as bindable.
+
+    Keeps the pool-bookkeeping tests independent of whatever the host machine
+    happens to have bound or reserved — on a developer box the default 20000 is
+    routinely held by another engine.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): fixture used to swap the probe.
+
+    Returns:
+        None
+    """
+    _patch_probe(monkeypatch, lambda port: None)
+
+
+def _probe_returning(**by_port):
+    """
+    Build a probe stub with a per-port verdict.
+
+    Args:
+        **by_port: mapping of ``p<port>`` to the errno that port should report;
+            any port not named is reported bindable.
+
+    Returns:
+        Callable[[int], Optional[int]]: stand-in for ``_probe_port``.
+    """
+    table = {int(k[1:]): v for k, v in by_port.items()}
+    return lambda port: table.get(port)
+
+
+def test_assign_port_uses_default_base_port(all_ports_bindable):
+    """Without a configured base_port, allocation starts at 20000."""
+    ts = _make_server()
+    assert ts.assign_port() == 20000
+    assert ts._allocated_ports == [20000]
+
+
+def test_assign_port_respects_configured_base_port(all_ports_bindable):
+    """`_config['base_port']` overrides the default starting port."""
+    ts = _make_server(config={'base_port': 30000})
+    assert ts.assign_port() == 30000
+
+
+def test_assign_port_returns_next_free_in_range(all_ports_bindable):
+    """Allocations skip already-taken ports and return the next free one."""
+    ts = _make_server()
+    ts._allocated_ports = [20000, 20001, 20002]
+    assert ts.assign_port() == 20003
+
+
+def test_release_port_frees_allocated_port():
+    """release_port removes the entry from `_allocated_ports`."""
+    ts = _make_server()
+    ts._allocated_ports = [20000, 20001]
+    ts.release_port(20000)
+    assert ts._allocated_ports == [20001]
+
+
+def test_release_port_unknown_is_noop():
+    """Releasing a port that was never allocated is a no-op."""
+    ts = _make_server()
+    ts._allocated_ports = [20000]
+    ts.release_port(99999)  # must not raise
+    assert ts._allocated_ports == [20000]
+
+
+def test_assign_port_exhausts_after_10000(all_ports_bindable):
+    """When every port in the 10000-wide window is taken, allocation raises."""
+    ts = _make_server()
+    ts._allocated_ports = list(range(20000, 30000))
+    with pytest.raises(RuntimeError, match='No available ports'):
+        ts.assign_port()
+
+
+def test_assign_port_skips_unbindable_port(monkeypatch):
+    """A port the probe rejects is passed over for the next one."""
+    _patch_probe(monkeypatch, _probe_returning(p20000=errno.EADDRINUSE))
+    ts = _make_server()
+    assert ts.assign_port() == 20001
+    assert ts._allocated_ports == [20001]
+
+
+def test_assign_port_reprobes_ports_in_use(monkeypatch):
+    """An occupied port is probed again next time, because its owner can exit."""
+    probed = []
+
+    def _probe(port):
+        probed.append(port)
+        return errno.EADDRINUSE if port == 20000 else None
+
+    _patch_probe(monkeypatch, _probe)
+    ts = _make_server()
+    ts.assign_port()
+    ts.assign_port()
+    assert probed.count(20000) == 2
+    assert ts._reserved_ports == set()
+
+
+def test_assign_port_does_not_hand_back_a_released_but_still_held_port(monkeypatch):
+    """A released port whose old owner still holds the socket is skipped.
+
+    Teardown returns ports to the pool without waiting for the child to exit,
+    so the next allocation would otherwise be handed a port that is still bound.
+    """
+    _patch_probe(monkeypatch, _probe_returning(p20000=errno.EADDRINUSE))
+    ts = _make_server()
+    ts._allocated_ports = [20000]
+    ts.release_port(20000)
+    assert ts.assign_port() == 20001
+
+
+def test_assign_port_caches_system_reserved_ports(monkeypatch):
+    """An EACCES port is remembered and never probed a second time."""
+    probed = []
+
+    def _probe(port):
+        probed.append(port)
+        return errno.EACCES if port == 20000 else None
+
+    _patch_probe(monkeypatch, _probe)
+    ts = _make_server()
+    assert ts.assign_port() == 20001
+    assert ts.assign_port() == 20002
+    assert probed.count(20000) == 1
+    assert ts._reserved_ports == {20000}
+
+
+def test_assign_port_exhausted_blames_system_reservations(monkeypatch):
+    """When every candidate is forbidden, the message names the OS reservation."""
+    _patch_probe(monkeypatch, lambda port: errno.EACCES)
+    ts = _make_server(config={'base_port': 30000})
+    with pytest.raises(RuntimeError, match='reserved by the operating system'):
+        ts.assign_port()
+
+
+def test_assign_port_exhausted_blames_other_processes(monkeypatch):
+    """When every candidate is occupied, the message names other processes."""
+    _patch_probe(monkeypatch, lambda port: errno.EADDRINUSE)
+    ts = _make_server()
+    with pytest.raises(RuntimeError, match='in use by other processes'):
+        ts.assign_port()
+
+
+def test_assign_port_exhausted_reports_unexpected_errno(monkeypatch):
+    """A probe failing for our own reasons is reported as itself, not as 'in use'.
+
+    One port reports a genuine conflict, so the our-fault fallback below does
+    not apply and the window really is refused.
+    """
+    _patch_probe(monkeypatch, lambda port: errno.EADDRINUSE if port == 20000 else errno.EMFILE)
+    ts = _make_server()
+    with pytest.raises(RuntimeError, match=f'most probes failed unexpectedly, last with errno {errno.EMFILE}'):
+        ts.assign_port()
+
+
+def test_assign_port_falls_back_when_every_probe_fails_for_our_own_reasons(monkeypatch):
+    """An fd ceiling must not become a refusal to launch.
+
+    When every probe fails for a reason of ours rather than the pool's, nothing
+    was learned about the ports. The child is a separate process with its own
+    descriptor table and would very likely bind, so degrade to what the old
+    allocator did instead of failing the task.
+    """
+    _patch_probe(monkeypatch, lambda port: errno.EMFILE)
+    ts = _make_server()
+    assert ts.assign_port() == 20000
+    assert ts._allocated_ports == [20000]
+
+
+def test_assign_port_drops_stale_reservations_before_giving_up(monkeypatch):
+    """A window that looks fully reserved is re-probed once with a clean cache.
+
+    Windows exclusion ranges come and go as Hyper-V, WSL and Docker start and
+    stop, so a cached EACCES can outlive the reservation. Without this the
+    usable window could only shrink, and a long-lived engine would end up
+    refusing every task while `netsh` reported no exclusions at all.
+    """
+    _patch_probe(monkeypatch, lambda port: None)
+    ts = _make_server()
+    # Cached earlier, when the range really was excluded. The OS has since let
+    # it go, but nothing re-probes a cached port, so the pool looks empty.
+    ts._reserved_ports = set(range(20000, 30000))
+
+    assert ts.assign_port() == 20000
+    assert ts._reserved_ports == set(), 'the stale cache must not survive the retry'
+
+
+def test_assign_port_does_not_resweep_when_the_cache_was_not_consulted(monkeypatch):
+    """A window exhausted by live probes has nothing stale to forget.
+
+    Re-probing it would spend a second full sweep of syscalls on the event loop
+    for nothing, so the retry is gated on cached verdicts actually being used.
+    """
+    probed = []
+
+    def _probe(port):
+        probed.append(port)
+        return errno.EADDRINUSE
+
+    _patch_probe(monkeypatch, _probe)
+    ts = _make_server()
+
+    with pytest.raises(RuntimeError, match='in use by other processes'):
+        ts.assign_port()
+
+    assert len(probed) == 10000, f'expected one sweep of the window, got {len(probed)} probes'
+
+
+def test_assign_port_exhausted_says_the_window_was_clamped(monkeypatch):
+    """A base high enough to run past 65535 gets a short window; say so.
+
+    Otherwise the message advises widening a window that cannot widen upward.
+    """
+    _patch_probe(monkeypatch, lambda port: errno.EADDRINUSE)
+    ts = _make_server(config={'base_port': 60000})
+    with pytest.raises(RuntimeError, match='was clamped'):
+        ts.assign_port()
+
+
+def test_assign_port_exhausted_names_a_tied_cause(monkeypatch):
+    """On a tie the message must not silently pick one of two very different paths."""
+    _patch_probe(monkeypatch, lambda port: errno.EACCES if port < 25000 else errno.EADDRINUSE)
+    ts = _make_server()
+    with pytest.raises(RuntimeError, match='tied with'):
+        ts.assign_port()
+
+
+def test_assign_port_exhausted_by_self_does_not_blame_other_processes(all_ports_bindable):
+    """The self-allocated message must not send the reader hunting other processes."""
+    ts = _make_server()
+    ts._allocated_ports = list(range(20000, 30000))
+    with pytest.raises(RuntimeError) as excinfo:
+        ts.assign_port()
+    message = str(excinfo.value)
+    assert 'already allocated by this server' in message
+    assert 'ss -ltn' not in message
+    assert 'netsh' not in message
+    assert 'lsof' not in message
+
+
+def test_assign_port_rejects_window_past_the_last_valid_port(monkeypatch):
+    """A base_port above 65535 leaves an empty window and never reaches a probe."""
+    probed = []
+    _patch_probe(monkeypatch, lambda port: probed.append(port))
+    ts = _make_server(config={'base_port': 70000})
+    with pytest.raises(RuntimeError, match='leaves no ports at or below 65535'):
+        ts.assign_port()
+    assert probed == []
+
+
+def test_assign_port_never_returns_port_zero(all_ports_bindable):
+    """base_port 0 must not yield port 0, which means 'any port' to bind()."""
+    ts = _make_server(config={'base_port': 0})
+    assert ts.assign_port() == 1
+
+
+def test_assign_port_returns_a_bindable_port():
+    """The unpatched allocator returns a port the caller can really bind."""
+    ts = _make_server()
+    port = ts.assign_port()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', port))
+    finally:
+        sock.close()
+
+
+def test_probe_port_detects_a_held_port():
+    """_probe_port reports EADDRINUSE while a socket holds the port, None after."""
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        holder.bind(('127.0.0.1', 0))
+        port = holder.getsockname()[1]
+        assert TaskServer._probe_port(port) == errno.EADDRINUSE
+    finally:
+        holder.close()
+
+    assert TaskServer._probe_port(port) is None
+
+
+def test_probe_port_never_reports_a_failed_bind_as_free(monkeypatch):
+    """An OSError carrying no errno must not read as 'port is free'."""
+
+    class _NoErrnoSocket:
+        # _probe_port opens the socket with `with`, so the stub is a context
+        # manager rather than something with a close().
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def bind(self, address):
+            raise OSError()
+
+    monkeypatch.setattr(task_server_module.socket, 'socket', lambda *a, **kw: _NoErrnoSocket())
+    assert TaskServer._probe_port(20000) == errno.EADDRINUSE
+
+
+# ---------------------------------------------------------------------------
+# get_task_control / get_task_control_by_public_key / get_task
+# ---------------------------------------------------------------------------
+
+
+def test_get_task_control_returns_registered_control():
+    """A valid token returns the matching TASK_CONTROL structure."""
+    ts = _make_server()
+    control = _make_control(token='tk_1')
+    ts._task_control['tk_1'] = control
+    assert ts.get_task_control('tk_1') is control
+
+
+def test_get_task_control_missing_token_raises():
+    """An empty token raises ValueError before lookup."""
+    ts = _make_server()
+    with pytest.raises(ValueError, match='Task token is required'):
+        ts.get_task_control('')
+
+
+def test_get_task_control_unknown_token_raises_runtime():
+    """An unknown but non-empty token raises RuntimeError."""
+    ts = _make_server()
+    with pytest.raises(RuntimeError, match='not running'):
+        ts.get_task_control('tk_unknown')
+
+
+def test_get_task_control_unknown_token_carries_a_code():
+    """The failure is classifiable without matching the English message (#2097)."""
+    ts = _make_server()
+    with pytest.raises(TaskError) as excinfo:
+        ts.get_task_control('tk_unknown')
+    assert excinfo.value.code == TaskError.NOT_REGISTERED
+    assert isinstance(excinfo.value, RuntimeError)  # existing handlers still catch it
+
+
+def test_get_task_control_by_public_key_unknown_carries_a_code():
+    """A public key naming no live task reports TASK_NOT_REGISTERED."""
+    ts = _make_server()
+    with pytest.raises(TaskError) as excinfo:
+        ts.get_task_control_by_public_key('pk_unknown')
+    assert excinfo.value.code == TaskError.NOT_REGISTERED
+
+
+def test_get_task_control_with_require_denies_without_membership(monkeypatch):
+    """No permissions on the task's team -> uniform access-denied error."""
+    from ai.modules.task import task_server as ts_mod
+
+    monkeypatch.setattr(ts_mod, 'resolve_run_permissions', lambda info, control: [])
+
+    ts = _make_server()
+    ts._task_control['tk_1'] = _make_control()
+    account = SimpleNamespace(userId='u', devTeam='t', sysPermissions=[])
+
+    with pytest.raises(PermissionError, match='no permissions for this task'):
+        ts.get_task_control('tk_1', account_info=account, require='task.debug')
+
+
+def test_get_task_control_with_require_enforces_permission(monkeypatch):
+    """Membership without the required permission raises PermissionError."""
+    from ai.modules.task import task_server as ts_mod
+
+    monkeypatch.setattr(ts_mod, 'resolve_run_permissions', lambda info, control: ['task.monitor'])
+
+    ts = _make_server()
+    ts._task_control['tk_1'] = _make_control()
+    account = SimpleNamespace(userId='u', devTeam='t', sysPermissions=[])
+
+    with pytest.raises(PermissionError, match="'task.debug' denied"):
+        ts.get_task_control('tk_1', account_info=account, require='task.debug')
+
+
+def test_get_task_control_with_require_passes_when_granted(monkeypatch):
+    """A granted permission lets get_task_control return the control unmodified."""
+    from ai.modules.task import task_server as ts_mod
+
+    monkeypatch.setattr(ts_mod, 'resolve_run_permissions', lambda info, control: ['task.debug'])
+
+    ts = _make_server()
+    control = _make_control()
+    ts._task_control['tk_1'] = control
+    account = SimpleNamespace(userId='u', devTeam='t', sysPermissions=[])
+
+    assert ts.get_task_control('tk_1', account_info=account, require='task.debug') is control
+
+
+def test_get_task_control_with_require_sys_admin_bypasses():
+    """sys.admin is granted INSIDE resolve_task_permissions (it returns the
+    full permission set) — deliberately no outer short-circuit to keep in
+    sync (parity with get_task).
+    """
+    ts = _make_server()
+    control = _make_control()
+    ts._task_control['tk_1'] = control
+    # No organization at all: only the resolver's sys.admin expansion grants.
+    account = SimpleNamespace(userId='u', devTeam='t', sysPermissions=['sys.admin'], organization=None)
+
+    assert ts.get_task_control('tk_1', account_info=account, require='task.debug') is control
+
+
+def test_get_task_returns_underlying_task():
+    """get_task is a thin wrapper over get_task_control.task."""
+    ts = _make_server()
+    inner_task = SimpleNamespace(name='my-task')
+    ts._task_control['tk_1'] = _make_control(token='tk_1', task=inner_task)
+    assert ts.get_task('tk_1') is inner_task
+
+
+def test_get_task_control_by_public_key_finds_match():
+    """The first control whose public_auth equals the argument is returned."""
+    ts = _make_server()
+    ctrl_a = _make_control(token='tk_a', public_auth='pk_zzz')
+    ctrl_b = _make_control(token='tk_b', public_auth='pk_xyz')
+    ts._task_control = {'tk_a': ctrl_a, 'tk_b': ctrl_b}
+    assert ts.get_task_control_by_public_key('pk_xyz') is ctrl_b
+
+
+def test_get_task_control_by_public_key_missing_raises():
+    """No matching public key raises RuntimeError with a clear message."""
+    ts = _make_server()
+    ts._task_control['tk_a'] = _make_control(token='tk_a', public_auth='pk_other')
+    with pytest.raises(RuntimeError, match='not running'):
+        ts.get_task_control_by_public_key('pk_does-not-exist')
+
+
+# ---------------------------------------------------------------------------
+# Connection registry — _dapbase_on_connected / _dapbase_on_disconnected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dapbase_on_connected_registers_connection():
+    """_dapbase_on_connected adds the conn to `_connections` keyed by its id."""
+    ts = _make_server()
+    conn = MagicMock()
+    conn.get_connection_id.return_value = 42
+    conn._client_ip = '127.0.0.1'
+
+    await TaskServer._dapbase_on_connected(ts, conn)
+
+    assert ts._connections[42] is conn
+
+
+# ---------------------------------------------------------------------------
+# broadcast_server_event / broadcast_task_event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_broadcast_server_event_calls_each_connection():
+    """Every connection receives the event payload."""
+    ts = _make_server()
+    a, b, c = MagicMock(), MagicMock(), MagicMock()
+    a.send_server_event = AsyncMock()
+    b.send_server_event = AsyncMock()
+    c.send_server_event = AsyncMock()
+    ts._connections = {1: a, 2: b, 3: c}
+
+    payload = {'event': 'dashboard', 'body': {'action': 'x'}}
+    await TaskServer.broadcast_server_event(ts, type='etype', event=payload, user_id='user-1')
+
+    for conn in (a, b, c):
+        conn.send_server_event.assert_awaited_once_with('etype', event=payload, user_id='user-1', org_id=None)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_server_event_isolates_failures():
+    """A single connection raising must not stop the broadcast to others."""
+    ts = _make_server()
+    bad = MagicMock()
+    bad.send_server_event = AsyncMock(side_effect=RuntimeError('boom'))
+    good = MagicMock()
+    good.send_server_event = AsyncMock()
+    ts._connections = {1: bad, 2: good}
+
+    await TaskServer.broadcast_server_event(ts, type='etype', event={'event': 'x', 'body': None})
+
+    good.send_server_event.assert_awaited_once()
+    ts.debug_message.assert_called_once()  # logged the bad connection
+
+
+@pytest.mark.asyncio
+async def test_broadcast_task_event_skips_when_token_unknown():
+    """If the token is not in the task registry, the broadcast short-circuits."""
+    ts = _make_server()
+    conn = MagicMock()
+    conn.send_task_event = AsyncMock()
+    ts._connections = {1: conn}
+
+    await TaskServer.broadcast_task_event(ts, event_type='etype', token='tk_x', event={'event': 'x'})
+
+    conn.send_task_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_broadcast_task_event_calls_each_subscriber():
+    """All connections receive the event when the task token is registered."""
+    ts = _make_server()
+    ts._task_control['tk_x'] = _make_control(token='tk_x')
+
+    a, b = MagicMock(), MagicMock()
+    a.send_task_event = AsyncMock()
+    b.send_task_event = AsyncMock()
+    ts._connections = {1: a, 2: b}
+
+    payload = {'event': 'summary', 'body': {}}
+    await TaskServer.broadcast_task_event(ts, event_type='etype', token='tk_x', event=payload)
+
+    a.send_task_event.assert_awaited_once_with('etype', token='tk_x', event=payload)
+    b.send_task_event.assert_awaited_once_with('etype', token='tk_x', event=payload)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_task_event_silently_skips_permission_errors():
+    """PermissionError from a connection is treated as normal (not logged)."""
+    ts = _make_server()
+    ts._task_control['tk_x'] = _make_control(token='tk_x')
+
+    pk_conn = MagicMock()
+    pk_conn.send_task_event = AsyncMock(side_effect=PermissionError('no monitor'))
+    other = MagicMock()
+    other.send_task_event = AsyncMock()
+    ts._connections = {1: pk_conn, 2: other}
+
+    await TaskServer.broadcast_task_event(ts, event_type='etype', token='tk_x', event={'event': 'x'})
+
+    other.send_task_event.assert_awaited_once()
+    ts.debug_message.assert_not_called()  # permission errors are normal
+
+
+@pytest.mark.asyncio
+async def test_broadcast_task_event_logs_other_exceptions():
+    """Non-permission errors are logged but the broadcast continues."""
+    ts = _make_server()
+    ts._task_control['tk_x'] = _make_control(token='tk_x')
+
+    bad = MagicMock()
+    bad.send_task_event = AsyncMock(side_effect=RuntimeError('boom'))
+    good = MagicMock()
+    good.send_task_event = AsyncMock()
+    ts._connections = {1: bad, 2: good}
+
+    await TaskServer.broadcast_task_event(ts, event_type='etype', token='tk_x', event={'event': 'x'})
+
+    good.send_task_event.assert_awaited_once()
+    ts.debug_message.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# store property — lazy initialization
+# ---------------------------------------------------------------------------
+
+
+def test_store_property_returns_process_singleton(monkeypatch):
+    """TaskServer.store IS the process singleton — server code and
+    Store.file_store(ctx) call sites can never diverge onto different stores.
+    """
+    from ai.modules.task import task_server as ts_mod
+
+    fake_store = MagicMock(name='store')
+    monkeypatch.setattr(ts_mod.Store, '_instance', fake_store)
+
+    ts = _make_server()
+    assert ts.store is fake_store
+    assert ts.store is ts_mod.Store.instance()
+
+
+# ---------------------------------------------------------------------------
+# _cleanup_tasks / _monitor_ttl — one-iteration tests
+# ---------------------------------------------------------------------------
+
+
+class _LoopBreak(BaseException):
+    """Sentinel BaseException used to break out of background loops.
+
+    The bodies of ``_cleanup_tasks`` and ``_monitor_ttl`` wrap each
+    iteration in ``except Exception`` to keep the server resilient. We need
+    to escape the loop without being caught — BaseException subclasses
+    (like ``KeyboardInterrupt``) bypass ``except Exception``.
+    """
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tasks_removes_completed_expired_task(monkeypatch):
+    """
+    A completed task whose endTime is older than the grace window is removed.
+
+    The loop normally runs forever; we patch ``asyncio.sleep`` to raise
+    ``StopAsyncIteration`` after one cycle so the test terminates.
+    """
+    from ai.modules.task import task_server as ts_mod
+
+    # End the loop after one iteration.
+    async def _stop_after_one(_delay):
+        """Sleep stub that raises to break the otherwise-infinite loop."""
+        raise _LoopBreak
+
+    monkeypatch.setattr(ts_mod.asyncio, 'sleep', _stop_after_one)
+    monkeypatch.setattr(ts_mod.time, 'time', lambda: 10_000.0)
+    monkeypatch.setattr(ts_mod, 'CONST_CLEANUP_DELAY_TIME', 60.0)
+
+    ts = _make_server()
+    ts.remove_task = AsyncMock()
+
+    task = MagicMock()
+    task.is_task_complete = MagicMock(return_value=True)
+    # endTime well in the past: 10000 - 200 -> grace window expired
+    task.get_status = MagicMock(return_value=SimpleNamespace(endTime=9_000.0))
+    ts._task_control['tk_old'] = _make_control(token='tk_old', task=task)
+
+    with pytest.raises(_LoopBreak):
+        await TaskServer._cleanup_tasks(ts)
+
+    ts.remove_task.assert_awaited_once_with('tk_old')
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tasks_skips_running_task(monkeypatch):
+    """A still-running (incomplete) task is NOT removed by the cleanup loop."""
+    from ai.modules.task import task_server as ts_mod
+
+    async def _stop_after_one(_delay):
+        """Stop the loop after the first iteration."""
+        raise _LoopBreak
+
+    monkeypatch.setattr(ts_mod.asyncio, 'sleep', _stop_after_one)
+
+    ts = _make_server()
+    ts.remove_task = AsyncMock()
+
+    task = MagicMock()
+    task.is_task_complete = MagicMock(return_value=False)
+    ts._task_control['tk_run'] = _make_control(token='tk_run', task=task)
+
+    with pytest.raises(_LoopBreak):
+        await TaskServer._cleanup_tasks(ts)
+
+    ts.remove_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _monitor_ttl — one-iteration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_terminates_idle_task(monkeypatch):
+    """A task whose idle_time crosses ``_ttl`` is terminated by the TTL monitor."""
+    from ai.modules.task import task_server as ts_mod
+
+    counter = {'n': 0}
+
+    async def _sleep_one_then_stop(_delay):
+        """Sleep once, then raise to break the loop on the next iteration."""
+        counter['n'] += 1
+        if counter['n'] < 1:
+            raise _LoopBreak
+
+    monkeypatch.setattr(ts_mod.asyncio, 'sleep', _sleep_one_then_stop)
+    monkeypatch.setattr(ts_mod, 'CONST_TTL_CHECK', 60)
+
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+
+    task = MagicMock()
+    task.is_task_complete = MagicMock(return_value=False)
+    task._ttl = 100
+    task._idle_time = 50  # 50 + 60 (check interval) > 100 -> terminate
+    ts._task_control['tk_idle'] = _make_control(token='tk_idle', task=task)
+
+    with pytest.raises(_LoopBreak):
+        await TaskServer._monitor_ttl(ts)
+
+    # The reason MUST be 'ttl': it is what makes the run record as a
+    # completed window instead of a cancelled run.
+    ts.stop_task.assert_awaited_once_with('tk_idle', reason='ttl')
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_skips_task_with_zero_ttl(monkeypatch):
+    """A task with ``_ttl == 0`` has no timeout and is never terminated."""
+    from ai.modules.task import task_server as ts_mod
+
+    counter = {'n': 0}
+
+    async def _sleep_one_then_stop(_delay):
+        """Sleep once, then raise to break the loop."""
+        counter['n'] += 1
+        if counter['n'] > 1:
+            raise _LoopBreak
+
+    monkeypatch.setattr(ts_mod.asyncio, 'sleep', _sleep_one_then_stop)
+
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+
+    task = MagicMock()
+    task.is_task_complete = MagicMock(return_value=False)
+    task._ttl = 0
+    task._idle_time = 999_999
+    ts._task_control['tk_immortal'] = _make_control(token='tk_immortal', task=task)
+
+    with pytest.raises(_LoopBreak):
+        await TaskServer._monitor_ttl(ts)
+
+    ts.stop_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# remove_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_task_unknown_token_carries_a_code():
+    """An unknown token reaches the TaskError guard, not a bare KeyError.
+
+    The registry pop had no default, so the guard below it was unreachable
+    for the one case it was written for.
+    """
+    ts = _make_server()
+    with pytest.raises(TaskError) as excinfo:
+        await ts.remove_task('tk_unknown')
+    assert excinfo.value.code == TaskError.NOT_REGISTERED
+
+
+@pytest.mark.asyncio
+async def test_remove_task_calls_stop_and_broadcasts():
+    """remove_task pops the control, stops the task, and broadcasts a dashboard event."""
+    ts = _make_server()
+    ts.broadcast_server_event = AsyncMock()
+
+    task = MagicMock()
+    task.stop_task = AsyncMock()
+    control = SimpleNamespace(
+        id='task-name',
+        token='tk_rm',
+        userId='u1',
+        teamId='t1',
+        run_kind='dev',
+        # Monitor-key cleanup builds the owner-scoped key from the control.
+        owner_id='u1',
+        task=task,
+        project_id='proj-1',
+        source='src-1',
+        apikey='ak_x',
+    )
+    ts._task_control['tk_rm'] = control
+
+    result = await TaskServer.remove_task(ts, 'tk_rm')
+
+    assert result is control
+    assert 'tk_rm' not in ts._task_control
+    task.stop_task.assert_awaited_once()
+    ts.broadcast_server_event.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# push_account_update
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_push_account_update_skips_other_users(monkeypatch):
+    """Connections owned by a different user are not notified."""
+    from ai.modules.task import task_server as ts_mod
+
+    fresh_info = MagicMock()
+    fresh_info.to_connect_result = MagicMock(return_value={'user_id': 'u1'})
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock(return_value=fresh_info)
+    fake_account = SimpleNamespace(_service=service)
+    monkeypatch.setitem(sys.modules, 'ai.account.account', fake_account)
+    monkeypatch.setattr(ts_mod, 'account', fake_account, raising=False)
+
+    ts = _make_server()
+    other = MagicMock()
+    other._account_info = SimpleNamespace(userId='u-other', auth='ak_o')
+    other.send_event = AsyncMock()
+    other.get_connection_id = MagicMock(return_value=99)
+    ts._connections = {99: other}
+
+    await TaskServer.push_account_update(ts, 'u1')
+    other.send_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_push_account_update_swallows_send_errors(monkeypatch):
+    """If account refresh raises, the loop logs and moves on (no propagation)."""
+    from ai.modules.task import task_server as ts_mod
+
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock(side_effect=RuntimeError('refresh fail'))
+    fake_account = SimpleNamespace(_service=service)
+    monkeypatch.setitem(sys.modules, 'ai.account.account', fake_account)
+    monkeypatch.setattr(ts_mod, 'account', fake_account, raising=False)
+
+    ts = _make_server()
+    target = MagicMock()
+    target._account_info = SimpleNamespace(userId='u1', auth='ak_a')
+    target.send_event = AsyncMock()
+    target.get_connection_id = MagicMock(return_value=1)
+    ts._connections = {1: target}
+
+    await TaskServer.push_account_update(ts, 'u1')
+    target.send_event.assert_not_awaited()
+    ts.debug_message.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_push_account_update_skips_task_scoped_connections(monkeypatch):
+    """pk_/tk_ connections carry the LAUNCHING user's id (so they match the
+    userId filter) but must NOT be rebuilt or notified: rebuilding escalates a
+    minimal task identity into the full user and leaks the user's rr_ session
+    key. Only the full-user connection is notified, with the token-stripped body.
+    """
+    # push_account_update resolves `from ai.account import account` and reads
+    # account._service.get_authentication_result -- patch the real facade's
+    # service so the positive (send) path is actually exercised.
+    from ai.account import account as real_account
+
+    fresh = MagicMock()
+    fresh.to_push_result = MagicMock(return_value={'userId': 'u1', 'userToken': ''})
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock(return_value=fresh)
+    # raising=False: the default (OSS) facade in this test env has no _service;
+    # the SaaS facade that actually runs push_account_update does.
+    monkeypatch.setattr(real_account, '_service', service, raising=False)
+
+    ts = _make_server()
+
+    def _conn(cid, auth):
+        c = MagicMock()
+        c._account_info = SimpleNamespace(userId='u1', auth=auth)
+        c.send_event = AsyncMock()
+        c.get_connection_id = MagicMock(return_value=cid)
+        return c
+
+    pk = _conn(1, 'pk_abc')
+    tk = _conn(2, 'tk_abc')
+    full = _conn(3, 'rr_abc')
+    ts._connections = {1: pk, 2: tk, 3: full}
+
+    await TaskServer.push_account_update(ts, 'u1')
+
+    # Task-scoped sockets are neither rebuilt nor notified.
+    pk.send_event.assert_not_awaited()
+    tk.send_event.assert_not_awaited()
+    assert pk._account_info.auth == 'pk_abc'  # identity untouched
+    assert tk._account_info.auth == 'tk_abc'
+
+    # The full-user connection is notified with the token-stripped push body.
+    full.send_event.assert_awaited_once()
+    args, kwargs = full.send_event.call_args
+    assert args[0] == 'apaext_account'
+    assert kwargs['body'] == {'userId': 'u1', 'userToken': ''}
+    fresh.to_push_result.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# push_org_update
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_push_org_update_skips_other_orgs(monkeypatch):
+    """Connections whose primary org differs are not notified."""
+    from ai.modules.task import task_server as ts_mod
+
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock()
+    fake_account = SimpleNamespace(_service=service)
+    monkeypatch.setitem(sys.modules, 'ai.account.account', fake_account)
+    monkeypatch.setattr(ts_mod, 'account', fake_account, raising=False)
+
+    ts = _make_server()
+    other = MagicMock()
+    other._account_info = SimpleNamespace(userId='u1', auth='rr_o', organization={'id': 'org-other'})
+    other.send_event = AsyncMock()
+    other.get_connection_id = MagicMock(return_value=99)
+    ts._connections = {99: other}
+
+    await TaskServer.push_org_update(ts, 'org-1')
+    other.send_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_push_org_update_swallows_send_errors(monkeypatch):
+    """If account refresh raises, the loop logs and moves on (no propagation)."""
+    from ai.account import account as real_account
+
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock(side_effect=RuntimeError('refresh fail'))
+    monkeypatch.setattr(real_account, '_service', service, raising=False)
+
+    ts = _make_server()
+    target = MagicMock()
+    target._account_info = SimpleNamespace(userId='u1', auth='rr_a', organization={'id': 'org-1'})
+    target.send_event = AsyncMock()
+    target.get_connection_id = MagicMock(return_value=1)
+    ts._connections = {1: target}
+
+    await TaskServer.push_org_update(ts, 'org-1')
+    target.send_event.assert_not_awaited()
+    ts.debug_message.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_push_org_update_notifies_org_and_skips_task_scoped(monkeypatch):
+    """Every full-user connection on the org is rebuilt and notified with the
+    token-stripped body; pk_/tk_ sockets on the same org are skipped for the
+    same reason as push_account_update (no escalation, no rr_ key leak).
+    Organization may be a dict or an object — both shapes must match.
+    """
+    from ai.account import account as real_account
+
+    fresh = MagicMock()
+    fresh.to_push_result = MagicMock(return_value={'userId': 'u1', 'userToken': ''})
+    service = MagicMock()
+    service.get_authentication_result = AsyncMock(return_value=fresh)
+    # raising=False: the default (OSS) facade in this test env has no _service;
+    # the SaaS facade that actually runs push_org_update does.
+    monkeypatch.setattr(real_account, '_service', service, raising=False)
+
+    ts = _make_server()
+
+    def _conn(cid, auth, org):
+        c = MagicMock()
+        c._account_info = SimpleNamespace(userId='u1', auth=auth, organization=org)
+        c.send_event = AsyncMock()
+        c.get_connection_id = MagicMock(return_value=cid)
+        return c
+
+    pk = _conn(1, 'pk_abc', {'id': 'org-1'})
+    full_dict = _conn(2, 'rr_abc', {'id': 'org-1'})
+    full_obj = _conn(3, 'rr_def', SimpleNamespace(id='org-1'))
+    ts._connections = {1: pk, 2: full_dict, 3: full_obj}
+
+    await TaskServer.push_org_update(ts, 'org-1')
+
+    # Task-scoped sockets are neither rebuilt nor notified.
+    pk.send_event.assert_not_awaited()
+    assert pk._account_info.auth == 'pk_abc'  # identity untouched
+
+    # Both full-user connections (dict- and object-shaped org) are notified.
+    for full in (full_dict, full_obj):
+        full.send_event.assert_awaited_once()
+        args, kwargs = full.send_event.call_args
+        assert args[0] == 'apaext_account'
+        assert kwargs['body'] == {'userId': 'u1', 'userToken': ''}
+        assert full._account_info is fresh
+
+
+# ---------------------------------------------------------------------------
+# _build_task_account_info — pk_/tk_ permission resolution
+# ---------------------------------------------------------------------------
+
+
+def test_build_task_account_info_populates_organization():
+    """The synthesized account for pk_/tk_ auth must carry a populated
+    ``organization`` so team permissions resolve. Regression: a plural
+    ``organizations=`` value was silently dropped by pydantic, leaving
+    ``organization`` None and breaking the chat SSE subscribe with
+    'Access denied: no permissions for this task'.
+    """
+    from ai.account.models import resolve_task_permissions
+
+    ts = _make_server()
+    control = SimpleNamespace(userId='user-1', teamId='team-1', orgId='org-1')
+
+    info = ts._build_task_account_info('pk_abc', control, ['task.data'])
+
+    assert info.organization is not None
+    # The task's own team is present with the granted permissions, so a pk_
+    # subscriber resolves to a non-empty permission list for its own task.
+    assert resolve_task_permissions(info, 'team-1') == ['task.data']
+
+
+# ---------------------------------------------------------------------------
+# _monitor_ttl: the counter itself, and the two halves of the trade
+# ---------------------------------------------------------------------------
+
+
+def _ttl_task(*, ttl, idle):
+    """A task stand-in whose ``_idle_time`` is a real int, not a MagicMock attribute."""
+    task = MagicMock()
+    task.is_task_complete = MagicMock(return_value=False)
+    task._ttl = ttl
+    task._idle_time = idle
+    return task
+
+
+async def _one_ttl_cycle(monkeypatch, ts, *, check=60):
+    """Drive exactly one iteration of ``_monitor_ttl`` and stop."""
+    from ai.modules.task import task_server as ts_mod
+
+    counter = {'n': 0}
+
+    async def _sleep_one_then_stop(_delay):
+        counter['n'] += 1
+        if counter['n'] > 1:
+            raise _LoopBreak
+
+    monkeypatch.setattr(ts_mod.asyncio, 'sleep', _sleep_one_then_stop)
+    monkeypatch.setattr(ts_mod, 'CONST_TTL_CHECK', check)
+
+    with pytest.raises(_LoopBreak):
+        await TaskServer._monitor_ttl(ts)
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_ages_a_silent_task(monkeypatch):
+    """A task nothing has touched still ages, so the reaper is not disabled."""
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+    task = _ttl_task(ttl=900, idle=0)
+    ts._task_control['tk_quiet'] = _make_control(token='tk_quiet', task=task)
+
+    await _one_ttl_cycle(monkeypatch, ts)
+
+    assert task._idle_time == 60, 'a silent task must accumulate idle time'
+    ts.stop_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_reaps_a_task_that_stayed_silent(monkeypatch):
+    """The other half of the trade: an abandoned task is still collected."""
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+    task = _ttl_task(ttl=900, idle=860)
+    ts._task_control['tk_abandoned'] = _make_control(token='tk_abandoned', task=task)
+
+    await _one_ttl_cycle(monkeypatch, ts)
+
+    ts.stop_task.assert_awaited_once_with('tk_abandoned', reason='ttl')
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_spares_a_task_whose_timer_was_reset(monkeypatch):
+    """Work resets the counter, so a busy task survives a cycle it would have died in."""
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+    task = _ttl_task(ttl=900, idle=860)
+    task._idle_time = 0  # what on_event does when the pipeline reports work
+    ts._task_control['tk_busy'] = _make_control(token='tk_busy', task=task)
+
+    await _one_ttl_cycle(monkeypatch, ts)
+
+    assert task._idle_time == 60
+    ts.stop_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_ttl_leaves_a_zero_ttl_counter_alone(monkeypatch):
+    """``ttl: 0`` skips before the increment, so its idle counter never moves."""
+    ts = _make_server()
+    ts.stop_task = AsyncMock()
+    task = _ttl_task(ttl=0, idle=0)
+    ts._task_control['tk_immortal'] = _make_control(token='tk_immortal', task=task)
+
+    await _one_ttl_cycle(monkeypatch, ts)
+
+    assert task._idle_time == 0
+    ts.stop_task.assert_not_awaited()

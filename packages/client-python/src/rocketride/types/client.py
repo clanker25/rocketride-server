@@ -1,0 +1,413 @@
+# MIT License
+#
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+Client Type Definitions for RocketRide Client.
+
+This module provides TypedDict classes and type aliases for type-safe client configuration,
+DAP (Debug Adapter Protocol) messages, and callback signatures. These types improve code
+completion, enable static type checking, and document expected data structures.
+
+Types Defined:
+    DAPMessage: Core message structure for client-server communication
+    TransportCallbacks: Callback hooks for transport layer events
+    ConnectionInfo: Connection configuration for server endpoints
+    RocketRideClientConfig: Complete client configuration options
+    EventCallback: Type alias for event handling callbacks
+    ConnectCallback: Type alias for connection callbacks
+    ConnectErrorCallback: Type alias for connection attempt failure callbacks
+    DisconnectCallback: Type alias for disconnection callbacks
+    TraceInfo: Stack trace information for debugging errors
+
+These types are compatible with Python 3.10+ using native typing without extensions.
+
+Usage:
+    from rocketride.types import RocketRideClientConfig, EventCallback
+
+    # Type-safe configuration
+    config: RocketRideClientConfig = {
+        'auth': 'your_api_key',
+        'uri': 'wss://server.example.com',
+        'onEvent': my_event_handler
+    }
+
+    # Type hints for callbacks
+    async def handle_event(event: DAPMessage) -> None:
+        print(f"Event: {event['event']}")
+"""
+
+from typing import Any, Callable, Awaitable, TypedDict, Literal, Optional, Union
+
+from typing_extensions import NotRequired
+
+
+class TraceInfo(TypedDict):
+    """
+    Stack trace information attached to error responses.
+
+    Attributes:
+        file (str): The source file path where the error originated.
+        lineno (int): The line number within that source file.
+    """
+
+    file: str
+    lineno: int
+
+
+class DAPMessage(TypedDict, total=False):
+    """
+    Core message structure for Debug Adapter Protocol (DAP) communication.
+
+    Used for all client-server communication including requests, responses,
+    and events. Supports both text and binary data transmission through
+    the DAP protocol format.
+
+    Note: Using total=False makes all fields optional by default.
+    Required fields are documented in comments.
+    """
+
+    # Required fields (must be present in all messages)
+    type: Literal['request', 'response', 'event']  # REQUIRED
+    seq: int  # REQUIRED
+
+    # Optional fields
+    command: str  # Command name for requests (e.g., 'execute', 'terminate', 'rrext_ping')
+    arguments: dict[str, Any]  # Command arguments and parameters
+    body: dict[str, Any]  # Response body containing results and data
+    success: bool  # Success flag for responses - true if operation succeeded
+    message: str  # Error or status message
+    request_seq: int  # Sequence number of the request this response corresponds to
+    event: str  # Event type name for event messages
+    token: str  # Task or pipeline token for operation context
+    data: Union[bytes, str]  # Binary or text data payload
+    trace: TraceInfo  # Stack trace information for errors
+
+
+class TransportCallbacks(TypedDict, total=False):
+    """
+    Callback functions for transport layer events and debugging.
+
+    These callbacks provide hooks for monitoring transport activity,
+    debugging protocol messages, and handling connection lifecycle events.
+    """
+
+    onDebugMessage: Callable[[str], None]  # Called when debug messages are generated
+    onDebugProtocol: Callable[[str], None]  # Called when protocol messages are sent/received for debugging
+    onReceive: Callable[[DAPMessage], Awaitable[None]]  # Called when a message is received from the server
+    onConnected: Callable[[Optional[str]], Awaitable[None]]  # Called when connection is established
+    onDisconnected: Callable[
+        [Optional[str], Optional[bool]], Awaitable[None]
+    ]  # Called when connection is lost or closed
+
+
+class ConnectionInfo(TypedDict):
+    """
+    Connection configuration for establishing server connections.
+
+    Note: uri is required, auth is optional.
+    """
+
+    uri: str  # Server URI (WebSocket endpoint) - REQUIRED
+    auth: Optional[str]  # Authentication token or API key - OPTIONAL
+
+
+# =============================================================================
+# CALLBACK TYPE ALIASES
+# These Callable type aliases are not TypedDicts; they are simple type aliases
+# used to annotate callback parameters and attributes across the SDK.
+# =============================================================================
+
+# Type aliases for callback functions
+"""
+Callback function for handling real-time events from the server.
+
+Events include pipeline status updates, processing progress,
+error notifications, and system alerts.
+"""
+EventCallback = Callable[[DAPMessage], Awaitable[None]]
+
+"""Callback function for connection establishment events."""
+ConnectCallback = Callable[[Optional[str]], Awaitable[None]]
+
+"""Callback function for connection attempt failure (e.g. connect or reconnect failed). Async."""
+ConnectErrorCallback = Callable[[str], Awaitable[None]]
+
+"""Callback function for disconnection events."""
+DisconnectCallback = Callable[[Optional[str], Optional[bool]], Awaitable[None]]
+
+
+class RocketRideClientConfig(TypedDict, total=False):
+    """
+    Configuration options for creating an RocketRideClient instance.
+
+    Provides connection settings, authentication, and event handling
+    configuration for establishing and managing server connections.
+
+    All fields are optional.
+    """
+
+    # Connection
+    auth: str  # API authentication key or token
+    uri: str  # Server URI (will be converted to WebSocket URI automatically)
+
+    # Environment variables for pipeline config substitution.
+    # If not provided, loads values from `.env`.
+    env: dict[str, str]
+
+    # Callbacks
+    on_event: EventCallback  # Callback for handling real-time events from server
+    on_connected: ConnectCallback  # Callback for connection establishment
+    on_connect_error: ConnectErrorCallback  # Callback for connection attempt failure (persist mode)
+    on_disconnected: DisconnectCallback  # Callback for disconnection events
+
+    # Debug / logging
+    on_protocol_message: Callable[[str], None]  # Optional function to output protocol messages
+    on_debug_message: Callable[[str], None]  # Optional function to output debug messages
+    module: str  # Client module name for debugging and identification
+
+    # Connection behavior
+    persist: bool  # Enable automatic reconnection with exponential backoff (default: False)
+    request_timeout: float  # Default timeout in ms for individual requests (default: None/no timeout)
+    max_retry_time: float  # Max total time in ms to keep retrying connections (default: None/forever)
+
+
+# =============================================================================
+# CONNECT RESULT — returned by connect() after successful authentication
+# =============================================================================
+
+
+class TeamInfo(TypedDict):
+    """
+    Information about a single team within an organisation.
+
+    Attributes:
+        id (str): Unique identifier for the team.
+        name (str): Human-readable display name.
+        permissions (list[str]): Permission strings granted to this team.
+    """
+
+    id: str
+    name: str
+    permissions: list[str]
+
+
+class OrgInfo(TypedDict):
+    """
+    Information about a single organisation the authenticated user belongs to.
+
+    Attributes:
+        id (str): Unique identifier for the organisation.
+        name (str): Human-readable display name.
+        developerId (str | None): Public developer slug — the organisation's app
+            publisher identity ('<developerId>.<appName>'). None/absent until the
+            organisation registers as a marketplace developer (always absent on OSS).
+        permissions (list[str]): Permission strings granted at the org level.
+        teams (list[TeamInfo]): Teams within this organisation that the user is a member of.
+    """
+
+    id: str
+    name: str
+    developerId: NotRequired[str | None]
+    permissions: list[str]
+    teams: list[TeamInfo]
+
+
+class DevEntry(TypedDict):
+    """
+    One live dev-server registration in an app's ``devEntries`` list.
+
+    The server emits all three keys on every entry ('' / 0 as the unknown
+    fallbacks), so none is optional.
+
+    Attributes:
+        url (str): The dev server's remoteEntry URL (with its cache-buster).
+        session (str): The owning editor's session nonce ('' when unknown).
+        registeredAt (float): Registration time, epoch seconds (0 when unknown).
+    """
+
+    url: str
+    session: str
+    registeredAt: float
+
+
+class AppManifestEntry(TypedDict, total=False):
+    """
+    A single app entry in the server-provided manifest.
+
+    Same shape as the build-time apps.json entries, extended with
+    optional pricing and visibility metadata for SaaS deployments.
+    When returned as a desktop app in ConnectResult.apps, also includes
+    subscription status fields.
+
+    Attributes:
+        id (str): Unique app identifier (e.g. "rocketride.pipeBuilder").
+        moduleId (str): Module Federation remote name.
+        name (str): Human-readable app name.
+        description (str): Short description.
+        icon (str): URL path to the app's icon.
+        categories (list[str]): Category tags for filtering.
+        configuration (dict): Settings contribution in the VSCode
+            ``contributes.configuration`` shape ({title, properties}). Preserved
+            through ConnectResult so permission-gated desktop apps (which never
+            appear in the public probe) still deliver their settings schema.
+        entry (str): URL to the app's MF remote entry file — present ONLY
+            for dev-overlay entries (a localhost dev server is not
+            constructible from a number). Published versions carry
+            ``registryVersion`` and clients construct
+            ``/apps/<appId>/v<N>/remoteEntry.js``.
+        registryVersion (int): Registry version number the entry resolves
+            to (the scope-walk winner).
+        version (str): Semver version string.
+        ownerType (str): Visibility scope — "public", "org", "team", or "user".
+        authenticated (bool): Whether the app UI requires auth to render.
+        public (bool): Whether the app is visible to unauthenticated users.
+        stripeProductId (str): Stripe product ID (SaaS paid apps only).
+        stripePrices (list): Available pricing tiers (SaaS paid apps only).
+        appStatus (str): App lifecycle status (auth|free|unsubscribed|subscribed|trialing|past_due|canceled).
+        onDesktop (bool): Whether this app is on the user's desktop.
+        seats (int): Total seats on the subscription.
+        seatsUsed (int): Seats currently occupied in this org.
+        features (list[str]): Feature flags enabled by the subscribed plan.
+        dev (bool): True when ``entry`` is a dev-overlay override (live
+            watch build).
+        devEntries (list[DevEntry]): Every live dev-server registration
+            for this app — one per editor session, newest first; ``entry``
+            already carries the newest.
+    """
+
+    id: str
+    moduleId: str
+    name: str
+    description: str
+    icon: str
+    categories: list[str]
+    configuration: dict[str, Any]
+    entry: str
+    registryVersion: int
+    version: str
+    ownerType: str
+    authenticated: bool
+    public: bool
+    stripeProductId: str
+    stripePrices: list[dict]
+    appStatus: str
+    onDesktop: bool
+    seats: int
+    seatsUsed: int
+    features: list[str]
+    dev: bool
+    devEntries: list[DevEntry]
+
+
+class ConnectResult(TypedDict, total=False):
+    """
+    Full identity payload returned by the server after a successful authentication handshake.
+
+    All fields are optional (total=False) because older server versions may omit some.
+
+    Attributes:
+        userToken (str): A durable ``rr_`` prefixed token the SDK persists for reconnection.
+        userId (str): Unique identifier of the authenticated user.
+        displayName (str): Full display name (e.g. "Jane Smith").
+        givenName (str): First / given name.
+        familyName (str): Last / family name.
+        preferredUsername (str): Preferred short username or handle.
+        email (str): Primary email address.
+        emailVerified (bool): True when the email address has been verified.
+        phoneNumber (str): Primary phone number in E.164 format.
+        phoneNumberVerified (bool): True when the phone number has been verified.
+        locale (str): BCP-47 locale tag (e.g. "en-US").
+        devTeam (str): The user's DEV team — dev-mode runs bill to it and use its environment layer.
+        organization (OrgInfo | None): The organisation the user belongs to, or None.
+        apps (list[AppManifestEntry]): Apps on the user's desktop — full manifest entries with subscription status.
+        serverVersion (str): Version string of the server that handled the handshake; newer servers only.
+        waitlisted (bool): True when authenticated but not yet granted full app access.
+    """
+
+    userToken: str
+    userId: str
+    displayName: str
+    givenName: str
+    familyName: str
+    preferredUsername: str
+    email: str
+    emailVerified: bool
+    phoneNumber: str
+    phoneNumberVerified: bool
+    locale: str
+    devTeam: str
+    organization: OrgInfo
+    capabilities: list[str]
+    serverVersion: str
+    sysPermissions: list[str]
+    credits: dict
+    apps: list[AppManifestEntry]
+    waitlisted: bool
+
+
+class ServerInfoResult(TypedDict, total=False):
+    """
+    Server metadata returned by the pre-auth info probe.
+
+    Obtained via :meth:`RocketRideClient.get_server_info` which sends an
+    ``rrext_public_probe`` command on a public connection. The server
+    responds without requiring credentials.
+
+    Attributes:
+        version (str): Server engine version string.
+        capabilities (list[str]): Capability tags — ``['oss']`` for open-source,
+            ``['saas']`` for cloud.
+        platform (str): Server platform (e.g. ``'linux'``, ``'win32'``, ``'darwin'``).
+        apps (list[AppManifestEntry]): Public apps visible without authentication.
+        stripePublishableKey (str): Stripe publishable key (``pk_*``) configured
+            on this server, so clients initialise Stripe Elements with the key
+            matching the server's Stripe account (test vs live) instead of a
+            build-time value. Absent on servers without billing (OSS).
+        endpoints (ServerEndpoints): The server's public addresses, RESOLVED
+            to absolute URLs by :meth:`RocketRideClient.get_server_info` —
+            the server's ``'origin'`` sentinel ("the address you probed me
+            at") is substituted client-side, and the block is manufactured
+            when probing a pre-endpoints server. Consumers always receive
+            both keys and never branch on presence.
+    """
+
+    version: str
+    capabilities: list[str]
+    platform: str
+    apps: list[AppManifestEntry]
+    stripePublishableKey: str
+    endpoints: 'ServerEndpoints'
+
+
+class ServerEndpoints(TypedDict):
+    """
+    The server's public addresses from the pre-auth probe, resolved.
+
+    Attributes:
+        api (str): Absolute URL clients connect the DAP WebSocket to.
+        ui (str): Absolute URL of the environment's web UI (browser links,
+            OAuth returns). Differs from ``api`` only on split deployments
+            (e.g. a CDN-served UI with a direct API host).
+    """
+
+    api: str
+    ui: str

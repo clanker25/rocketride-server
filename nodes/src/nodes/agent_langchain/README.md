@@ -1,0 +1,127 @@
+# agent_langchain
+
+A RocketRide agent node for answering questions with a LangChain agent loop and
+the LLM and tools wired into the pipeline. Choose it when a single agent should
+use LangChain's structured tool-call flow, rather than coordinate CrewAI
+subagents.
+
+## About LangChain
+
+LangChain is a framework for building applications that combine language models
+with tools and message-based workflows. This node uses its agent and chat-model
+interfaces while keeping model and tool execution on RocketRide connections.
+
+## What it does
+
+The node accepts a question on `questions`, runs a LangChain agent using the
+connected LLM and any connected tools, then writes the final text to `answers`.
+It is also available to a parent agent as a tool. The LLM adapter asks the model
+for a JSON envelope that represents either a tool call or a final answer, then
+converts it into LangChain's structured message form. Choose this node for that
+single-agent LangChain flow; use the CrewAI manager when work must be delegated
+to configured specialist subagents.
+
+## Connections
+
+| Connection | Required | Description |
+| --- | --- | --- |
+| `llm` | yes | LLM used by the agent. |
+| `tool` | no | Tools available to the agent through control-plane invocation. |
+
+The `llm` connection is required. With no `tool` connection, the agent can
+still produce a final answer, but has no pipeline tools to call.
+
+## Lanes
+
+| Lane in | Lane out | Description |
+| --- | --- | --- |
+| `questions` | `answers` | Run the agent for each incoming question and emit its final answer. |
+
+During a run, the node sends `thinking` SSE updates for agent startup,
+LLM activity, and tool-call activity.
+
+## As a tool
+
+The registered tool name is `<nodeId>.run_agent`, where `<nodeId>` is this
+node's pipeline ID; it has no separately configured server-name prefix.
+
+| Function | Description |
+| --- | --- |
+| `<nodeId>.run_agent` | Run this LangChain agent for a delegated query and return its agent result. |
+
+The input must be an object with required non-empty `query: string` and optional
+`context: object`. The node stores supplied context as a
+`RocketRide.agent.tool_context.v1` context entry. The call returns
+`{content, meta, stack}` to its caller instead of writing to `answers`.
+`meta` holds the framework, agent and run ids, timings and the tool-call count; it carries `stop_reason` when the run reports why it stopped (`error` when it raised, or when the `require_tool_call` guard refused its answer), and no `stop_reason` means none was reported, not that the run finished. The task's control token is never included.
+Non-object input, a blank query, or a non-object context raises `ValueError`.
+If the LLM does not produce a parsable envelope after three attempts, the
+adapter supplies an explanatory final message rather than a tool call.
+
+## Configuration
+
+The only profile is `default`: connect an LLM first, then add tools only when
+the agent needs to take actions or retrieve information. Most pipelines can
+leave the profile selection alone and set the fields that shape delegation and
+answering behavior.
+
+### Agent description
+
+This text is added to the registered `run_agent` tool description when it is
+non-empty. Set it when another agent may choose this node, describing the
+specialist job and the kinds of requests it should receive; leave it empty when
+the node is only driven from its `questions` lane. A concrete description such
+as “Summarizes retrieved policy documents” gives a parent a usable routing cue.
+
+### Instructions
+
+Use the instruction list for additional guidance supplied by this node's
+configuration. Keep each entry narrowly scoped to the work the agent should do
+or the constraints it must honor. Put enduring routing information in **Agent
+description** instead, because that is the text exposed to parent agents.
+
+### Require tool call
+
+This option is off by default. Turn it on for a workflow where an answer must
+follow at least one real tool invocation, for example a response that must be
+grounded in a connected store. Leave it off when the agent can validly answer
+without a tool; enabled runs that answer without a tool fail with the declared
+guard error.
+
+## Notes
+
+### JSON tool-call protocol
+
+RocketRide's LLM seam is text-based, while the LangChain agent expects
+structured tool calls. On each model turn, the adapter requests exactly one
+JSON object: `{"type":"tool_call","name":"server.tool","args":{...}}` or
+`{"type":"final","content":"..."}`. It retries malformed output twice with
+a correction prompt; after the third invalid response it returns an explanatory
+AI message. Connected tools receive dynamically built argument schemas from
+their declared input schemas, with a generic `input` field as the fallback.
+
+## Upstream docs
+
+- [LangChain documentation](https://docs.langchain.com/)
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `agent_description` | `string` | **Agent description**<br/>What does this agent do? Describe its purpose and capabilities, this helps parent agents select and invoke it correctly. | `""` |
+| `agent_langchain.profile` | `string` | **Profile** | `"default"` |
+| `instructions` | `array` | **Instructions**<br/>Additional instructions to guide the agent. |  |
+| `require_tool_call` | `boolean` | **Require tool call**<br/>Require the agent to invoke at least one tool before answering. When on, a run that answers without calling any tool fails with a guard error. Use for determinism-critical pipelines where an ungrounded or narrated answer must never be delivered. Off by default. | `false` |
+
+## Dependencies
+
+- `langchain`
+- `langchain-core`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/agent_langchain)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

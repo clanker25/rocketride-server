@@ -1,0 +1,37 @@
+{
+	"compilerOptions": {
+		"target": "ES2020",
+		"lib": [
+			"ES2020",
+			"DOM",
+			"DOM.Iterable"
+		],
+		"module": "ESNext",
+		"moduleResolution": "node",
+		"strict": false,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": true,
+		"noImplicitAny": true,
+		"noImplicitReturns": true,
+		"noImplicitThis": false,
+		"noUnusedLocals": true,
+		"strictNullChecks": true,
+		"strictPropertyInitialization": true
+	},
+	"include": [
+		"./src/client/**/*",
+		"./src/app-pack/**/*",
+		"./src/app-dev/**/*",
+		"./src/app-scaffold/**/*",
+		"./src/app-sdk/**/*"
+	],
+	"exclude": [
+		"node_modules",
+		"dist",
+		"**/*.test.ts",
+		"**/*.spec.ts"
+	]
+}

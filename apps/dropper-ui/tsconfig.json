@@ -1,0 +1,86 @@
+{
+	"compilerOptions": {
+		/* Language and Environment */
+		"target": "ES2022",
+		"lib": [
+			"ES2022",
+			"DOM",
+			"DOM.Iterable"
+		],
+		"module": "ESNext",
+		/* Bundler mode */
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": false,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"jsx": "react-jsx",
+		/* Type Checking */
+		"strict": false,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": false,
+		"exactOptionalPropertyTypes": true,
+		"noImplicitReturns": true,
+		"noImplicitOverride": true,
+		"noUncheckedIndexedAccess": true,
+		/* Module Resolution */
+		"paths": {
+			"@/*": [
+				"./src/*"
+			],
+			"@components/*": [
+				"./src/components/*"
+			],
+			"@pages/*": [
+				"./src/pages/*"
+			],
+			"@apptypes/*": [
+				"./src/types/*"
+			],
+			"@utils/*": [
+				"./src/utils/*"
+			],
+			"@hooks/*": [
+				"./src/hooks/*"
+			],
+			"@services/*": [
+				"./src/services/*"
+			],
+			"@assets/*": [
+				"./src/assets/*"
+			]
+		},
+		/* Interop Constraints */
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": false,
+		"forceConsistentCasingInFileNames": false,
+		/* Skip Lib Check */
+		"skipLibCheck": true,
+		/* Additional Options for React */
+		"allowJs": false,
+		"checkJs": false
+	},
+	"include": [
+		"src/**/*",
+		"src/**/*.ts",
+		"src/**/*.tsx",
+		"src/**/*.js",
+		"src/**/*.jsx",
+		"src/types/global.d.ts",
+		"public/**/*",
+		"*.ts",
+		"*.tsx",
+    "rsbuild.config.mts"
+	],
+	"exclude": [
+		"node_modules",
+		"dist",
+		"build",
+		"coverage",
+		"**/*.test.ts",
+		"**/*.test.tsx",
+		"**/*.spec.ts",
+		"**/*.spec.tsx"
+	]
+}

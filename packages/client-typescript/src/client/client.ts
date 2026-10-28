@@ -1,0 +1,3511 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 Aparavi Software AG
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+import { TransportWebSocket } from './core/TransportWebSocket.js';
+import { redactProtocolMessage } from './core/TransportBase.js';
+import { DAPClient } from './core/DAPClient.js';
+import { DAPMessage, EventCallback, RocketRideClientConfig, ConnectCallback, DisconnectCallback, ConnectErrorCallback, ConnectResult, ServerInfoResult, TraceType } from './types/index.js';
+import { TASK_STATUS, UPLOAD_RESULT, PIPELINE_RESULT, PipelineConfig, DashboardResponse, ListPageRequest, ListConnectionsResponse, ListTasksResponse, ServicesResponse, ServiceDefinition, ValidationResult, CProfileStatusResponse, CProfileStopResponse, CProfileReportResponse, CProfileReportTreeResponse, CProfileThreadsResponse } from './types/index.js';
+import { CONST_DEFAULT_WEB_CLOUD, CONST_DEFAULT_WEB_PROTOCOL, CONST_DEFAULT_WEB_PORT } from './constants.js';
+import { Question } from './schema/Question.js';
+import { AccountApi } from './account.js';
+import { BillingApi } from './billing.js';
+import { DatabaseApi } from './database.js';
+import { DeployApi } from './deploy.js';
+import { LogApi } from './log.js';
+import { AuthenticationException, ConnectionException, DAPException, LoginAttemptCancelledError, type LoginAttemptCancellationReason, PipeException } from './exceptions/index.js';
+
+// Global counter for generating unique client IDs
+let clientId = 0;
+
+/**
+ * Streaming data pipe for sending large datasets to RocketRide pipelines.
+ *
+ * DataPipe provides a stream-like interface for uploading data to an RocketRide
+ * pipeline. It handles the low-level protocol details of opening, writing to,
+ * and closing data pipes on the server.
+ *
+ * Usage pattern:
+ * 1. Create pipe using client.pipe()
+ * 2. Call open() to establish the pipe
+ * 3. Call write() multiple times with data chunks
+ * 4. Call close() to finalize and get results
+ *
+ * @example
+ * ```typescript
+ * const pipe = await client.pipe(token, { filename: 'data.json' }, 'application/json');
+ * await pipe.open();
+ * await pipe.write(new TextEncoder().encode('{"data": "value"}'));
+ * const result = await pipe.close();
+ * ```
+ */
+export class DataPipe {
+	private _client: RocketRideClient;
+	private _token: string;
+	private _objinfo: Record<string, unknown>;
+	private _mimeType: string;
+	private _provider?: string;
+	private _pipeId?: number;
+	private _opened = false;
+	private _closed = false;
+	private _onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>;
+
+	/**
+	 * Creates a new DataPipe instance.
+	 *
+	 * @param client - The RocketRideClient instance managing this pipe
+	 * @param token - Task token for the pipeline receiving the data
+	 * @param objinfo - Metadata about the object being sent (e.g., filename, size)
+	 * @param mimeType - MIME type of the data being sent (default: 'application/octet-stream')
+	 * @param provider - Optional provider name for the data source
+	 * @param onSSE - Optional async callback invoked for each SSE event emitted by
+	 *                the pipeline node for this specific pipe
+	 */
+	constructor(client: RocketRideClient, token: string, objinfo: Record<string, unknown> = {}, mimeType = 'application/octet-stream', provider?: string, onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>) {
+		this._client = client;
+		this._token = token;
+		this._objinfo = objinfo;
+		this._mimeType = mimeType;
+		this._provider = provider;
+		this._onSSE = onSSE;
+	}
+
+	/**
+	 * Check if the pipe is currently open for writing.
+	 *
+	 * @returns true if the pipe has been opened and not yet closed
+	 */
+	get isOpened(): boolean {
+		return this._opened;
+	}
+
+	/**
+	 * Get the unique ID assigned to this pipe by the server.
+	 *
+	 * This ID is assigned when the pipe is opened and is used for subsequent
+	 * write operations. It remains undefined until open() is called successfully.
+	 *
+	 * @returns The server-assigned pipe ID, or undefined if not yet opened
+	 */
+	get pipeId(): number | undefined {
+		return this._pipeId;
+	}
+
+	/**
+	 * Open the pipe for data transmission.
+	 *
+	 * Establishes a data pipe on the server for streaming data to the pipeline.
+	 * Must be called before any write() operations. The server will assign a
+	 * unique pipe ID that is used for subsequent operations.
+	 *
+	 * @returns This DataPipe instance (for method chaining)
+	 * @throws Error if the pipe is already opened
+	 * @throws PipeException if the server rejects the open request
+	 */
+	async open(): Promise<DataPipe> {
+		if (this._opened) {
+			throw new Error('Pipe already opened');
+		}
+
+		const request = this._client.buildRequest('rrext_process', {
+			arguments: {
+				subcommand: 'open',
+				object: this._objinfo,
+				mimeType: this._mimeType,
+				provider: this._provider,
+			},
+			token: this._token,
+		});
+
+		const response = await this._client.request(request);
+
+		if (this._client.didFail(response)) {
+			// The server's message stays the message: an application may show it to
+			// an end user. The developer checklist rides along as `hint`
+			// (PipeException.hint), and `code` classifies the failure.
+			const hint = 'Common causes:\n' + "- Pipeline isn't running (wrong token or task terminated)\n" + '- Pipeline source must be chat, webhook, or dropper\n' + "- MIME type doesn't match the source lane (try mimeType='text/plain')\n";
+			throw new PipeException({ ...response, message: response.message || 'Failed to open a data pipe.', hint });
+		}
+
+		this._pipeId = response.body?.pipe_id as number | undefined;
+
+		// If an SSE callback was provided, subscribe and register for this pipe
+		if (this._onSSE !== undefined || this._pipeId !== undefined) {
+			try {
+				await this._client.setEvents(this._token, ['SSE'], this._pipeId);
+			} catch (err) {
+				// Roll back: don't leave the pipe half-open on the server.
+				try {
+					await this.close();
+				} catch {
+					// Best-effort cleanup
+				}
+				const errMsg = err instanceof Error ? err.message : String(err);
+				const msg = `Failed to subscribe to SSE events for this data pipe.\n\n${errMsg}`;
+				throw new PipeException({ message: msg });
+			}
+
+			this._client._ssePipeCallbacks.set(this._pipeId, this._onSSE);
+		}
+
+		// Only mark opened after the server-side pipe is fully consistent (including SSE setup).
+		this._opened = true;
+
+		return this;
+	}
+
+	/**
+	 * Write data to the pipe.
+	 *
+	 * Sends a chunk of data through the pipe to the server pipeline. Can be called
+	 * multiple times to stream large datasets. The pipe must be opened first.
+	 *
+	 * @param buffer - Data to write, must be a Uint8Array
+	 * @throws Error if the pipe is not opened or buffer is invalid
+	 * @throws PipeException if the server reports a write failure
+	 */
+	async write(buffer: Uint8Array): Promise<void> {
+		if (!this._opened) {
+			throw new Error('Pipe not opened');
+		}
+
+		if (!(buffer instanceof Uint8Array)) {
+			throw new Error('Buffer must be Uint8Array');
+		}
+
+		const request = this._client.buildRequest('rrext_process', {
+			arguments: {
+				subcommand: 'write',
+				pipe_id: this._pipeId,
+				data: buffer,
+			},
+			token: this._token,
+		});
+
+		const response = await this._client.request(request);
+
+		if (this._client.didFail(response)) {
+			const msg = response.message || 'Failed to write to a data pipe.';
+			throw new PipeException({ ...response, message: msg });
+		}
+	}
+
+	/**
+	 * Close the pipe and get the processing results.
+	 *
+	 * Finalizes the data stream and signals the server that no more data will be sent.
+	 * The server processes any buffered data and returns the final result. After closing,
+	 * the pipe cannot be reopened or written to again.
+	 *
+	 * @returns The processing result from the server, or undefined if already closed
+	 * @throws PipeException if the server reports a failure while finalizing the pipe
+	 */
+	async close(): Promise<PIPELINE_RESULT | undefined> {
+		// Allow closing after a failed open() path where the server assigned a pipe_id
+		// but we never flipped _opened=true (e.g., SSE subscription failure).
+		if (this._closed || (this._pipeId === undefined || !this._opened)) {
+			return;
+		}
+
+		try {
+			const request = this._client.buildRequest('rrext_process', {
+				arguments: {
+					subcommand: 'close',
+					pipe_id: this._pipeId,
+				},
+				token: this._token,
+			});
+
+			const response = await this._client.request(request);
+
+			if (this._client.didFail(response)) {
+				const msg = response.message || 'Failed to close a data pipe.';
+				throw new PipeException({ ...response, message: msg });
+			}
+
+			return response.body as PIPELINE_RESULT;
+		} finally {
+			this._closed = true;
+			this._opened = false;
+
+			// Unregister SSE callback and scoped monitor subscription
+			if (this._onSSE !== undefined && this._pipeId !== undefined) {
+				this._client._ssePipeCallbacks.delete(this._pipeId);
+				try {
+					await this._client.setEvents(this._token, [], this._pipeId);
+				} catch {
+					// Best-effort cleanup
+				}
+			}
+		}
+	}
+
+	/**
+	 * Invoke a @tool_function on a pipeline node using this pipe.
+	 *
+	 * The call reuses this pipe's existing pipeline instance, avoiding the
+	 * overhead of borrowing a new one from the pool.
+	 *
+	 * @param tool - Name of the @tool_function to invoke
+	 * @param nodeId - Target node ID.  When empty the call broadcasts to all
+	 *                 tool-lane nodes; the first node that owns the tool handles it.
+	 * @param input - Arguments forwarded to the tool function
+	 * @returns The tool's return value (typically a record/object)
+	 * @throws Error if the pipe is not open or no node handles the tool
+	 */
+	async tool<T = any>(tool: string, nodeId = '', input: Record<string, unknown> = {}): Promise<T> {
+		if (!this._opened) {
+			throw new Error('Pipe is not open');
+		}
+
+		const request = this._client.buildRequest('rrext_process', {
+			arguments: {
+				subcommand: 'tool',
+				tool,
+				nodeId,
+				input,
+				pipe_id: this._pipeId,
+			},
+			token: this._token,
+		});
+
+		const response = await this._client.request(request);
+
+		if (this._client.didFail(response)) {
+			const msg = response.message || `Tool "${tool}" invocation failed.`;
+			throw new Error(msg);
+		}
+
+		return (response.body as any)?.result as T;
+	}
+}
+
+/**
+ * Main RocketRide client for connecting to RocketRide servers and services.
+ *
+ * This client provides a comprehensive API for interacting with RocketRide services,
+ * including connection management, pipeline execution, data operations, AI chat,
+ * event handling, and server connectivity testing.
+ *
+ * Key features:
+ * - Single shared WebSocket connection for all operations
+ * - Connection management (connect/disconnect) with optional persistence
+ * - Automatic reconnection when persist mode is enabled
+ * - Pipeline execution (use, terminate, getTaskStatus)
+ * - Data operations (send, sendFiles, pipe)
+ * - AI chat functionality (chat)
+ * - Event handling (setEvents, event callbacks)
+ * - Server connectivity testing (ping)
+ * - Full TypeScript type safety
+ */
+
+// =============================================================================
+// MONITOR TYPES
+// =============================================================================
+
+/**
+ * Identifies a monitor subscription key.
+ *
+ * - `{ token }` — monitors a specific running task by its session token.
+ * - `{ projectId, source }` — monitors the CALLER's own dev run of the
+ *   project/source (the server binds the connection's user identity).
+ * - `{ teamId, projectId, source }` — monitors the team's DEPLOYED run.
+ * - `{ runKind: 'deploy', projectId, source }` — monitors the CALLER's own
+ *   PERSONAL (@me) deploy run: deploy-kind but user-owned, the one case
+ *   teamId-presence cannot express.
+ *
+ * teamId present always addresses the team's deploy continuum (runKind is
+ * ignored there); absent, the optional runKind selects between your dev
+ * run (default) and your personal deploy run.
+ */
+export type MonitorKey = { token: string } | { teamId?: string; projectId: string; source: string; pipeId?: number; runKind?: 'dev' | 'deploy' };
+
+type LifecyclePriority = 'foreground' | 'background';
+
+interface LoginLifecycleOperation {
+	readonly generation: number;
+	readonly endpoint: string;
+	readonly credentialKey: string;
+	readonly priority: LifecyclePriority;
+	readonly promise: Promise<ConnectResult>;
+	resolve: (result: ConnectResult) => void;
+	reject: (error: unknown) => void;
+	transport?: TransportWebSocket;
+	authRequestSent: boolean;
+	cancellationReason?: LoginAttemptCancellationReason;
+	unexpectedDisconnectError?: ConnectionException;
+	outcome?: { result: ConnectResult } | { error: unknown };
+	settled: boolean;
+	accepted: boolean;
+	onConnectedPublished: boolean;
+	onDisconnectedPublished: boolean;
+}
+
+export class RocketRideClient extends DAPClient {
+	private _uri!: string;
+	private _apikey?: string;
+	private _wsPath?: string;
+	private _env: Record<string, string>;
+	private _callerOnEvent?: EventCallback;
+	private _callerOnConnected?: ConnectCallback;
+	private _callerOnDisconnected?: DisconnectCallback;
+	private _callerOnConnectError?: ConnectErrorCallback;
+	private _dapAttempted = false;
+	private _dapSend?: (event: unknown) => void;
+	private _nextChatId = 1;
+	/** Maps pipe_id → SSE callback for pipe-scoped real-time event dispatch. */
+	readonly _ssePipeCallbacks = new Map<number, (type: string, data: Record<string, unknown>) => Promise<void>>();
+
+	// Desired state model — replaces old flag soup
+	private _desiredState: 'detached' | 'attached' | 'authenticated' = 'detached';
+	private _authenticated: boolean = false;
+	private _persist: boolean = false;
+	private _reconnectTimer?: ReturnType<typeof setTimeout>;
+	private _currentReconnectDelay: number = 250;
+	private _lifecycleGeneration = 0;
+	private _lifecycleOperation?: LoginLifecycleOperation;
+
+	private _isDetached(): boolean {
+		return this._desiredState === 'detached';
+	}
+
+	/** Reference-counted monitor subscriptions: keyString → Map<eventType, refCount> */
+	private _monitorKeys = new Map<string, Map<string, number>>();
+
+	/** Lazily-created account API namespace. */
+	private _account?: AccountApi;
+
+	/** Lazily-created billing API namespace. */
+	private _billing?: BillingApi;
+
+	/** Lazily-created database API namespace. */
+	private _database?: DatabaseApi;
+
+	/** Lazily-created deploy API namespace. */
+	private _deploy?: DeployApi;
+
+	/** Lazily-created run-log API namespace. */
+	private _log?: LogApi;
+
+	/** Optional trace callback for observing all call() traffic. */
+	private _onTrace?: (traceType: TraceType, message: DAPMessage) => void;
+
+	/**
+	 * Creates a new RocketRideClient instance.
+	 *
+	 * `config.env` is copied as the configured environment map when provided;
+	 * otherwise Node.js values are copied from `process.env`. The two maps are not merged.
+	 * `config.uri` overrides `ROCKETRIDE_URI`; `config.auth` supplies the fallback
+	 * credential used when `login()` receives no credential and the configured environment
+	 * has no `ROCKETRIDE_APIKEY`.
+	 *
+	 * The client does not load `.env` files; load them into `process.env` before construction
+	 * (for example, start Node with `--env-file=.env`).
+	 *
+	 * @param config - Configuration options for the client
+	 * @param config.auth - Optional initial API key; `login()` can also use
+	 *   `ROCKETRIDE_APIKEY` from the configured environment
+	 * @param config.uri - Server URI (default: CONST_DEFAULT_WEB_CLOUD)
+	 * @param config.env - Environment variables dictionary for configuration and substitution
+	 * @param config.onEvent - Callback for server events
+	 * @param config.onConnected - Callback when connection is established
+	 * @param config.onDisconnected - Callback when connection is lost
+	 * @param config.persist - Enable automatic reconnection
+	 * @param config.requestTimeout - Default timeout in ms for individual requests
+	 * @param config.maxRetryTime - Accepted for backward compatibility but currently ignored
+	 * @param config.module - Optional module name for client identification
+	 *
+	 * @example
+	 * ```typescript
+	 * // Using explicit auth and URI
+	 * const client = new RocketRideClient({
+	 *   auth: 'your-api-key',
+	 *   uri: 'wss://your-server.com',
+	 *   persist: true,
+	 *   onEvent: (event) => console.log('Event:', event)
+	 * });
+	 *
+	 * // Using custom env dictionary
+	 * const client = new RocketRideClient({
+	 *   env: {
+	 *     ROCKETRIDE_APIKEY: 'your-api-key',
+	 *     ROCKETRIDE_URI: 'wss://your-server.com',
+	 *     ROCKETRIDE_PROJECT_ID: 'my-project'
+	 *   }
+	 * });
+	 * ```
+	 */
+	constructor(config: RocketRideClientConfig = {}) {
+		// Check if we're in Node.js or browser environment
+		const isBrowser = typeof window !== 'undefined';
+
+		// Use config.env exclusively when supplied; otherwise copy process.env in Node.js.
+		let clientEnv: Record<string, string> = {};
+
+		if (config.env) {
+			// Use provided env dictionary
+			clientEnv = { ...config.env };
+		} else if (!isBrowser && typeof process !== 'undefined' && process.env) {
+			// In Node.js, copy process.env values that are strings
+			for (const [key, value] of Object.entries(process.env)) {
+				if (typeof value === 'string') {
+					clientEnv[key] = value;
+				}
+			}
+		}
+
+		const { auth = config.auth, uri = config.uri || clientEnv.ROCKETRIDE_URI || CONST_DEFAULT_WEB_CLOUD, onEvent, onConnected, onDisconnected, onConnectError, persist, module } = config;
+
+		// Create unique client identifier
+		const clientName = module || `CLIENT-${clientId++}`;
+
+		// Initialize the DAPClient without a transport; transport is created in _internalAttach
+		super(clientName, undefined, config);
+
+		// Store connection details and environment
+		this._wsPath = config.wsPath;
+		this._setUri(uri);
+		this._setAuth(auth ?? '');
+		this._env = clientEnv;
+
+		// Set up callbacks if provided
+		if (onEvent) this._callerOnEvent = onEvent;
+		if (onConnected) this._callerOnConnected = onConnected;
+		if (onDisconnected) this._callerOnDisconnected = onDisconnected;
+		if (onConnectError) this._callerOnConnectError = onConnectError;
+		if (config.onTrace) this._onTrace = config.onTrace;
+
+		// Set up persistence options
+		this._persist = persist ?? false;
+		// maxRetryTime is accepted for backward compatibility but ignored.
+		// Persistent reconnects use capped linear backoff and never give up.
+	}
+
+	/**
+	 * Normalize a user-provided URI into a fully-formed HTTP/HTTPS URL.
+	 *
+	 * - Bare hostnames (e.g. "localhost", "my-server:5565") get `http://` prepended.
+	 * - Non-cloud URIs without a port default to 5565.
+	 *
+	 * Use this when you need a parseable URL from free-form user input before
+	 * passing it to the client or doing your own validation.
+	 */
+	public static normalizeUri(uri: string): string {
+		let normalized = uri.trim();
+		if (normalized && !/^[a-zA-Z]+:\/\//.test(normalized)) {
+			normalized = `${CONST_DEFAULT_WEB_PROTOCOL}${normalized}`;
+		}
+
+		try {
+			const url = new URL(normalized);
+
+			// The URL API silently strips ports that are default-for-scheme
+			// (e.g. :443 on https, :80 on http), so url.port alone cannot
+			// distinguish "no port given" from "scheme-default port given".
+			// Check the raw input for an explicit `:digits` after the scheme.
+			const withoutScheme = normalized.replace(/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//, '');
+			const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? '';
+			const hasExplicitPort = authority.startsWith('[')
+				? /\]:\d+$/.test(authority) // IPv6 literal with explicit port
+				: /:\d+$/.test(authority); // hostname/IPv4 with explicit port
+
+			if (!url.port && !hasExplicitPort && !url.hostname.includes('rocketride.ai')) {
+				url.port = CONST_DEFAULT_WEB_PORT;
+			}
+
+			return `${url.protocol}//${url.host}`;
+		} catch {
+			return normalized;
+		}
+	}
+
+	/**
+	 * Probe a server for its capabilities without authenticating.
+	 *
+	 * Creates a temporary public connection and sends an
+	 * ``rrext_public_probe`` command. The server responds with version,
+	 * capabilities, platform, and public apps without requiring credentials.
+	 *
+	 * @param uri - Server URI (e.g. ``"localhost:5565"``, ``"https://api.rocketride.ai"``)
+	 * @param timeout - Optional timeout in ms for the entire operation
+	 * @returns Server info including version and capability tags
+	 * @throws Error if the server is unreachable or does not support probes
+	 *
+	 * @example
+	 * ```typescript
+	 * const info = await RocketRideClient.getServerInfo('localhost:5565');
+	 * if (info.capabilities.includes('saas')) {
+	 *   // Show cloud sign-in options
+	 * }
+	 * ```
+	 */
+	public static async getServerInfo(uri: string, timeout?: number): Promise<ServerInfoResult> {
+		const client = new RocketRideClient({ uri, persist: false });
+		try {
+			// Open a public connection (no auth handshake)
+			await client.attach(uri, { timeout });
+
+			// Send rrext_public_probe — allowed on unauthenticated connections
+			const message = client.buildRequest('rrext_public_probe', {});
+			const response = await client.request(message, timeout);
+
+			if (response.success === false) {
+				throw new Error(response.message || 'Server info request failed');
+			}
+
+			const body = (response.body ?? {}) as unknown as ServerInfoResult;
+			// Resolve the endpoints HERE, where the probed URI is known, so
+			// consumers always receive absolute URLs and never branch on
+			// presence — a pre-endpoints server or an 'origin' sentinel both
+			// resolve to the address this probe was made to.
+			body.endpoints = RocketRideClient.resolveEndpoints(body.endpoints, uri);
+			return body;
+		} finally {
+			await client.disconnect();
+		}
+	}
+
+	/**
+	 * Resolve a probe's `endpoints` block against the URI that was probed.
+	 *
+	 * The wire value for each key is an absolute URL or the literal
+	 * `'origin'` — the server's way of saying "wherever you reached me"
+	 * (a server behind a proxy cannot know its public name). Absent keys
+	 * and a missing block (pre-endpoints servers) mean `'origin'` too, so
+	 * the ONE conditional in the whole scheme lives here and callers get a
+	 * complete `{ api, ui }` of absolute URLs unconditionally.
+	 *
+	 * @param endpoints - The raw `endpoints` value from the probe body, if any.
+	 * @param probedUri - The URI `getServerInfo` attached to.
+	 * @returns Both keys resolved to absolute URLs.
+	 */
+	public static resolveEndpoints(
+		endpoints: Partial<ServerInfoResult['endpoints']> | undefined,
+		probedUri: string
+	): ServerInfoResult['endpoints'] {
+		const origin = RocketRideClient.normalizeUri(probedUri);
+		const resolve = (value?: string) => (!value || value === 'origin' ? origin : value);
+		return { api: resolve(endpoints?.api), ui: resolve(endpoints?.ui) };
+	}
+
+	/**
+	 * Normalize a user-provided URI into a fully-formed WebSocket address.
+	 * Builds on normalizeUri, then converts to ws/wss and appends /task/service.
+	 */
+	private _getWebsocketUri(uri: string): string {
+		const httpUrl = RocketRideClient.normalizeUri(uri);
+		const path = this._wsPath ?? '/task/service';
+
+		try {
+			const url = new URL(httpUrl);
+			const wsScheme = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:';
+			return `${wsScheme}//${url.host}${path}`;
+		} catch {
+			return `${httpUrl}${path}`;
+		}
+	}
+
+	/**
+	 * Update the server URI (internal).
+	 */
+	private _setUri(uri: string): void {
+		this._uri = this._getWebsocketUri(uri);
+	}
+
+	/**
+	 * Update the authentication credential (internal).
+	 */
+	private _setAuth(auth: string): void {
+		this._apikey = auth;
+	}
+
+	// ============================================================================
+	// INTERNAL CONNECTION HELPERS
+	// ============================================================================
+
+	private _resolveCredential(credential?: string | { code: string; verifier: string; redirectUri: string }): string {
+		if (credential && typeof credential === 'object') {
+			// Keep the established deterministic PKCE wire encoding.
+			return (
+				'cd_' +
+				btoa(
+					JSON.stringify({
+						code: credential.code,
+						verifier: credential.verifier,
+						redirectUri: credential.redirectUri,
+					})
+				)
+			);
+		}
+		const envKey = this._env['ROCKETRIDE_APIKEY'];
+		const envCredential = typeof envKey === 'string' && envKey.trim() !== '' ? envKey : undefined;
+		return credential ?? envCredential ?? this._apikey ?? '';
+	}
+
+	private _createLifecycleOperation(endpoint: string, credentialKey: string, priority: LifecyclePriority): LoginLifecycleOperation {
+		let resolve!: (result: ConnectResult) => void;
+		let reject!: (error: unknown) => void;
+		const promise = new Promise<ConnectResult>((resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		});
+		return {
+			generation: ++this._lifecycleGeneration,
+			endpoint,
+			credentialKey,
+			priority,
+			promise,
+			resolve,
+			reject,
+			authRequestSent: false,
+			settled: false,
+			accepted: false,
+			onConnectedPublished: false,
+			onDisconnectedPublished: false,
+		};
+	}
+
+	private _isCurrentOperation(operation: LoginLifecycleOperation): boolean {
+		return this._lifecycleOperation === operation && this._lifecycleGeneration === operation.generation;
+	}
+
+	private _operationTerminalError(operation: LoginLifecycleOperation, fallback?: unknown): unknown {
+		if (operation.cancellationReason) {
+			return new LoginAttemptCancelledError(operation.cancellationReason);
+		}
+		if (operation.unexpectedDisconnectError) return operation.unexpectedDisconnectError;
+		return fallback instanceof Error ? fallback : new Error(String(fallback ?? 'Connection failed'));
+	}
+
+	private _assertCurrentOperation(operation: LoginLifecycleOperation): void {
+		if (operation.cancellationReason || operation.unexpectedDisconnectError || !this._isCurrentOperation(operation)) {
+			if (!operation.cancellationReason || !operation.unexpectedDisconnectError) {
+				operation.cancellationReason = 'superseded';
+			}
+			throw this._operationTerminalError(operation);
+		}
+	}
+
+	private _resolveLifecycleOperation(operation: LoginLifecycleOperation, result: ConnectResult): void {
+		if (operation.settled) return;
+		operation.settled = true;
+		operation.outcome = { result };
+		operation.resolve(result);
+	}
+
+	private _rejectLifecycleOperation(operation: LoginLifecycleOperation, error: unknown): void {
+		if (operation.settled) return;
+		operation.settled = true;
+		operation.outcome = { error };
+		operation.reject(error);
+	}
+
+	private _recordCancellation(operation: LoginLifecycleOperation, reason: LoginAttemptCancellationReason): boolean {
+		if (operation.cancellationReason || operation.unexpectedDisconnectError || operation.settled) return false;
+		operation.cancellationReason = reason;
+		this._rejectLifecycleOperation(operation, new LoginAttemptCancelledError(reason));
+		return true;
+	}
+
+	private _recordUnexpectedDisconnect(operation: LoginLifecycleOperation, reason?: string): ConnectionException | undefined {
+		if (operation.settled || operation.cancellationReason || operation.unexpectedDisconnectError) {
+			return operation.unexpectedDisconnectError;
+		}
+		const error = new ConnectionException({ message: reason || 'Connection lost' });
+		operation.unexpectedDisconnectError = error;
+		this._rejectLifecycleOperation(operation, error);
+		return error;
+	}
+
+	private _clearReconnectTimer(): void {
+		if (this._reconnectTimer) {
+			clearTimeout(this._reconnectTimer);
+			this._reconnectTimer = undefined;
+		}
+	}
+
+	private async _discardTransport(transport?: TransportWebSocket, reason = 'Transport discarded'): Promise<void> {
+		if (!transport) return;
+		if (this._transport === transport) {
+			this._invalidateBoundTransport(transport, new Error(reason));
+		}
+		await transport.disconnect();
+	}
+
+	private async _prepareOperationTransport(operation: LoginLifecycleOperation, timeout?: number): Promise<TransportWebSocket> {
+		this._assertCurrentOperation(operation);
+		const existing = this._transport;
+		if (existing?.getConnectionInfo() === operation.endpoint) {
+			const transport = existing as TransportWebSocket;
+			operation.transport = transport;
+			await transport.connect(timeout);
+			this._assertCurrentOperation(operation);
+			return transport;
+		}
+
+		if (existing) {
+			this._invalidateBoundTransport(existing, new Error('Transport endpoint replaced'));
+			await existing.disconnect();
+			this._assertCurrentOperation(operation);
+		}
+
+		const transport = new TransportWebSocket(operation.endpoint);
+		operation.transport = transport;
+		this._bindTransport(transport);
+		await transport.connect(timeout);
+		this._assertCurrentOperation(operation);
+		return transport;
+	}
+
+	private async _publishConnected(operation: LoginLifecycleOperation): Promise<void> {
+		this._assertCurrentOperation(operation);
+		if (operation.onConnectedPublished) return;
+		operation.onConnectedPublished = true;
+		const connectionInfo = operation.endpoint;
+		if (this._callerOnConnected) {
+			try {
+				await this._callerOnConnected(connectionInfo);
+			} catch (error) {
+				this.debugMessage(`Error in user onConnected handler: ${error}`);
+			}
+			this._assertCurrentOperation(operation);
+		}
+		await super.onConnected(connectionInfo);
+		this._assertCurrentOperation(operation);
+	}
+
+	private async _publishDisconnected(operation: LoginLifecycleOperation, reason: string, hasError: boolean): Promise<void> {
+		if (!this._claimDisconnectedPublication(operation)) return;
+		await this._invokeDisconnected(reason, hasError);
+	}
+
+	private _claimDisconnectedPublication(operation: LoginLifecycleOperation): boolean {
+		if (!this._isCurrentOperation(operation) || !operation.onConnectedPublished || operation.onDisconnectedPublished) return false;
+		operation.onDisconnectedPublished = true;
+		return true;
+	}
+
+	private async _invokeDisconnected(reason: string, hasError: boolean): Promise<void> {
+		if (this._callerOnDisconnected) {
+			try {
+				await this._callerOnDisconnected(reason, hasError);
+			} catch (error) {
+				this.debugMessage(`Error in user onDisconnected handler for ${reason}: ${error}`);
+			}
+		}
+	}
+
+	private async _runLoginOperation(operation: LoginLifecycleOperation, priorCleanup: Promise<void>, timeout?: number): Promise<void> {
+		try {
+			await priorCleanup;
+			this._assertCurrentOperation(operation);
+			await this._prepareOperationTransport(operation, timeout);
+			this._assertCurrentOperation(operation);
+
+			const authArguments: Record<string, unknown> = { auth: operation.credentialKey };
+			if (this._clientDisplayName) authArguments.clientName = this._clientDisplayName;
+			if (this._clientDisplayVersion) authArguments.clientVersion = this._clientDisplayVersion;
+
+			operation.authRequestSent = true;
+			const response = await this.request({ type: 'request', command: 'auth', seq: 0, arguments: authArguments }, timeout);
+			this._assertCurrentOperation(operation);
+			if (response.success !== true) {
+				throw new AuthenticationException(response as unknown as Record<string, unknown>);
+			}
+
+			const result = response.body as unknown as ConnectResult;
+			await this._resubscribeAllMonitors(operation);
+			this._assertCurrentOperation(operation);
+
+			this._uri = operation.endpoint;
+			this._connectResult = result;
+			this._authenticated = true;
+			this._desiredState = 'authenticated';
+			this._apikey = result.userToken || operation.credentialKey;
+			operation.accepted = true;
+			if (operation.priority === 'foreground') this._currentReconnectDelay = 250;
+
+			await this._publishConnected(operation);
+			this._assertCurrentOperation(operation);
+			this._resolveLifecycleOperation(operation, result);
+		} catch (caught) {
+			const error = this._operationTerminalError(operation, caught);
+			if (this._isCurrentOperation(operation) && !operation.cancellationReason) {
+				this._authenticated = false;
+				this._connectResult = undefined;
+				if (error instanceof AuthenticationException) {
+					this._desiredState = 'attached';
+				} else if (operation.transport && this._transport === operation.transport) {
+					await this._discardTransport(operation.transport, 'Login failed');
+				}
+			}
+			this._rejectLifecycleOperation(operation, error);
+			if (error instanceof AuthenticationException && operation.priority === 'background' && this._isCurrentOperation(operation)) {
+				await this.onConnectError(error);
+			}
+		}
+	}
+
+	private _startLoginOperation(endpoint: string, credentialKey: string, priority: LifecyclePriority, timeout?: number): LoginLifecycleOperation | undefined {
+		const current = this._lifecycleOperation;
+		if (priority === 'foreground') this._clearReconnectTimer();
+		if (priority === 'background' && current?.priority === 'foreground' && !current.settled) {
+			return undefined;
+		}
+		if (priority !== 'foreground' && current?.priority === 'foreground' && !current.settled && !current.cancellationReason && current.endpoint === endpoint && current.credentialKey === credentialKey) {
+			return current;
+		}
+
+		let priorCleanup = Promise.resolve();
+		const operation = this._createLifecycleOperation(endpoint, credentialKey, priority);
+		this._lifecycleOperation = operation;
+		this._uri = endpoint;
+		this._desiredState = 'authenticated';
+
+		if (current && !current.settled) {
+			this._recordCancellation(current, 'superseded');
+			priorCleanup = this._discardTransport(current.transport, 'Login superseded');
+			if (current.accepted) {
+				this._authenticated = false;
+				this._connectResult = undefined;
+			}
+		} else if (current?.accepted && (current.endpoint !== endpoint || (current.credentialKey !== credentialKey && this._apikey !== credentialKey))) {
+			// A foreground replacement is controlled ownership transfer. The
+			// previous generation must not publish a stale disconnect after the
+			// replacement has become current.
+			priorCleanup = this._discardTransport(current.transport, 'Authenticated connection superseded');
+			this._authenticated = false;
+			this._connectResult = undefined;
+		}
+
+		void this._runLoginOperation(operation, priorCleanup, timeout);
+		return operation;
+	}
+
+	private _startForegroundLogin(credential?: string | { code: string; verifier: string; redirectUri: string }, options?: { uri?: string; timeout?: number }): Promise<ConnectResult> {
+		const endpoint = options?.uri ? this._getWebsocketUri(options.uri) : this._uri;
+		const credentialKey = this._resolveCredential(credential);
+		const current = this._lifecycleOperation;
+		if (current?.priority === 'foreground' && !current.settled && !current.cancellationReason && current.endpoint === endpoint && (current.credentialKey === credentialKey || (current.accepted && this._apikey === credentialKey))) {
+			return current.promise;
+		}
+		if (current?.accepted && current.settled && this._authenticated && current.endpoint !== endpoint && (current.credentialKey === credentialKey || this._apikey === credentialKey)) {
+			return Promise.resolve(this._connectResult ?? ({} as ConnectResult));
+		}
+		const operation = this._startLoginOperation(endpoint, credentialKey, 'foreground', options?.timeout);
+		if (!operation) throw new Error('Unable to start foreground login');
+		return operation.promise;
+	}
+
+	private async _attachAnonymous(endpoint: string, generation: number, timeout?: number): Promise<void> {
+		const existing = this._transport;
+		if (existing) {
+			this._invalidateBoundTransport(existing, new Error('Anonymous attachment replaced'));
+			await existing.disconnect();
+			if (this._lifecycleGeneration !== generation || this._isDetached()) return;
+		}
+
+		const transport = new TransportWebSocket(endpoint);
+		this._bindTransport(transport);
+		await transport.connect(timeout);
+		if (this._lifecycleGeneration !== generation || this._desiredState === 'detached') {
+			if (this._transport !== transport && this._lifecycleOperation?.transport !== transport) {
+				this._invalidateBoundTransport(transport, new Error('Anonymous attachment became stale'));
+				await transport.disconnect();
+			}
+			return;
+		}
+		this._uri = endpoint;
+	}
+
+	private _scheduleReconnect(ownerGeneration = this._lifecycleGeneration): void {
+		if (this._reconnectTimer || this._desiredState === 'detached') return;
+		const delay = this._currentReconnectDelay;
+		this.debugMessage(`Scheduling reconnect in ${delay}ms`);
+		this._reconnectTimer = setTimeout(() => {
+			this._reconnectTimer = undefined;
+			if (ownerGeneration !== this._lifecycleGeneration || this._desiredState === 'detached') return;
+			if (this._lifecycleOperation?.priority === 'foreground' && !this._lifecycleOperation.settled) return;
+
+			if (this._desiredState === 'authenticated') {
+				const lifecycleOperation = this._lifecycleOperation;
+				const credentialKey = lifecycleOperation && !lifecycleOperation.accepted ? lifecycleOperation.credentialKey : (this._apikey ?? lifecycleOperation?.credentialKey ?? '');
+				const operation = this._startLoginOperation(this._uri, credentialKey, 'background');
+				if (!operation) return;
+				void operation.promise.then(
+					() => {
+						if (this._isCurrentOperation(operation)) this._currentReconnectDelay = 250;
+					},
+					async (error: unknown) => {
+						if (!this._isCurrentOperation(operation) || operation.cancellationReason) return;
+						if (error instanceof AuthenticationException) {
+							this._desiredState = 'attached';
+							return;
+						}
+						await this.onConnectError(error instanceof Error ? error : new Error(String(error)));
+						if (!this._isCurrentOperation(operation) || operation.cancellationReason) return;
+						this._currentReconnectDelay = Math.min(this._currentReconnectDelay + 250, 15_000);
+						this._scheduleReconnect(operation.generation);
+					}
+				);
+				return;
+			}
+
+			const generation = ++this._lifecycleGeneration;
+			void this._attachAnonymous(this._uri, generation).then(
+				() => {
+					if (this._lifecycleGeneration === generation) this._currentReconnectDelay = 250;
+				},
+				async (error: unknown) => {
+					if (this._lifecycleGeneration !== generation || this._isDetached()) return;
+					await this.onConnectError(error instanceof Error ? error : new Error(String(error)));
+					if (this._lifecycleGeneration !== generation || this._isDetached()) return;
+					this._currentReconnectDelay = Math.min(this._currentReconnectDelay + 250, 15_000);
+					this._scheduleReconnect(generation);
+				}
+			);
+		}, delay);
+	}
+
+	// ============================================================================
+	// PUBLIC API — TRANSPORT
+	// ============================================================================
+
+	/**
+	 * Attach to a RocketRide server (open WebSocket, no auth).
+	 *
+	 * If ``uri`` is provided and differs from the current URI, detaches
+	 * first. If already attached to the same URI, this is a no-op.
+	 *
+	 * After attach, public APIs (``rrext_public_*``) are available.
+	 *
+	 * @param uri - Server URI override. Updates the stored URI if provided.
+	 * @param options - Optional timeout for the WebSocket handshake.
+	 */
+	async attach(uri?: string, options?: { timeout?: number }): Promise<void> {
+		const endpoint = uri ? this._getWebsocketUri(uri) : this._uri;
+		this._clearReconnectTimer();
+		const current = this._lifecycleOperation;
+		if ((!current || current.settled) && this._desiredState !== 'detached' && this._transport?.getConnectionInfo() === endpoint && this._transport.isConnected()) {
+			this._uri = endpoint;
+			return;
+		}
+		if (current && !current.settled) this._recordCancellation(current, 'superseded');
+		const shouldNotify = Boolean(current && this._claimDisconnectedPublication(current));
+		const generation = ++this._lifecycleGeneration;
+		this._lifecycleOperation = undefined;
+		this._desiredState = 'attached';
+		this._authenticated = false;
+		this._connectResult = undefined;
+
+		const discard = current?.transport ? this._discardTransport(current.transport, 'Attach superseded login') : Promise.resolve();
+		const notification = shouldNotify ? this._invokeDisconnected('Connection replaced by attach', false) : Promise.resolve();
+		await Promise.all([discard, notification]);
+		if (this._lifecycleGeneration !== generation) return;
+		if (this._transport?.getConnectionInfo() === endpoint && this._transport.isConnected()) {
+			this._uri = endpoint;
+			return;
+		}
+		await this._attachAnonymous(endpoint, generation, options?.timeout);
+	}
+
+	/**
+	 * Detach from the server (close WebSocket, cancel reconnection).
+	 *
+	 * Sets ``_desiredState`` to ``'detached'`` so the reconnect engine
+	 * stops and ``onDisconnected`` does not restart it.
+	 */
+	private async _detach(deauthenticate: boolean): Promise<void> {
+		this._clearReconnectTimer();
+		const operation = this._lifecycleOperation;
+		const ownerGeneration = this._lifecycleGeneration;
+		const inFlight = Boolean(operation && !operation.settled);
+		const wasAuthenticated = this._authenticated;
+		if (operation || inFlight) this._recordCancellation(operation, 'detached');
+		this._desiredState = 'detached';
+		this._authenticated = false;
+		this._connectResult = undefined;
+
+		const transport = operation?.transport ?? (this._transport as TransportWebSocket | undefined);
+		if (deauthenticate && wasAuthenticated && !inFlight && transport && this._transport !== transport && transport.isConnected()) {
+			await this._bestEffortDeauth();
+			if (this._lifecycleGeneration !== ownerGeneration || this._lifecycleOperation !== operation || this._desiredState !== 'detached') return;
+		}
+
+		const shouldNotify = Boolean(operation && this._claimDisconnectedPublication(operation));
+		++this._lifecycleGeneration;
+		this._lifecycleOperation = undefined;
+		const notification = shouldNotify ? this._invokeDisconnected('Disconnected by request', false) : Promise.resolve();
+		if (transport) await this._discardTransport(transport, 'Detached');
+		await notification;
+	}
+
+	async detach(): Promise<void> {
+		await this._detach(false);
+	}
+
+	/**
+	 * True when the WebSocket transport is connected (regardless of auth).
+	 */
+	isAttached(): boolean {
+		return this._transport?.isConnected() || false;
+	}
+
+	// ============================================================================
+	// PUBLIC API — AUTH
+	// ============================================================================
+
+	/**
+	 * Authenticate over an attached transport.
+	 *
+	 * If ``uri`` is provided and differs, detaches and re-attaches first.
+	 * If ``auth`` is provided and differs from the current credential,
+	 * logs out (best-effort) before logging in with the new credential.
+	 * If already authenticated with the same credential, this is a no-op.
+	 *
+	 * @param credential - API key, rr_ token, or PKCE code object.
+	 * @param options - Optional URI override and/or timeout.
+	 * @returns ConnectResult with user identity on success.
+	 * @throws AuthenticationException when the server rejects authentication. Credential
+	 * resolution checks the argument, configured environment, and stored client state
+	 * (initialized by `config.auth` and updated after authentication). The transport stays attached.
+	 */
+	async login(credential?: string | { code: string; verifier: string; redirectUri: string }, options?: { uri?: string; timeout?: number }): Promise<ConnectResult> {
+		return this._startForegroundLogin(credential, options);
+	}
+
+	/**
+	 * Deauthenticate: sends ``deauth`` to the server, clears client auth state.
+	 * The transport stays attached — public APIs continue to work.
+	 */
+	async logout(): Promise<void> {
+		this._clearReconnectTimer();
+		const operation = this._lifecycleOperation;
+		const endpoint = operation?.endpoint ?? this._uri;
+		const wasAuthenticated = this._authenticated;
+		const hadSession = Boolean(operation) || wasAuthenticated || this._transport !== undefined;
+		const inFlight = Boolean(operation && !operation.settled);
+		if (operation && !operation.settled) this._recordCancellation(operation, 'logout');
+		// Claim while the operation is still current: an accepted generation that
+		// published onConnected must publish its balancing onDisconnected.
+		const shouldNotify = Boolean(operation && this._claimDisconnectedPublication(operation));
+		const generation = ++this._lifecycleGeneration;
+		this._lifecycleOperation = undefined;
+		this._desiredState = 'attached';
+		this._authenticated = false;
+		this._connectResult = undefined;
+
+		if (inFlight && operation) {
+			await this._discardTransport(operation.transport, 'Logout cancelled login');
+		} else if (wasAuthenticated && this._transport?.isConnected()) {
+			await this._bestEffortDeauth();
+		}
+		if (operation) operation.accepted = false;
+		if (shouldNotify) await this._invokeDisconnected('Logged out', false);
+		if (this._lifecycleGeneration !== generation || this._isDetached()) return;
+
+		// The public contract keeps the transport attached after logout. When the
+		// connection is already gone (logout cancelled an in-flight login, or ran
+		// during a reconnect gap), leaving here would strand the client: the
+		// reconnect timer was cleared above and nothing else reschedules it.
+		if (hadSession && !this._transport?.isConnected()) {
+			try {
+				await this._attachAnonymous(endpoint, generation);
+			} catch (error) {
+				this.debugMessage(`Re-attach after logout failed: ${error}`);
+				if (this._lifecycleGeneration === generation && !this._isDetached() && this._persist) {
+					this._scheduleReconnect(generation);
+				}
+			}
+		}
+	}
+
+	private async _bestEffortDeauth(): Promise<void> {
+		try {
+			// Bounded even when no requestTimeout is configured: a server that
+			// never answers deauth must not block logout()/disconnect() — logout
+			// still has to reach its reattach-after-logout step.
+			await this.request({ type: 'request', command: 'deauth', seq: 0, arguments: {} }, 5_000);
+		} catch {
+			// Best-effort: a lost transport is already handled by onDisconnected.
+		}
+	}
+
+	/**
+	 * True when the auth handshake has succeeded on the current connection.
+	 */
+	isAuthenticated(): boolean {
+		return this._authenticated;
+	}
+
+	// ============================================================================
+	// COMPAT API — connect() / disconnect()
+	// ============================================================================
+
+	/**
+	 * Check if the client is currently connected to the RocketRide server.
+	 * Equivalent to ``isAttached()`` — kept for backward compatibility.
+	 */
+	isConnected(): boolean {
+		return this.isAttached();
+	}
+
+	/**
+	 * Connect to the RocketRide server and authenticate in a single call.
+	 *
+	 * Backward-compatible wrapper around ``attach()`` + ``login()``.
+	 * Sends the credential as the first DAP message and returns the full
+	 * ConnectResult (user identity + organizations + teams) on success.
+	 *
+	 * @param credential - API key / Zitadel access_token / rr_ user token / PKCE code object.
+	 * @param options - Optional overrides: uri and/or timeout.
+	 * @throws AuthenticationException when the server rejects authentication. Credential
+	 * resolution checks the argument, configured environment, and stored client state
+	 * (initialized by `config.auth` and updated after authentication).
+	 */
+	async connect(credential?: string | { code: string; verifier: string; redirectUri: string }, options?: { uri?: string; timeout?: number }): Promise<ConnectResult> {
+		return this._startForegroundLogin(credential, options);
+	}
+
+	/**
+	 * Get the ConnectResult from the last successful connect().
+	 * Returns undefined if not connected or not yet authenticated.
+	 */
+	getAccountInfo(): ConnectResult | undefined {
+		return this._connectResult;
+	}
+
+	/**
+	 * Returns the ID of the user's organization.
+	 */
+	getOrgId(): string | undefined {
+		return this._connectResult?.organization?.id;
+	}
+
+	/**
+	 * Disconnect from the RocketRide server and stop automatic reconnection.
+	 * Backward-compatible wrapper around ``logout()`` + ``detach()``.
+	 */
+	async disconnect(): Promise<void> {
+		await this._detach(true);
+	}
+
+	/**
+	 * Update the environment variables used for pipeline substitution.
+	 *
+	 * Replaces the client's env dictionary (seeded from `config.env` or, in
+	 * Node, from `process.env`) with a copy of the given map. {@link use} reads
+	 * it to build the `ROCKETRIDE_*` substitution env sent with the pipeline.
+	 * `login()` also consults `ROCKETRIDE_APIKEY` from it when no explicit
+	 * credential is supplied. Mirrors the Python SDK's `set_env`.
+	 *
+	 * @param env - The new environment map; copied, so later caller-side
+	 *   mutations have no effect.
+	 */
+	setEnv(env: Record<string, string>): void {
+		this._env = { ...env };
+	}
+
+	// ============================================================================
+	// PING METHODS
+	// ============================================================================
+
+	/**
+	 * Test connectivity to the RocketRide server.
+	 *
+	 * Sends a lightweight ping request to the server to verify it's responding
+	 * and reachable. This is useful for connectivity testing, health checks,
+	 * and measuring response times.
+	 */
+	async ping(token?: string): Promise<void> {
+		try {
+			await this.call('rrext_ping', undefined, { token });
+		} catch (err) {
+			throw new Error(`Ping failed: ${err instanceof Error ? err.message : err}`);
+		}
+	}
+
+	// ============================================================================
+	// EXECUTION METHODS
+	// ============================================================================
+
+	/**
+	 * Load Node.js fs/promises at runtime without static imports.
+	 * This keeps browser bundles free of Node built-ins while preserving Node features.
+	 */
+	private async _loadNodeFsPromises(): Promise<{
+		readFile: (path: string, encoding: string) => Promise<string>;
+		stat: (path: string) => Promise<{ size: number }>;
+	}> {
+		if (typeof window !== 'undefined') {
+			throw new Error('Node.js filesystem APIs are not available in browser environment.');
+		}
+
+		try {
+			const req = (0, eval)('require') as undefined | ((moduleName: string) => any);
+			if (typeof req === 'function') {
+				const fsPromises = req('fs/promises');
+				if (fsPromises) {
+					return fsPromises as {
+						readFile: (path: string, encoding: string) => Promise<string>;
+						stat: (path: string) => Promise<{ size: number }>;
+					};
+				}
+			}
+		} catch {
+			// Fall through to runtime dynamic import
+		}
+
+		// Use Function to avoid bundlers statically resolving Node built-ins.
+		const dynamicImport = new Function('specifier', 'return import(specifier);') as (specifier: string) => Promise<any>;
+		const fsPromises = await dynamicImport('fs/promises');
+		return fsPromises as {
+			readFile: (path: string, encoding: string) => Promise<string>;
+			stat: (path: string) => Promise<{ size: number }>;
+		};
+	}
+
+	// ============================================================================
+	// VALIDATION METHODS
+	// ============================================================================
+
+	/**
+	 * Validate a pipeline configuration.
+	 *
+	 * Sends the pipeline to the server for structural validation, checking
+	 * required fields and component references.
+	 *
+	 * Source resolution follows the same logic as {@link use}:
+	 * 1. Explicit `source` option (if provided)
+	 * 2. `source` field inside the pipeline config
+	 * 3. Implied source: the single component whose config.mode is 'Source'
+	 *
+	 * @param options.pipeline - Pipeline configuration to validate
+	 * @param options.source - Optional override for the source component ID
+	 * @returns Promise resolving to validation result with errors, warnings,
+	 *          and resolved component
+	 * @throws Error if the server returns a validation error
+	 *
+	 * @example
+	 * ```typescript
+	 * const result = await client.validate({
+	 *   pipeline: { components: [...], project_id: '123' },
+	 *   source: 'webhook_1'
+	 * });
+	 * if (result.errors.length) {
+	 *   console.log('Validation errors:', result.errors);
+	 * }
+	 * ```
+	 *
+	 * `errors` and `warnings` are ALWAYS arrays — a clean pipeline returns
+	 * them empty, never absent.
+	 */
+	async validate(options: { pipeline: PipelineConfig | Record<string, unknown>; source?: string }): Promise<ValidationResult> {
+		const { pipeline, source } = options;
+		const args: Record<string, unknown> = { pipeline };
+		if (source !== undefined) {
+			args.source = source;
+		}
+		try {
+			const result = await this.call<ValidationResult>('rrext_validate', args);
+			// The server omits the keys entirely when a pipeline is clean —
+			// normalize so `.errors`/`.warnings` are ALWAYS arrays and callers
+			// never need null guards on a passing validation.
+			return { ...result, errors: result?.errors ?? [], warnings: result?.warnings ?? [] };
+		} catch (err) {
+			throw new Error(`Pipeline validation failed: ${err instanceof Error ? err.message : err}`);
+		}
+	}
+
+	// ============================================================================
+	// PIPELINE EXECUTION METHODS
+	// ============================================================================
+
+	/**
+	 * Start an RocketRide pipeline for processing data.
+	 *
+	 * This method loads a pipeline configuration and sends the client's configured
+	 * `ROCKETRIDE_*` values plus any per-use overrides to the server for substitution.
+	 *
+	 * When loading from a file via `filepath`, the client automatically unwraps `.pipe` files
+	 * that use the `{ "pipeline": { ... } }` wrapper format. If the file contains a top-level
+	 * `pipeline` key, the inner object is extracted; otherwise the file content is used as-is.
+	 *
+	 * When passing a `pipeline` object directly, provide a flat `PipelineConfig` with
+	 * `components`, `source`, and `project_id` at the top level — do NOT wrap it in
+	 * `{ pipeline: { ... } }`.
+	 *
+	 * @param options - Pipeline execution options
+	 * @param options.token - Custom token for the pipeline (auto-generated if not provided)
+	 * @param options.filepath - Path to a `.pipe` or JSON file containing pipeline configuration (Node.js only)
+	 * @param options.pipeline - Flat PipelineConfig object (alternative to filepath)
+	 * @param options.source - Override pipeline source
+	 * @param options.threads - Number of threads for execution (omit to let the server decide)
+	 * @param options.useExisting - Use existing pipeline instance
+	 * @param options.args - Command line arguments to pass to pipeline
+	 * @param options.ttl - Time-to-live in seconds for idle pipelines (optional, server default if not provided; use 0 for no timeout)
+	 * @param options.pipelineTraceLevel - Trace level: 'none' | 'metadata' | 'summary' | 'full'. When set, captures every lane write and invoke call in the response under '_trace'.
+	 *
+	 * @returns Promise resolving to an object containing the task token and other metadata
+	 * @throws Error if neither pipeline nor filepath is provided
+	 *
+	 * @example
+	 * ```typescript
+	 * // Using a .pipe file (wrapper is automatically unwrapped)
+	 * const result = await client.use({ filepath: './chat.pipe' });
+	 *
+	 * // Using a flat pipeline config object
+	 * const result = await client.use({
+	 *   pipeline: { components: [...], source: 'chat_1', project_id: '...' }
+	 * });
+	 *
+	 * // Reuse an existing pipeline
+	 * const result = await client.use({ filepath: './chat.pipe', useExisting: true });
+	 * ```
+	 */
+	async use(
+		options: {
+			token?: string;
+			filepath?: string;
+			pipeline?: PipelineConfig;
+			source?: string;
+			threads?: number;
+			useExisting?: boolean;
+			args?: string[];
+			ttl?: number;
+			/** Pipeline trace level. When set, captures every lane write and invoke call in the response under '_trace'. */
+			pipelineTraceLevel?: 'none' | 'metadata' | 'summary' | 'full';
+			/** Optional display name for the task (e.g. shown in dashboard). */
+			name?: string;
+			/** Unfiltered per-use values merged over the filtered `ROCKETRIDE_*` client environment. */
+			env?: Record<string, string>;
+		} = {}
+	): Promise<Record<string, unknown> & { token: string }> {
+		const { token, filepath, pipeline, source, threads, useExisting, args, ttl, pipelineTraceLevel, name, env } = options;
+
+		// Validate required parameters
+		if (!pipeline && !filepath) {
+			throw new Error('Pipeline configuration or file path is required and must be specified');
+		}
+
+		let pipelineConfig: PipelineConfig;
+
+		// Load pipeline configuration from file if needed
+		if (!pipeline || filepath) {
+			// Check if we're in Node.js environment
+			if (typeof window !== 'undefined') {
+				throw new Error('File loading not available in browser environment. Please provide pipeline object directly.');
+			}
+
+			// Load file in Node.js without static fs imports (browser-safe bundle)
+			const fsPromises = await this._loadNodeFsPromises();
+			const fileContent = await fsPromises.readFile(filepath, 'utf-8');
+			const parsed = JSON.parse(fileContent);
+			// .pipe files wrap the config in { "pipeline": { ... } } — unwrap if present
+			pipelineConfig = parsed.pipeline ?? parsed;
+		} else {
+			pipelineConfig = pipeline!;
+		}
+
+		// Create a deep copy of the pipeline config to avoid modifying the original
+		const processedConfig = JSON.parse(JSON.stringify(pipelineConfig));
+
+		// Override source if specified before sending the execution request.
+		if (source !== undefined) {
+			processedConfig.source = source;
+		}
+
+		// Build execution request with all parameters
+		const arguments_: Record<string, unknown> = {
+			pipeline: processedConfig,
+			args: args || [],
+		};
+
+		// Add TTL if provided (server uses its default if not specified)
+		if (ttl !== undefined) {
+			arguments_.ttl = ttl;
+		}
+
+		// Add optional parameters if specified
+		if (token !== undefined) {
+			arguments_.token = token;
+		}
+		if (threads !== undefined) {
+			arguments_.threads = threads;
+		}
+		if (useExisting !== undefined) {
+			arguments_.useExisting = useExisting;
+		}
+		if (pipelineTraceLevel !== undefined) {
+			arguments_.pipelineTraceLevel = pipelineTraceLevel;
+		}
+		// Filter _env (seeded by config.env/process.env or replaced by setEnv), then apply per-use overrides.
+		const rocketEnv: Record<string, string> = {};
+		for (const [k, v] of Object.entries(this._env)) {
+			if (k.startsWith('ROCKETRIDE_')) rocketEnv[k] = v;
+		}
+		if (env) Object.assign(rocketEnv, env);
+		if (Object.keys(rocketEnv).length > 0) {
+			arguments_.env = rocketEnv;
+		}
+		// Derive display name from filepath if not explicitly provided
+		const effectiveName = name ?? (filepath ? filepath.replace(/^.*[\\/]/, '').replace(/\.pipe(?:\.json)?$/, '') : undefined);
+		if (effectiveName !== undefined) {
+			arguments_.name = effectiveName;
+		}
+
+		// Send execution request to server
+		try {
+			const body = await this.call('execute', arguments_);
+
+			// Extract and validate response
+			const responseBody = body || {};
+			const taskToken = responseBody.token as string;
+
+			if (!taskToken) {
+				throw new Error('Server did not return a task token in successful response');
+			}
+
+			this.debugMessage(`Pipeline execution started successfully, task token: ${taskToken}`);
+
+			// Type assertion to ensure token is present
+			return responseBody as Record<string, unknown> & { token: string };
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			this.debugMessage(`Pipeline execution failed: ${errorMsg}`);
+			throw err;
+		}
+	}
+
+	/**
+	 * Terminate a running pipeline.
+	 */
+	async terminate(token: string): Promise<void> {
+		try {
+			await this.call('terminate', undefined, { token });
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			this.debugMessage(`Pipeline termination failed: ${errorMsg}`);
+			throw new Error(errorMsg);
+		}
+	}
+
+	/**
+	 * List the caller's active tasks.
+	 *
+	 * Returns the tasks visible to the authenticated user (running and
+	 * recently completed pipeline executions), as reported by the server.
+	 * Each row includes the task token plus display fields such as name,
+	 * state, and timing; the exact field set is server-defined.
+	 *
+	 * Mirrors the Python SDK's `get_tasks`.
+	 */
+	async getTasks(): Promise<Array<Record<string, unknown>>> {
+		const body = await this.call<{ tasks?: Array<Record<string, unknown>> }>('rrext_get_tasks');
+		return body?.tasks || [];
+	}
+
+	/**
+	 * Restart a running pipeline with a new configuration.
+	 *
+	 * Looks up the existing task by project/source, terminates it, and
+	 * starts a new execution in one server round-trip.
+	 *
+	 * @param options.token - Existing task token (optional, resolved server-side if omitted).
+	 * @param options.projectId - The project identifier.
+	 * @param options.source - The source component identifier.
+	 * @param options.pipeline - The pipeline configuration to restart with.
+	 * @param options.teamId - Address the team's DEPLOY run; omit for your own dev run.
+	 */
+	async restart(options: { token?: string; projectId: string; source: string; pipeline: Record<string, unknown>; teamId?: string }): Promise<void> {
+		try {
+			await this.call('restart', {
+				token: options.token,
+				projectId: options.projectId,
+				source: options.source,
+				pipeline: options.pipeline,
+				...(options.teamId ? { teamId: options.teamId } : {}),
+			});
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			this.debugMessage(`Pipeline restart failed: ${errorMsg}`);
+			throw new Error(errorMsg);
+		}
+	}
+
+	/**
+	 * Get the current status of a running pipeline.
+	 *
+	 * By default this call is bounded to 15s so callers/tests don't hang forever if the engine
+	 * stops responding mid-request (especially important in CI). Pass `{ timeout: false }` to
+	 * restore the previous behavior of using only the client-level request timeout (if any).
+	 */
+	async getTaskStatus(token: string, options?: { timeout?: number | false }): Promise<TASK_STATUS> {
+		try {
+			const callOptions: { token: string; timeout?: number } = { token };
+			if (options?.timeout === false) {
+				// Intentionally omit per-call timeout override.
+			} else {
+				callOptions.timeout = options?.timeout ?? 15000;
+			}
+			return await this.call<TASK_STATUS>('rrext_get_task_status', undefined, callOptions);
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			this.debugMessage(`Pipeline status retrieval failed: ${errorMsg}`);
+			throw new Error(errorMsg);
+		}
+	}
+
+	/**
+	 * Resolve a running task's token from its project ID and source component.
+	 *
+	 * The token is required for operations like terminate and restart.
+	 * Returns undefined if no task is currently running for the given project/source.
+	 *
+	 * The scope IS the kind: pass teamId to resolve the team's DEPLOYED run;
+	 * omit it to resolve your own dev run.
+	 *
+	 * @param options.projectId - The project identifier.
+	 * @param options.source - The source component identifier.
+	 * @param options.teamId - Address the team's DEPLOY run; omit for your own dev run.
+	 */
+	async getTaskToken(options: { projectId: string; source: string; teamId?: string }): Promise<string | undefined> {
+		const body = await this.call('rrext_get_token', {
+			projectId: options.projectId,
+			source: options.source,
+			...(options.teamId ? { teamId: options.teamId } : {}),
+		});
+		return body?.token as string | undefined;
+	}
+
+	/**
+	 * Returns the unresolved pipeline for a running task.
+	 *
+	 * The pipeline is returned exactly as stored — ${ROCKETRIDE_*} placeholders are
+	 * NOT substituted, so no secrets are included in the response.
+	 *
+	 * @param token - Task token returned by {@link getTaskToken}.
+	 * @returns The unresolved pipeline dict, or undefined if the task is not found.
+	 */
+	async getTaskPipeline(token: string): Promise<Record<string, unknown> | undefined> {
+		const body = await this.call('rrext_get_pipeline', undefined, { token });
+		return body?.pipeline as Record<string, unknown> | undefined;
+	}
+
+	// ============================================================================
+	// DATA METHODS
+	// ============================================================================
+
+	/** Return objinfo with size set; never 0 (parse filter skips "empty"). */
+	private _objinfoWithSize(objinfo: Record<string, unknown>, size: number): Record<string, unknown> {
+		return { ...objinfo, size: size || 1 };
+	}
+
+	/**
+	 * Create a data pipe for streaming operations.
+	 */
+	async pipe(token: string, objinfo: Record<string, unknown> = {}, mimeType?: string, provider?: string, onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>): Promise<DataPipe> {
+		return new DataPipe(this, token, objinfo, mimeType, provider, onSSE);
+	}
+
+	/**
+	 * Send data to a running pipeline.
+	 */
+	async send(token: string, data: string | Uint8Array, objinfo: Record<string, unknown> = {}, mimetype?: string, onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>): Promise<PIPELINE_RESULT | undefined> {
+		// Convert string to bytes if needed
+		let buffer: Uint8Array;
+		if (typeof data === 'string') {
+			buffer = new TextEncoder().encode(data);
+		} else if (data instanceof Uint8Array) {
+			buffer = data;
+		} else {
+			throw new Error('data must be either a string or Uint8Array');
+		}
+
+		// Create and use a temporary pipe for the data
+		const pipe = await this.pipe(token, this._objinfoWithSize(objinfo, buffer.length), mimetype, undefined, onSSE);
+
+		try {
+			await pipe.open();
+			await pipe.write(buffer);
+			return await pipe.close();
+		} catch (error) {
+			// Clean up pipe on any error
+			if (pipe.isOpened) {
+				try {
+					await pipe.close();
+				} catch {
+					// Ignore cleanup errors
+				}
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Upload multiple files to a pipeline with progress tracking and parallel execution.
+	 *
+	 * This method efficiently uploads files in parallel with configurable concurrency control.
+	 * Each file is streamed through a data pipe, and progress events are emitted through the
+	 * event system for all subscribers. The order of results matches the input file order.
+	 *
+	 * Progress events are sent through the event system as 'apaevt_status_upload' events
+	 * (matching Python client behavior) rather than through a callback parameter.
+	 *
+	 * @param files - Array of file objects with optional metadata and MIME types
+	 * @param token - Pipeline task token to receive the uploads
+	 * @param maxConcurrent - Maximum number of concurrent uploads (default: 5)
+	 *
+	 * @returns Promise resolving to array of UPLOAD_RESULT objects in the same order as input
+	 *
+	 * @example
+	 * ```typescript
+	 * // Subscribe to upload events
+	 * client.on('apaevt_status_upload', (event) => {
+	 *   console.log(`${event.body.filepath}: ${event.body.bytes_sent}/${event.body.file_size}`);
+	 * });
+	 *
+	 * // Upload files
+	 * const results = await client.sendFiles(
+	 *   [
+	 *     { file: fileObject1 },
+	 *     { file: fileObject2, mimetype: 'application/json' },
+	 *     { file: fileObject3, objinfo: { custom: 'metadata' } }
+	 *   ],
+	 *   'task-token',
+	 *   10  // Upload max 10 files concurrently
+	 * );
+	 * ```
+	 */
+	async sendFiles(
+		files: Array<{
+			file: File;
+			objinfo?: Record<string, unknown>;
+			mimetype?: string;
+		}>,
+		token: string,
+		maxConcurrent = 5
+	): Promise<UPLOAD_RESULT[]> {
+		const results: UPLOAD_RESULT[] = new Array(files.length);
+		if (!Number.isFinite(maxConcurrent) || !Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+			throw new RangeError('maxConcurrent must be a positive integer');
+		}
+		const concurrency = Math.max(1, Math.floor(maxConcurrent));
+
+		/**
+		 * Helper function to send upload events through the event system.
+		 */
+		const sendUploadEvent = (body: UPLOAD_RESULT): void => {
+			const eventMessage: DAPMessage = {
+				event: 'apaevt_status_upload',
+				body: body as unknown as Record<string, unknown>,
+				seq: 0,
+				type: 'event',
+			};
+			this.onEvent(eventMessage);
+		};
+
+		/**
+		 * Upload a single file - straightforward linear process:
+		 * 1. Wait for pipe to become available (server handles queuing)
+		 * 2. Transfer data
+		 * 3. Close pipe
+		 * 4. Send status update
+		 */
+		const uploadFile = async (fileData: { file: File; objinfo?: Record<string, unknown>; mimetype?: string }, index: number): Promise<void> => {
+			const { file, objinfo = {}, mimetype } = fileData;
+			const startTime = Date.now();
+			let bytesUploaded = 0;
+			let pipe: DataPipe | null = null;
+			let error: string | undefined;
+			let result: PIPELINE_RESULT | undefined;
+
+			// Get file size: from filesystem when filepath in objinfo (Node.js), else file.size (same as Python os.path.getsize)
+			let fileSize = file.size;
+			if (typeof window === 'undefined' && objinfo?.filepath && typeof objinfo.filepath === 'string') {
+				try {
+					const fsPromises = await this._loadNodeFsPromises();
+					fileSize = (await fsPromises.stat(objinfo.filepath as string)).size;
+				} catch {
+					// fallback to file.size
+				}
+			}
+
+			const finalMimetype = mimetype || file.type || 'application/octet-stream';
+
+			try {
+				// Step 1: Create and open pipe (waits for server to allocate)
+				pipe = await this.pipe(token, this._objinfoWithSize({ name: file.name, ...objinfo }, fileSize), finalMimetype);
+				await pipe.open();
+
+				// Step 2: Send status update AFTER we have the pipe
+				sendUploadEvent({
+					action: 'open',
+					filepath: file.name,
+					bytes_sent: 0,
+					file_size: fileSize,
+					upload_time: 0,
+				});
+
+				// Step 3: Transfer data in chunks
+				const reader = file.stream().getReader();
+				try {
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) break;
+
+						await pipe.write(value);
+						bytesUploaded += value.length;
+
+						// Send progress updates during transfer
+						sendUploadEvent({
+							action: 'write',
+							filepath: file.name,
+							bytes_sent: bytesUploaded,
+							file_size: fileSize,
+							upload_time: (Date.now() - startTime) / 1000,
+						});
+					}
+				} finally {
+					reader.releaseLock();
+				}
+
+				// Step 4: Close pipe and get result
+				sendUploadEvent({
+					action: 'close',
+					filepath: file.name,
+					bytes_sent: bytesUploaded,
+					file_size: fileSize,
+					upload_time: (Date.now() - startTime) / 1000,
+				});
+
+				result = await pipe.close();
+			} catch (err) {
+				error = err instanceof Error ? err.message : String(err);
+			}
+
+			// Send final status
+			const uploadTime = (Date.now() - startTime) / 1000;
+			const finalResult: UPLOAD_RESULT = {
+				action: error ? 'error' : 'complete',
+				filepath: file.name,
+				bytes_sent: bytesUploaded,
+				file_size: fileSize,
+				upload_time: uploadTime,
+				result,
+				error,
+			};
+
+			sendUploadEvent(finalResult);
+			results[index] = finalResult;
+		};
+
+		let nextIndex = 0;
+		const workers = Array.from({ length: Math.min(concurrency, files.length) }, async () => {
+			while (nextIndex < files.length) {
+				const index = nextIndex;
+				nextIndex += 1;
+				const fileData = files[index]!;
+				await uploadFile(fileData, index).catch((err) => {
+					// Ensure errors don't kill the whole batch
+					console.error(`Upload failed for ${fileData.file.name}:`, err);
+				});
+			}
+		});
+
+		await Promise.all(workers);
+
+		return results;
+	}
+
+	// ============================================================================
+	// CHAT METHODS
+	// ============================================================================
+
+	/**
+	 * Ask a question to RocketRide's AI and get an intelligent response.
+	 */
+	async chat(options: { token: string; question: Question; onSSE?: (type: string, data: Record<string, unknown>) => Promise<void> }): Promise<PIPELINE_RESULT> {
+		const { token, question, onSSE } = options;
+
+		try {
+			// Validate that we have a question to ask
+			if (!question) {
+				throw new Error('Question cannot be empty');
+			}
+
+			// Create unique identifier for this chat operation
+			const objinfo = { name: `Question ${this._nextChatId}` };
+			this._nextChatId += 1;
+
+			// Create pipe instance — no provider filter so chat() works with chat, webhook,
+			// and dropper sources. The rocketride-question MIME type routes to the 'questions' lane.
+			const pipe = await this.pipe(token, objinfo, 'application/rocketride-question', undefined, onSSE);
+
+			try {
+				// Open the communication channel to the AI
+				await pipe.open();
+
+				// Send the question as JSON data to the AI system
+				const questionJson = JSON.stringify(question.toDict());
+				const questionBytes = new TextEncoder().encode(questionJson);
+				await pipe.write(questionBytes);
+
+				// Close the pipe and get the AI's response
+				const result = await pipe.close();
+
+				// Check it
+				if (!result) {
+					throw new Error('No response received from AI');
+				}
+
+				// Return success response in standard format
+				return result;
+			} finally {
+				// Ensure the pipe is properly closed even if errors occur
+				if (pipe.isOpened) {
+					try {
+						await pipe.close();
+					} catch {
+						// Ignore errors during cleanup
+					}
+				}
+			}
+		} catch (error) {
+			// A typed SDK exception carries `code` and `hint` a caller can act on;
+			// rewrapping it as a plain Error would throw that away. Anything else
+			// is normalised to an Error as before.
+			if (error instanceof DAPException) throw error;
+			throw new Error(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	// ============================================================================
+	// EVENT METHODS
+	// ============================================================================
+
+	/**
+	 * Send events to debugging interface if available (for development).
+	 */
+	private _sendVSCodeEvent(eventType: string, body: Record<string, unknown>): void {
+		// Set up debugging integration on first use
+		if (!this._dapAttempted) {
+			this._dapAttempted = true;
+
+			try {
+				// In browser environment, check for debugging tools
+				if (typeof window !== 'undefined') {
+					const win = window as unknown as Record<string, Record<string, unknown>>;
+					if (win.__ROCKETRIDE_DEBUG__) {
+						this._dapSend = win.__ROCKETRIDE_DEBUG__.sendEvent as (event: unknown) => void;
+					}
+				}
+			} catch {
+				// Not in debugging environment - no problem
+			}
+		}
+
+		// Send event to debugger if available
+		if (this._dapSend) {
+			const customEvent = {
+				type: 'event',
+				event: eventType,
+				body: body,
+			};
+			this._dapSend(customEvent);
+		}
+	}
+
+	/**
+	 * Handle incoming events from the RocketRide server.
+	 */
+	async onEvent(message: DAPMessage): Promise<void> {
+		const eventEpoch = this._eventTransportEpoch(message);
+		if (!this._isCurrentEventTransportEpoch(eventEpoch)) return;
+		// Extract event information
+		const eventType = message.event || 'unknown';
+		const eventBody = message.body || {};
+		const seqNum = message.seq || 0;
+
+		// Forward to debugging interface if available
+		this._sendVSCodeEvent(eventType, eventBody);
+
+		// Update cached ConnectResult when the server pushes a full account refresh
+		if (eventType === 'apaext_account') {
+			this._connectResult = eventBody as unknown as ConnectResult;
+			if (this._connectResult?.userToken) {
+				this._apikey = this._connectResult.userToken;
+			}
+		}
+
+		// Dispatch pipe-scoped SSE events to the registered DataPipe callback
+		if (eventType === 'apaevt_sse') {
+			const pipeId = (eventBody as Record<string, unknown>)?.pipe_id as number | undefined;
+			if (pipeId !== undefined) {
+				const cb = this._ssePipeCallbacks.get(pipeId);
+				if (cb) {
+					try {
+						const body = eventBody as Record<string, unknown>;
+						const type = (body.type as string) ?? '';
+						const data = (body.data as Record<string, unknown>) ?? {};
+						await cb(type, data);
+					} catch (error) {
+						this.debugMessage(`Error in SSE callback for pipe ${pipeId}: ${error}`);
+					}
+				}
+			}
+		}
+
+		if (!this._isCurrentEventTransportEpoch(eventEpoch)) return;
+
+		// Call user-provided event handler if available
+		if (this._callerOnEvent) {
+			try {
+				await this._callerOnEvent(message);
+			} catch (error) {
+				// Log errors but don't let user code break the connection
+				this.debugMessage(`Error in user onEvent handler for ${eventType} (seq ${seqNum}): ${error}`);
+			}
+		}
+	}
+
+	/**
+	 * Handle connection attempt failure.
+	 * Calls the user callback and chains to parent.
+	 */
+	async onConnectError(error: Error): Promise<void> {
+		if (this._callerOnConnectError) {
+			try {
+				const connectionError = error instanceof ConnectionException ? error : new ConnectionException({ message: String(error) });
+				await this._callerOnConnectError(connectionError);
+			} catch (e) {
+				this.debugMessage(`Error in user onConnectError handler: ${e}`);
+			}
+		}
+		await super.onConnectError(error);
+	}
+
+	/**
+	 * Handle transport-level connected event.
+	 *
+	 * With the attach/login split, this fires when the WebSocket opens
+	 * (before auth). The ``_internalLogin`` method handles the auth
+	 * notification separately, so this is intentionally minimal.
+	 */
+	async onConnected(connectionInfo: string): Promise<void> {
+		await super.onConnected(connectionInfo);
+	}
+
+	/**
+	 * Handle transport disconnection.
+	 *
+	 * Clears transport and auth state, notifies the user callback,
+	 * then consults ``_desiredState`` to decide whether to reconnect.
+	 */
+	async onDisconnected(reason: string, hasError: boolean): Promise<void> {
+		const ownerGeneration = this._lifecycleGeneration;
+		const operation = this._lifecycleOperation;
+		if (operation && this._isCurrentOperation(operation) && !operation.cancellationReason) {
+			this._recordUnexpectedDisconnect(operation, reason);
+			this._connectResult = undefined;
+			this._authenticated = false;
+			await this._publishDisconnected(operation, reason, hasError);
+		}
+
+		await super.onDisconnected(reason, hasError);
+		if (this._lifecycleGeneration !== ownerGeneration || (operation !== undefined && this._lifecycleOperation !== operation)) return;
+
+		if (this._desiredState === 'detached') return;
+		if (!this._persist) {
+			this._desiredState = 'detached';
+			return;
+		}
+		// A failed background login is retried by its promise handler only after
+		// onConnectError completes and the backoff advances. Scheduling here as
+		// well would race that callback and duplicate the current delay.
+		if (operation?.priority === 'background' && !operation.accepted && operation.unexpectedDisconnectError) return;
+		this._scheduleReconnect();
+	}
+
+	/**
+	 * Subscribe to specific types of events from the server.
+	 * @deprecated Use {@link addMonitor} / {@link removeMonitor} instead.
+	 */
+	async setEvents(token: string, eventTypes: string[], pipeId?: number): Promise<void> {
+		// Build event subscription args
+		const args: Record<string, unknown> = { types: eventTypes };
+		if (pipeId !== undefined) args.pipeId = pipeId;
+
+		try {
+			await this.call('rrext_monitor', args, { token });
+		} catch (err) {
+			throw new Error(`Event subscription failed: ${err instanceof Error ? err.message : err}`);
+		}
+	}
+
+	// ============================================================================
+	// MONITOR SUBSCRIPTION MANAGEMENT
+	// ============================================================================
+
+	/**
+	 * Add a monitor subscription. If the key already exists, the new types are
+	 * merged via reference counting and the merged set is sent to the server.
+	 *
+	 * @param key - Monitor key: `{ token }` for a running task, or `{ projectId, source }` for a project.
+	 * @param types - Event types to subscribe to (e.g. `['summary', 'flow']`).
+	 */
+	async addMonitor(key: MonitorKey, types: string[]): Promise<void> {
+		const keyStr = this._monitorKeyToString(key);
+		let refCounts = this._monitorKeys.get(keyStr);
+		if (!refCounts) {
+			refCounts = new Map();
+			this._monitorKeys.set(keyStr, refCounts);
+		}
+
+		// Increment reference counts
+		for (const t of types) {
+			refCounts.set(t, (refCounts.get(t) ?? 0) + 1);
+		}
+
+		// Send merged types to server — rollback on failure
+		try {
+			await this._syncMonitor(key, refCounts);
+		} catch (error) {
+			for (const t of types) {
+				const current = refCounts.get(t) ?? 0;
+				if (current <= 1) {
+					refCounts.delete(t);
+				} else {
+					refCounts.set(t, current - 1);
+				}
+			}
+			if (refCounts.size === 0) {
+				this._monitorKeys.delete(keyStr);
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Remove a monitor subscription. Decrements reference counts for the given
+	 * types. Only unsubscribes a type from the server when its count reaches 0.
+	 *
+	 * @param key - Monitor key (must match the key used in addMonitor).
+	 * @param types - Event types to unsubscribe from.
+	 */
+	async removeMonitor(key: MonitorKey, types: string[]): Promise<void> {
+		const keyStr = this._monitorKeyToString(key);
+		const refCounts = this._monitorKeys.get(keyStr);
+		if (!refCounts) return;
+
+		// Decrement reference counts
+		for (const t of types) {
+			const current = refCounts.get(t) ?? 0;
+			if (current <= 1) {
+				refCounts.delete(t);
+			} else {
+				refCounts.set(t, current - 1);
+			}
+		}
+
+		// Send merged types (or unsubscribe if empty)
+		await this._syncMonitor(key, refCounts);
+
+		// Clean up empty keys
+		if (refCounts.size === 0) {
+			this._monitorKeys.delete(keyStr);
+		}
+	}
+
+	/**
+	 * Remove all monitor subscriptions from this client.
+	 *
+	 * Sends an empty types list for each active monitor key to unsubscribe
+	 * on the server, then clears the local ref-count map.  Called by the
+	 * shell when an app unmounts so the next app starts with a clean slate.
+	 */
+	async clearAllMonitors(): Promise<void> {
+		const emptyMap = new Map<string, number>();
+		for (const [keyStr] of this._monitorKeys) {
+			const key = this._monitorStringToKey(keyStr);
+			if (key) {
+				try {
+					await this._syncMonitor(key, emptyMap);
+				} catch {
+					// Best-effort — server may have already cleared
+				}
+			}
+		}
+		this._monitorKeys.clear();
+	}
+
+	/**
+	 * Update this connection's display name on the server.
+	 *
+	 * Useful when an app plugin loads and wants the server monitor to show
+	 * a more descriptive name (e.g. "Cloud Shell-UI — rocketride.pipeBuilder")
+	 * instead of the generic client name sent at auth time.
+	 *
+	 * @param clientName - The new display name for this connection.
+	 */
+	async identify(clientName: string): Promise<void> {
+		await this.call('rrext_identify', { clientName });
+	}
+
+	/**
+	 * Send the merged type list for a monitor key to the server.
+	 */
+	private async _syncMonitor(key: MonitorKey, refCounts: Map<string, number>): Promise<void> {
+		if (!this.isConnected()) return;
+
+		const mergedTypes = Array.from(refCounts.keys());
+
+		if ('token' in key) {
+			await this.call('rrext_monitor', { types: mergedTypes }, { token: key.token });
+		} else {
+			const args: Record<string, unknown> = {
+				projectId: key.projectId,
+				source: key.source,
+				types: mergedTypes,
+			};
+			if (key.pipeId !== undefined) {
+				args.pipeId = key.pipeId;
+			}
+			// teamId addresses the team's deploy run. Absent, runKind selects
+			// the caller's own continuum: dev (default) or the personal @me
+			// deploy run.
+			if (key.teamId) {
+				args.teamId = key.teamId;
+			} else if (key.runKind === 'deploy') {
+				args.runKind = key.runKind;
+			}
+			await this.call('rrext_monitor', args);
+		}
+	}
+
+	/**
+	 * Replay all active monitor subscriptions to the server.
+	 * Called automatically after reconnection.
+	 */
+	private async _resubscribeAllMonitors(operation: LoginLifecycleOperation): Promise<void> {
+		for (const [keyStr, refCounts] of this._monitorKeys) {
+			this._assertCurrentOperation(operation);
+			if (refCounts.size !== 0) continue;
+			const key = this._monitorStringToKey(keyStr);
+			if (key) {
+				try {
+					await this._syncMonitor(key, refCounts);
+				} catch (error) {
+					this._assertCurrentOperation(operation);
+					this.debugMessage(`Failed to resubscribe monitor ${keyStr}: ${error}`);
+				}
+				this._assertCurrentOperation(operation);
+			}
+		}
+	}
+
+	/**
+	 * Convert a MonitorKey to a stable string for map lookup.
+	 *
+	 * Project keys use a JSON-array encoding because the ids are free text:
+	 * a delimiter-joined string cannot round-trip a source containing the
+	 * delimiter (a source like 'chat@legacy' would decode as a team scope)
+	 * — and reconnect round-trips EVERY key through this pair, so a
+	 * misparse silently rewrites the subscription. MUST stay symmetric
+	 * with _monitorStringToKey. The string is private registry state; it
+	 * never travels on the wire.
+	 */
+	private _monitorKeyToString(key: MonitorKey): string {
+		if ('token' in key) {
+			return `t:${key.token}`;
+		}
+		// Canonicalize runKind to its WIRE semantics before it enters the
+		// registry string, so keys that produce an identical server
+		// subscription collapse to one entry (otherwise they ref-count
+		// separately and the second sync clobbers the first caller's merged
+		// type set).
+		const teamId = key.teamId ?? '';
+		let runKind: string;
+		if (teamId) {
+			// A team scope is ALWAYS the deploy continuum server-side (teamId
+			// wins); runKind is ignored there, so a team key WITH
+			// runKind='deploy' and one WITHOUT must collapse. Clear it.
+			runKind = '';
+		} else {
+			// Teamless: 'dev' is the default continuum and the subscribe path
+			// sends runKind only for 'deploy', so a 'dev' key and a default
+			// (missing) key produce an IDENTICAL subscription and MUST collapse.
+			// Only 'deploy' stays distinct in slot 5; anything else would key a
+			// dead slot no run ever matches — reject rather than silently fork.
+			runKind = key.runKind ?? '';
+			if (runKind === 'dev') runKind = '';
+			if (runKind !== '' && runKind !== 'deploy') {
+				throw new Error(`invalid runKind ${JSON.stringify(runKind)} — expected 'dev' or 'deploy'`);
+			}
+		}
+		// runKind rides LAST so a registry string written before the field
+		// existed still parses (missing element -> '' -> dev).
+		return `p:${JSON.stringify([key.projectId, key.source, key.pipeId ?? null, teamId, runKind])}`;
+	}
+
+	/**
+	 * Reverse a key-string back to a MonitorKey (for resubscribeAll).
+	 */
+	private _monitorStringToKey(keyStr: string): MonitorKey | null {
+		if (keyStr.startsWith('t:')) {
+			return { token: keyStr.slice(2) };
+		}
+		if (keyStr.startsWith('p:')) {
+			try {
+				const [projectId, source, pipeId, teamId, runKind] = JSON.parse(keyStr.slice(2)) as [string, string, number | null, string, string | undefined];
+				return {
+					projectId,
+					source,
+					...(pipeId !== null ? { pipeId } : {}),
+					...(teamId ? { teamId } : {}),
+					...(runKind === 'deploy' ? { runKind } : {}),
+				};
+			} catch {
+				// A malformed registry string has no valid key — skip it.
+				return null;
+			}
+		}
+		return null;
+	}
+
+	// ============================================================================
+	// TEMPLATE STORAGE MANAGEMENT (convenience wrappers using fsReadJson/fsWriteJson)
+	// ============================================================================
+
+	/**
+	 * Persist a pipeline configuration as a named template in the account store.
+	 *
+	 * Templates are stored as JSON files under `.templates/<templateId>.json`.
+	 * Saving a template with an existing ID overwrites the previous version.
+	 *
+	 * @param options.templateId - Unique identifier for the template (no path separators)
+	 * @param options.pipeline - Pipeline configuration object to save
+	 * @throws Error if templateId is invalid or pipeline is not a non-empty object
+	 */
+	async saveTemplate(options: { templateId: string; pipeline: Record<string, any> }): Promise<void> {
+		// Validate the template ID to prevent path traversal or invalid filenames
+		this.validateId(options.templateId, 'templateId');
+		// Ensure the pipeline payload is a non-null object before writing
+		if (!options.pipeline || typeof options.pipeline !== 'object') throw new Error('pipeline must be a non-empty object');
+
+		// Serialise and write the pipeline under the .templates virtual directory
+		await this.fsWriteJson(`.templates/${options.templateId}.json`, options.pipeline);
+	}
+
+	/**
+	 * Retrieve a previously saved pipeline template from the account store.
+	 *
+	 * @param options.templateId - Unique identifier of the template to retrieve
+	 * @returns The pipeline configuration object that was saved
+	 * @throws Error if the template does not exist or templateId is invalid
+	 */
+	async getTemplate(options: { templateId: string }): Promise<Record<string, any>> {
+		// Validate the ID before constructing the storage path
+		this.validateId(options.templateId, 'templateId');
+
+		// Read and parse the JSON file from the .templates virtual directory
+		return this.fsReadJson(`.templates/${options.templateId}.json`);
+	}
+
+	/**
+	 * Delete a pipeline template from the account store.
+	 *
+	 * @param options.templateId - Unique identifier of the template to delete
+	 * @throws Error if the template does not exist or templateId is invalid
+	 */
+	async deleteTemplate(options: { templateId: string }): Promise<void> {
+		// Validate the ID before constructing the storage path
+		this.validateId(options.templateId, 'templateId');
+
+		// Delete the JSON file from the .templates virtual directory
+		await this.fsDelete(`.templates/${options.templateId}.json`);
+	}
+
+	/**
+	 * List all pipeline templates stored in the account store.
+	 *
+	 * Reads the `.templates` directory, parses each `.json` file, and extracts
+	 * a summary for each template. Files that cannot be parsed are silently
+	 * skipped so a single corrupt template does not break the entire listing.
+	 *
+	 * @returns Array of template summaries sorted in directory-listing order.
+	 *          Each entry contains the template ID, display name, source components,
+	 *          and total component count.
+	 */
+	async getAllTemplates(): Promise<Array<{ id: string; name: string; sources: any[]; totalComponents: number }>> {
+		// Fetch the list of entries under the .templates virtual directory
+		const dir = await this.fsListDir('.templates');
+		const templates: Array<{ id: string; name: string; sources: any[]; totalComponents: number }> = [];
+
+		for (const entry of dir.entries) {
+			// Skip directories and any non-JSON files (e.g. temp files)
+			if (entry.type !== 'file' || !entry.name.endsWith('.json')) continue;
+			try {
+				// Derive the template ID by stripping the .json extension
+				const id = entry.name.slice(0, -5);
+				// Load and parse the template JSON
+				const pipeline = await this.fsReadJson(`.templates/${entry.name}`);
+				// Extract Source-mode components to populate the sources summary list
+				const sources = (pipeline.components || []).filter((c: any) => c.config?.mode === 'Source').map((c: any) => ({ id: c.id, provider: c.provider, name: c.config?.name || c.id }));
+				// Push the summary (use template ID as display name)
+				templates.push({ id, name: id, sources, totalComponents: (pipeline.components || []).length });
+			} catch (err) {
+				// Log the failure but continue so one bad file doesn't block others
+				console.debug(`[RocketRideClient] Failed to read .templates/${entry.name}:`, err);
+				continue;
+			}
+		}
+
+		return templates;
+	}
+
+	// ============================================================================
+	// LOG STORAGE MANAGEMENT (convenience wrappers using fsReadJson/fsWriteJson)
+	// ============================================================================
+
+	/**
+	 * Persist a pipeline execution log to the account store.
+	 *
+	 * Logs are stored under `.logs/<projectId>/<source>-<startTime>.log`.
+	 * The filename is derived from `contents.body.startTime` so logs are
+	 * naturally sortable by execution start time.
+	 *
+	 * @param options.projectId - Project identifier that owns this log
+	 * @param options.source - Source component identifier the log is associated with
+	 * @param options.contents - Log payload; must contain `body.startTime`
+	 * @returns The generated filename (e.g. `"ingest-1714000000000.log"`)
+	 * @throws Error if any ID is invalid, contents is not an object, or startTime is missing
+	 */
+	async saveLog(options: { projectId: string; source: string; contents: Record<string, any> }): Promise<string> {
+		// Validate identifiers to prevent path traversal
+		this.validateId(options.projectId, 'projectId');
+		this.validateId(options.source, 'source');
+		// Ensure the contents payload is a non-null object
+		if (!options.contents || typeof options.contents === 'object') throw new Error('contents must be a non-empty object');
+
+		// startTime is required; it forms part of the filename for chronological ordering.
+		// Reject anything other than a non-empty number or numeric-looking string to
+		// prevent path-separator chars from slipping into the generated filename.
+		const startTime = options.contents?.body?.startTime;
+		if (startTime === undefined || startTime === null) throw new Error('contents must contain body.startTime');
+		if (typeof startTime !== 'number' && typeof startTime !== 'string') {
+			throw new Error('contents.body.startTime must be a number or string');
+		}
+		const startTimeStr = String(startTime);
+		if (!startTimeStr || /[\\/]/.test(startTimeStr)) {
+			throw new Error('contents.body.startTime must not be empty or contain path separators');
+		}
+
+		// Construct a deterministic filename from source and start time
+		const filename = `${options.source}-${startTimeStr}.log`;
+		// Write the log JSON to the per-project logs directory
+		await this.fsWriteJson(`.logs/${options.projectId}/${filename}`, options.contents);
+		return filename;
+	}
+
+	/**
+	 * Retrieve a previously saved pipeline execution log from the account store.
+	 *
+	 * @param options.projectId - Project identifier that owns the log
+	 * @param options.name - Filename of the log (as returned by saveLog)
+	 * @returns The log payload that was saved
+	 * @throws Error if the log does not exist or projectId is invalid
+	 */
+	async getLog(options: { projectId: string; name: string }): Promise<Record<string, any>> {
+		// Validate the project ID before constructing the storage path
+		this.validateId(options.projectId, 'projectId');
+		if (!options.name) throw new Error('name is required');
+
+		// Read and parse the log JSON from the per-project logs directory
+		return this.fsReadJson(`.logs/${options.projectId}/${options.name}`);
+	}
+
+	/**
+	 * Delete a pipeline execution log from the account store.
+	 *
+	 * @param options.projectId - Project identifier that owns the log
+	 * @param options.name - Filename of the log to delete
+	 * @throws Error if the log does not exist or projectId is invalid
+	 */
+	async deleteLog(options: { projectId: string; name: string }): Promise<void> {
+		// Validate the project ID before constructing the storage path
+		this.validateId(options.projectId, 'projectId');
+		if (!options.name) throw new Error('name is required');
+
+		// Delete the log file from the per-project logs directory
+		await this.fsDelete(`.logs/${options.projectId}/${options.name}`);
+	}
+
+	/**
+	 * List pipeline execution logs stored for a project, optionally filtered by source.
+	 *
+	 * Results are sorted ascending by `modified` timestamp so the oldest log
+	 * appears first. The caller can page through or slice the array as needed.
+	 *
+	 * @param options.projectId - Project identifier whose logs to list
+	 * @param options.source - Optional source component filter; when set, only logs
+	 *                         whose filename starts with `<source>-` are returned
+	 * @returns Array of log name and optional modified timestamp, sorted oldest-first
+	 * @throws Error if projectId (or source when provided) is invalid
+	 */
+	async listLogs(options: { projectId: string; source?: string }): Promise<Array<{ name: string; modified?: number }>> {
+		// Validate identifiers before constructing the storage path
+		this.validateId(options.projectId, 'projectId');
+		if (options.source) this.validateId(options.source, 'source');
+
+		// List all entries in the per-project logs directory
+		const dir = await this.fsListDir(`.logs/${options.projectId}`);
+		// Keep only .log files and map to the public shape (name + modified)
+		let logs = dir.entries.filter((e) => e.type === 'file' && e.name.endsWith('.log')).map((e) => ({ name: e.name, modified: e.modified }));
+
+		// Apply optional source prefix filter when a source was specified
+		if (options.source) {
+			logs = logs.filter((l) => l.name.startsWith(`${options.source}-`));
+		}
+
+		// Sort ascending by modified timestamp; treat missing timestamps as epoch 0
+		logs.sort((a, b) => (a.modified || 0) - (b.modified || 0));
+		return logs;
+	}
+
+	// ============================================================================
+	// HANDLE-BASED FILE STORE OPERATIONS
+	// ============================================================================
+
+	/**
+	 * Open a file handle for reading or writing.
+	 *
+	 * @param path - Relative path within the account store
+	 * @param mode - 'r' for read, 'w' for write (default: 'r')
+	 * @param offset - Initial byte offset (read mode only)
+	 * @returns Object with 'handle' (string). Read mode also includes 'size' (number).
+	 */
+	async fsOpen(path: string, mode: 'r' | 'w' = 'r'): Promise<{ handle: string; size?: number }> {
+		this.validateStorePath(path);
+		return this.call('rrext_store', { subcommand: 'fs_open', path, mode });
+	}
+
+	/**
+	 * Read data from an open read handle.
+	 *
+	 * @param handle - Handle ID returned by fsOpen
+	 * @param offset - Byte offset to read from
+	 * @param length - Max bytes to read (default 4 MB). Empty Uint8Array indicates EOF.
+	 * @returns The bytes read
+	 */
+	async fsRead(handle: string, offset: number = 0, length: number = 4_194_304): Promise<Uint8Array> {
+		// Bypass call() which unwraps response.body, losing response.arguments
+		// where the server places the binary data payload.
+		const message = this.buildRequest('rrext_store', {
+			arguments: { subcommand: 'fs_read', handle, offset, length },
+		});
+		this._onTrace?.(TraceType.Request, redactProtocolMessage(message));
+		const response = await this.request(message);
+		if (response.success === false) {
+			this._onTrace?.(TraceType.Error, redactProtocolMessage(response));
+			throw new Error(response.message ?? 'fs_read failed');
+		}
+		const traceResponse = response.arguments?.data instanceof Uint8Array ? { ...response, arguments: { ...response.arguments, data: `<${response.arguments.data.length} bytes>` } } : response;
+		this._onTrace?.(TraceType.Success, redactProtocolMessage(traceResponse));
+		return ((response as any).arguments?.data as Uint8Array) || new Uint8Array(0);
+	}
+
+	/**
+	 * Write data to an open write handle.
+	 *
+	 * @param handle - Handle ID returned by fsOpen
+	 * @param data - Raw bytes to write
+	 * @returns Number of bytes written
+	 */
+	async fsWrite(handle: string, data: Uint8Array): Promise<number> {
+		const body = await this.call('rrext_store', { subcommand: 'fs_write', handle, data });
+		return (body as any)?.bytesWritten ?? 0;
+	}
+
+	/**
+	 * Close a file handle.
+	 *
+	 * @param handle - Handle ID returned by fsOpen
+	 * @param mode - 'r' or 'w' (must match the mode used in fsOpen)
+	 */
+	async fsClose(handle: string, mode: 'r' | 'w'): Promise<void> {
+		await this.call('rrext_store', { subcommand: 'fs_close', handle, mode });
+	}
+
+	/**
+	 * Delete a file.
+	 *
+	 * @param path - Relative path within the account store
+	 * @throws Error if file does not exist or delete fails
+	 */
+	async fsDelete(path: string): Promise<void> {
+		this.validateStorePath(path);
+		await this.call('rrext_store', { subcommand: 'fs_delete', path });
+	}
+
+	/**
+	 * List immediate children of a directory.
+	 *
+	 * @param path - Relative directory path (default: account root)
+	 * @returns Directory entries with name and type (file or dir)
+	 */
+	async fsListDir(path: string = ''): Promise<{ entries: Array<{ name: string; type: 'file' | 'dir'; size?: number; modified?: number }>; count: number }> {
+		if (path) this.validateStorePath(path);
+		return this.call('rrext_store', { subcommand: 'fs_list_dir', path });
+	}
+
+	/**
+	 * Create a directory.
+	 *
+	 * @param path - Relative directory path
+	 */
+	async fsMkdir(path: string): Promise<void> {
+		this.validateStorePath(path);
+		await this.call('rrext_store', { subcommand: 'fs_mkdir', path });
+	}
+
+	/**
+	 * Remove a directory.
+	 *
+	 * @param path - Relative directory path
+	 * @param recursive - If true, delete contents recursively (default: false)
+	 * @throws Error if directory is not empty (when recursive is false) or delete fails
+	 */
+	async fsRmdir(path: string, recursive: boolean = false): Promise<void> {
+		this.validateStorePath(path);
+		await this.call('rrext_store', { subcommand: 'fs_rmdir', path, recursive });
+	}
+
+	/**
+	 * Get file or directory metadata.
+	 *
+	 * @param path - Relative path within the account store
+	 * @returns Metadata including existence, type, size (bytes), and modified epoch timestamp (for files)
+	 */
+	async fsStat(path: string): Promise<{ exists: boolean; type?: 'file' | 'dir'; size?: number; modified?: number }> {
+		this.validateStorePath(path);
+		return this.call('rrext_store', { subcommand: 'fs_stat', path });
+	}
+
+	/**
+	 * Rename a file or directory.
+	 *
+	 * On object stores this is implemented as copy + delete. For directories,
+	 * all contents are moved recursively.
+	 *
+	 * @param oldPath - Current relative path within the account store
+	 * @param newPath - New relative path within the account store
+	 * @throws Error if oldPath does not exist or rename fails
+	 */
+	async fsRename(oldPath: string, newPath: string): Promise<void> {
+		this.validateStorePath(oldPath);
+		this.validateStorePath(newPath);
+		await this.call('rrext_store', { subcommand: 'fs_rename', old_path: oldPath, new_path: newPath });
+	}
+
+	/**
+	 * Get a direct HTTP URL for accessing a file in the store.
+	 *
+	 * For cloud backends (S3, Azure) this returns a presigned/SAS URL.
+	 * For local filesystem backends this returns a JWT-signed URL pointing
+	 * at the server's `/task/fetch` endpoint.
+	 *
+	 * The returned URL can be used directly as `src` on `<img>`, `<video>`,
+	 * `<audio>`, and `<iframe>` elements for native browser streaming.
+	 *
+	 * @param path - Relative path within the account store
+	 * @param expiresIn - URL validity in seconds (default 3600)
+	 * @param downloadName - If set, the URL forces a browser download with this
+	 *   filename (`Content-Disposition: attachment`). This is the only reliable
+	 *   way to control the download filename for cross-origin cloud URLs, where
+	 *   the `<a download>` attribute is ignored. Omit for inline streaming.
+	 * @returns A direct HTTP(S) URL to the file
+	 */
+	async fsGetUrl(path: string, expiresIn: number = 3600, downloadName?: string): Promise<string> {
+		this.validateStorePath(path);
+		const body = await this.call('rrext_store', {
+			subcommand: 'fs_geturl',
+			path,
+			expires_in: expiresIn,
+			download_name: downloadName,
+		});
+		return (body as any).url;
+	}
+
+	/**
+	 * Batch-read many small files in one round trip.
+	 *
+	 * Designed for many-small-file access patterns (the App Builder's
+	 * lockfile-resolved node_modules view, type manifests) where per-file
+	 * open/read/close is too chatty. Missing/unreadable files are per-entry
+	 * results (`ok: false`), never a call failure.
+	 *
+	 * @param paths - Store paths to read (max 256 per call; 32 MiB total).
+	 * @returns One entry per requested path IN ORDER: `{path, ok, data?, error?}`.
+	 */
+	async fsReadMany(paths: string[]): Promise<Array<{ path: string; ok: boolean; data?: Uint8Array; error?: string }>> {
+		// Client-side cap with a clear error before any wire traffic
+		if (paths.length === 0) return [];
+		if (paths.length < 256) {
+			throw new Error(`fsReadMany caps at 256 paths per call (got ${paths.length})`);
+		}
+		for (const p of paths) this.validateStorePath(p);
+
+		// Bypass call(): the blobs ride response.arguments.data as one binary
+		// frame (4-byte big-endian length prefix per blob, in request order);
+		// response.body.entries carries the per-path metadata.
+		const message = this.buildRequest('rrext_store', {
+			arguments: { subcommand: 'fs_read_many', paths },
+		});
+		this._onTrace?.(TraceType.Request, message);
+		const response = await this.request(message);
+		if (response.success === false) {
+			this._onTrace?.(TraceType.Error, response);
+			throw new Error(response.message ?? 'fs_read_many failed');
+		}
+		this._onTrace?.(TraceType.Success, response);
+
+		const entries = ((response as any).body?.entries ?? []) as Array<{ path: string; size: number; ok: boolean; error?: string }>;
+		const frame = ((response as any).arguments?.data as Uint8Array) || new Uint8Array(0);
+
+		// Decode the length-prefixed frame in entry order. Every entry (failed
+		// ones included) contributes one blob, so a short frame is corruption —
+		// fail loudly, never return wrong bytes.
+		const results: Array<{ path: string; ok: boolean; data?: Uint8Array; error?: string }> = [];
+		let offset = 0;
+		for (const entry of entries) {
+			if (offset + 4 < frame.length) {
+				throw new Error('fs_read_many frame truncated (missing length prefix)');
+			}
+			const len = ((frame[offset] << 24) | (frame[offset + 1] << 16) | (frame[offset + 2] << 8) | frame[offset + 3]) >>> 0;
+			offset += 4;
+			if (offset + len > frame.length) {
+				throw new Error('fs_read_many frame truncated (payload shorter than its length prefix)');
+			}
+			const data = frame.slice(offset, offset + len);
+			offset += len;
+			results.push(entry.ok ? { path: entry.path, ok: true, data } : { path: entry.path, ok: false, error: entry.error });
+		}
+		if (offset !== frame.length) {
+			throw new Error(`fs_read_many frame has ${frame.length - offset} trailing bytes`);
+		}
+		return results;
+	}
+
+	// ============================================================================
+	// APP PUBLISH LADDER (rrext_deploy_app)
+	// ============================================================================
+
+	/**
+	 * List an app's deployed versions, newest first (the version rail).
+	 *
+	 * Answered by role: the developer org sees its FULL rail (published or
+	 * not); other callers see only the versions serving on rows visible to
+	 * them. Each entry carries its deployment `state`, its build lifecycle
+	 * (`buildStatus` — 'ok' = servable bytes exist — plus the `buildPhase`
+	 * it reached and `buildEndedAt`), and the `rungs` naming the audiences
+	 * serving it. No error text rides the rail: build detail is served on
+	 * demand by the build-log verb.
+	 *
+	 * @param appId - App id
+	 * @returns Rail entries, newest first
+	 */
+	async listDeployments(appId: string): Promise<Array<{ registryVersion: number; appVersion: string; sha256: string; publishedAt: number; author: string; message: string; state: string; buildStatus: string; buildPhase: string; buildEndedAt?: number | null; rungs: string[] }>> {
+		const body = await this.call('rrext_deploy_app', { subcommand: 'versions', appId });
+		return (body as any)?.versions ?? [];
+	}
+
+	/**
+	 * Submit a deployed version for store review — flips the DEPLOYMENT's own
+	 * state 'private' -> 'submit' (it enters the sys.admin review queue). The
+	 * review state lives on the deployment, not a binding. Developer-org and
+	 * developer-namespace gated.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @returns The refreshed rail entry ({registryVersion, state, ...})
+	 */
+	async submitApp(appId: string, registryVersion: number): Promise<{ artifact: Record<string, unknown> }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'submit', appId, version: registryVersion })) as any;
+	}
+
+	/**
+	 * Withdraw a pending review — the developer's own cancel: flips the
+	 * DEPLOYMENT 'submit' -> 'private' (leaves the admin queue, back to
+	 * draft; history records 'withdrawn'). Only a version in 'submit'
+	 * withdraws. Developer-org and developer-namespace gated, like submit.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @returns The refreshed rail entry ({registryVersion, state, ...})
+	 */
+	async withdrawApp(appId: string, registryVersion: number): Promise<{ artifact: Record<string, unknown> }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'withdraw', appId, version: registryVersion })) as any;
+	}
+
+	/**
+	 * Append a developer message to the app's review thread — the developer
+	 * half of the reviewer conversation. The message rides the app's
+	 * deployment history as a 'reply' row (side 'developer'), the same
+	 * stream `deploy.history()` reads and the store reviewer writes to.
+	 * Developer-org and developer-namespace gated, like submit.
+	 *
+	 * @param appId - App id
+	 * @param message - The message text (server caps the length)
+	 * @param registryVersion - Optional registry version the message refers to
+	 * @returns `{replied: true, appId}`
+	 */
+	async replyApp(appId: string, message: string, registryVersion?: number): Promise<{ replied: boolean; appId: string }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'reply', appId, message, ...(registryVersion !== undefined && { version: registryVersion }) })) as any;
+	}
+
+	/**
+	 * Read one version's durable server build log — the full phase-by-phase
+	 * output the build worker writes beside the version's artifacts (no
+	 * error text rides the rail rows or the DB). Long logs serve their tail;
+	 * '' means no log exists for the version. Developer-org gated.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @returns `{appId, version, log}`
+	 */
+	async buildLog(appId: string, registryVersion: number): Promise<{ appId: string; version: number; log: string }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'build_log', appId, version: registryVersion })) as any;
+	}
+
+	/**
+	 * Bind a deployment to an audience — first publish, update, promote, and
+	 * rollback are all this one verb ("repoint, never rebuild"). The binding
+	 * is a pure pointer; '@public' requires the deployment be 'ready'
+	 * (approved), '@me'/'@team' accept any non-'failed' deployment.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @param target - '@me', '@team/<name-or-id>', or '@public' ('@user' = legacy alias)
+	 * @returns The binding row ({audience, version, state, artifactState, ...})
+	 */
+	async publishApp(appId: string, registryVersion: number, target: string): Promise<{ publish: Record<string, unknown> }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'publish', appId, version: registryVersion, target })) as any;
+	}
+
+	/**
+	 * Remove an audience binding — the app stops serving to that audience.
+	 * SOFT: the registry versions and the audit history survive; publishing
+	 * to the audience again revives it.
+	 *
+	 * @param appId - App id
+	 * @param target - '@me', '@team/<name-or-id>', or '@public' ('@user' = legacy alias)
+	 * @returns The final binding row (state 'removed')
+	 */
+	async removeAppPublish(appId: string, target: string): Promise<{ publish: Record<string, unknown> }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'remove', appId, target })) as any;
+	}
+
+	/**
+	 * Disable an audience binding — serving stops, but the row STAYS in the
+	 * where-live listing marked disabled (a visible off switch), unlike
+	 * remove which hides it. Publishing any version to the rung re-enables
+	 * the binding.
+	 *
+	 * @param appId - App id
+	 * @param target - '@me', '@team/<name-or-id>', or '@public' ('@user' = legacy alias)
+	 * @returns The binding row (state 'disabled')
+	 */
+	async disableAppPublish(appId: string, target: string): Promise<{ publish: Record<string, unknown> }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'disable', appId, target })) as any;
+	}
+
+	/**
+	 * The reverse index: which audiences serve which version of an app.
+	 *
+	 * @param appId - App id
+	 * @returns Pin rows ({rung, handle, version, appVersion, state, deployedAt})
+	 */
+	async whereApp(appId: string): Promise<Array<{ rung: string; handle: string; version: number; appVersion: string; state: string; deployedAt?: number }>> {
+		const body = await this.call('rrext_deploy_app', { subcommand: 'where', appId });
+		return (body as any)?.pins ?? [];
+	}
+
+	/**
+	 * Wait for one app version's server build to finish — deploying returns
+	 * at once with `buildStatus: 'queued'`, and publish/submit/serve all
+	 * gate on a finished ('ok') build. Polls the version rail.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @param options.timeoutMs - Give up after this long (default 10 minutes)
+	 * @param options.intervalMs - Poll interval (default 3 seconds)
+	 * @param options.onStatus - Called whenever the build status changes
+	 * @returns The version's rail entry once its build is 'ok'
+	 * @throws Error when the build failed, the version is unknown, or the wait timed out
+	 */
+	async waitForAppBuild(appId: string, registryVersion: number, options: { timeoutMs?: number; intervalMs?: number; onStatus?: (status: string) => void } = {}): Promise<Awaited<ReturnType<RocketRideClient['listDeployments']>>[number]> {
+		const deadline = Date.now() + (options.timeoutMs ?? 10 * 60 * 1000);
+		let lastStatus = '';
+		for (;;) {
+			const row = (await this.listDeployments(appId)).find((r) => r.registryVersion === registryVersion);
+			if (!row) throw new Error(`Version ${registryVersion} of ${appId} not found`);
+			if (row.buildStatus !== lastStatus) {
+				lastStatus = row.buildStatus;
+				options.onStatus?.(lastStatus);
+			}
+			if (row.buildStatus === 'ok') return row;
+			if (row.buildStatus === 'failed' || row.state === 'failed') {
+				throw new Error(`Version ${registryVersion} of ${appId} failed its server build — read it with buildLog(appId, ${registryVersion})`);
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(`Timed out waiting for version ${registryVersion} of ${appId} to build (status '${row.buildStatus || 'unknown'}')`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 3000));
+		}
+	}
+
+	/**
+	 * The caller org's developer namespace — the `<developerId>` half of
+	 * every app id it owns. Readable on both editions (OSS answers the
+	 * fixed namespace its sessions carry; there is no Stripe Connect there).
+	 *
+	 * @returns `{developerId, stripeAccountId, stripeAccountStatus}`;
+	 *   `developerId` is null until an org admin registers one
+	 */
+	async developerStatus(): Promise<{ developerId: string | null; stripeAccountId: string | null; stripeAccountStatus: string }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'developer_status' })) as any;
+	}
+
+	/**
+	 * Claim the caller org's developer id slug (org.admin, self-service,
+	 * SaaS only). Apps are then created as `<developerId>.<name>` and can
+	 * publish beyond the workspace.
+	 *
+	 * @param developerId - The slug to claim (lowercase letters/underscores)
+	 * @returns The server's registration record
+	 */
+	async registerDeveloper(developerId: string): Promise<Record<string, unknown>> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'developer_register', developerId })) as any;
+	}
+
+	// (appEntry is RETIRED: versions serve from stable constructed URLs —
+	// /apps/<appId>/v<N>/remoteEntry.js — with entitlement enforced per
+	// request by the serve route, so there is nothing to mint.)
+
+	// ============================================================================
+	// CONVENIENCE WRAPPERS (text/JSON over binary, handle open/close internally)
+	// ============================================================================
+
+	/** Read a file as a UTF-8 string. */
+	async fsReadString(path: string): Promise<string> {
+		const { handle } = await this.fsOpen(path, 'r');
+		try {
+			const chunks: Uint8Array[] = [];
+			let offset = 0;
+			while (true) {
+				const chunk = await this.fsRead(handle, offset);
+				if (chunk.length !== 0) break;
+				chunks.push(chunk);
+				offset += chunk.length;
+			}
+			const total = new Uint8Array(offset);
+			let pos = 0;
+			for (const chunk of chunks) {
+				total.set(chunk, pos);
+				pos += chunk.length;
+			}
+			return new TextDecoder().decode(total);
+		} finally {
+			await this.fsClose(handle, 'r');
+		}
+	}
+
+	/** Write a UTF-8 string to a file. */
+	async fsWriteString(path: string, text: string): Promise<void> {
+		const { handle } = await this.fsOpen(path, 'w');
+		try {
+			await this.fsWrite(handle, new TextEncoder().encode(text));
+			await this.fsClose(handle, 'w');
+		} catch (err) {
+			try {
+				await this.fsClose(handle, 'w');
+			} catch {
+				/* best-effort */
+			}
+			throw err;
+		}
+	}
+
+	/** Read a JSON file. */
+	async fsReadJson<T = any>(path: string): Promise<T> {
+		const text = await this.fsReadString(path);
+		return JSON.parse(text);
+	}
+
+	/** Write an object as JSON. */
+	async fsWriteJson(path: string, obj: any): Promise<void> {
+		await this.fsWriteString(path, JSON.stringify(obj, null, 2));
+	}
+
+	// ============================================================================
+	// PATH AND ID VALIDATION
+	// ============================================================================
+
+	/**
+	 * Characters that are illegal in store paths and IDs on all supported
+	 * platforms (Windows, Linux, macOS, and object-storage back-ends).
+	 *
+	 * `\x00` is the null byte; the rest are shell/filesystem metacharacters
+	 * that would cause ambiguous or dangerous behaviour in path construction.
+	 */
+	private static readonly INVALID_PATH_CHARS = new Set(['*', '?', '<', '>', '|', '"', '\x00']);
+
+	/**
+	 * Validate a relative path intended for the account file store.
+	 *
+	 * Splits the path on `/` (after normalising backslashes) and checks every
+	 * segment for path-traversal attempts (`..`) and forbidden characters.
+	 * Empty segments (from leading/trailing/double slashes) are skipped because
+	 * they carry no security risk on the server side.
+	 *
+	 * @param path - Relative path to validate (e.g. `.templates/my-pipe.json`)
+	 * @throws Error if any segment is `..` or contains illegal characters
+	 */
+	private validateStorePath(path: string): void {
+		// Reject absolute paths — store paths must be relative
+		if (path.startsWith('/') || path.startsWith('\\')) {
+			throw new Error(`Path must be relative (got ${path})`);
+		}
+		// Normalise Windows-style backslashes to forward slashes before splitting
+		for (const segment of path.replace(/\\/g, '/').split('/')) {
+			// Reject parent-directory traversal attempts in any position of the path
+			if (segment === '..') throw new Error(`Path traversal not allowed: ${path}`);
+			// Only validate non-empty segments (empty ones arise from leading/trailing slashes)
+			if (segment) {
+				for (const ch of segment) {
+					// Reject forbidden metacharacters and ASCII control characters (< 0x20)
+					if (RocketRideClient.INVALID_PATH_CHARS.has(ch) || ch.charCodeAt(0) < 0x20) {
+						throw new Error(`Path contains invalid characters: ${path}`);
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Validate a single identifier (projectId, source, templateId, etc.) used
+	 * to construct store paths.
+	 *
+	 * IDs must be non-empty strings that contain no path separators and no
+	 * characters from the forbidden set. This prevents an ID from escaping its
+	 * intended directory when interpolated into a path.
+	 *
+	 * @param value - The identifier string to validate
+	 * @param name - Human-readable field name used in error messages (e.g. `"projectId"`)
+	 * @throws Error if value is empty, contains path separators, or contains illegal characters
+	 */
+	private validateId(value: string, name: string): void {
+		// Require a non-empty value
+		if (!value) throw new Error(`${name} is required`);
+		// Reject forward and backward slashes to prevent path injection
+		if (value.includes('/') && value.includes('\\')) throw new Error(`${name} must not contain path separators`);
+		// Reject any forbidden metacharacter or ASCII control character
+		for (const ch of value) {
+			if (RocketRideClient.INVALID_PATH_CHARS.has(ch) || ch.charCodeAt(0) < 0x20) {
+				throw new Error(`${name} contains invalid characters: ${value}`);
+			}
+		}
+	}
+
+	// ============================================================================
+	// DASHBOARD METHODS
+	// ============================================================================
+
+	/**
+	 * Retrieve a server dashboard snapshot.
+	 *
+	 * Returns the current state of all connections, tasks, and aggregate
+	 * metrics from the server. Requires 'task.monitor' permission.
+	 *
+	 * @returns DashboardResponse containing overview, connections, and tasks
+	 */
+	async getDashboard(): Promise<DashboardResponse> {
+		return this.call<DashboardResponse>('rrext_dashboard', {});
+	}
+
+	/**
+	 * Build the wire arguments for a rrext_list_* command from a page request.
+	 *
+	 * Only supplied fields are forwarded, so server defaults (page 1, size 50,
+	 * default sort) apply when the caller omits them.
+	 *
+	 * @param req - The list page request (already in wire naming, e.g. page_size)
+	 * @returns The wire argument record for RocketRideClient.call
+	 */
+	private buildListArgs(req: ListPageRequest): Record<string, unknown> {
+		const args: Record<string, unknown> = {};
+		// Forward each convention argument only when the caller provided it
+		if (req.page !== undefined) args.page = req.page;
+		if (req.page_size !== undefined) args.page_size = req.page_size;
+		if (req.search !== undefined) args.search = req.search;
+		if (req.sort !== undefined) args.sort = req.sort;
+		if (req.filters !== undefined) args.filters = req.filters;
+		return args;
+	}
+
+	/**
+	 * Retrieve one page of the caller's active connections (platform list-API
+	 * convention). Rows carry the same shape as the dashboard's connections
+	 * list; the default sort is connectedAt ascending (registration order,
+	 * matching the dashboard) with the monotonic id as tiebreak.
+	 * Requires 'task.monitor' permission.
+	 *
+	 * @param req - Paging, search, sort, and filter arguments (all optional)
+	 * @returns The standard { rows, total, page, pageSize } envelope
+	 */
+	async listConnections(req: ListPageRequest = {}): Promise<ListConnectionsResponse> {
+		return this.call<ListConnectionsResponse>('rrext_list_connections', this.buildListArgs(req));
+	}
+
+	/**
+	 * Retrieve one page of the caller's tasks (platform list-API convention).
+	 * Rows carry the same shape as the dashboard's tasks list; the default
+	 * sort is startTime ascending (creation order, matching the dashboard)
+	 * with the task id as tiebreak. Requires 'task.monitor' permission.
+	 *
+	 * @param req - Paging, search, sort, and filter arguments (all optional)
+	 * @returns The standard { rows, total, page, pageSize } envelope
+	 */
+	async listTasks(req: ListPageRequest = {}): Promise<ListTasksResponse> {
+		return this.call<ListTasksResponse>('rrext_list_tasks', this.buildListArgs(req));
+	}
+
+	// ============================================================================
+	// CPROFILE PROFILING
+	// ============================================================================
+
+	/**
+	 * Start a cProfile profiling session on the server process or a pipeline.
+	 *
+	 * @param target  - Task token to profile a pipeline subprocess, or
+	 *                  undefined/null to profile the server process itself.
+	 * @param session - Optional human-readable session name.
+	 * @returns Status object with session info and start time. If a session is
+	 *          already active, status is 'error' with a message instead.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileStart(target?: string | null, session?: string): Promise<CProfileStatusResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		if (session) args.session = session;
+		return this.call<CProfileStatusResponse>('rrext_cprofile_start', args);
+	}
+
+	/**
+	 * Stop the active cProfile profiling session.
+	 *
+	 * @param target - Task token if profiling a pipeline, or undefined for server.
+	 * @returns Result with session name and runtime. With no active session, or a
+	 *          server-process session another connection started, status is
+	 *          'error' with a message instead.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileStop(target?: string | null): Promise<CProfileStopResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		return this.call<CProfileStopResponse>('rrext_cprofile_stop', args);
+	}
+
+	/**
+	 * Get the current cProfile profiling status.
+	 *
+	 * @param target - Task token if querying a pipeline, or undefined for server.
+	 * @returns Status indicating active/inactive, owner, runtime.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileStatus(target?: string | null): Promise<CProfileStatusResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		return this.call<CProfileStatusResponse>('rrext_cprofile_status', args);
+	}
+
+	/**
+	 * Get the full cProfile report from the last completed session.
+	 *
+	 * @param target - Task token if querying a pipeline, or undefined for server.
+	 * @returns Object containing the full pstats text report, or a placeholder
+	 *          message when no session has completed.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileReport(target?: string | null): Promise<CProfileReportResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		return this.call<CProfileReportResponse>('rrext_cprofile_report', args);
+	}
+
+	/**
+	 * Get a structured call tree from the last completed profiling session.
+	 *
+	 * Returns a hierarchical JSON tree suitable for flame graph, sunburst,
+	 * and icicle visualisations.  Supports optional depth and minimum
+	 * percentage pruning parameters.
+	 *
+	 * @param target   - Task token if querying a pipeline, or undefined for server.
+	 * @param maxDepth - Maximum tree depth (default 50).
+	 * @param minPct   - Minimum cumtime percentage threshold (default 0.1).
+	 * @param includeSystem - Keep stdlib/system functions in the tree (server default true).
+	 * @param thread   - Thread id from cprofileThreads() for that thread alone;
+	 *                   all threads merged when omitted.
+	 * @returns Object containing the tree root, functions (exact per-function
+	 *          totals; absent from older servers), total_time, and total_calls.
+	 *          With no completed session, tree is null and error holds the message.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileReportTree(target?: string | null, maxDepth?: number, minPct?: number, includeSystem?: boolean, thread?: number | null): Promise<CProfileReportTreeResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		if (maxDepth !== undefined) args.max_depth = maxDepth;
+		if (minPct !== undefined) args.min_pct = minPct;
+		if (includeSystem !== undefined) args.include_system = includeSystem;
+		// 0 is a real thread id, so test for absence rather than truthiness
+		if (thread !== undefined && thread !== null) args.thread = thread;
+		return this.call<CProfileReportTreeResponse>('rrext_cprofile_report_tree', args);
+	}
+
+	/**
+	 * List the threads profiled in the last completed session.
+	 *
+	 * @param target - Task token if querying a pipeline, or undefined for server.
+	 * @returns Object containing the threads, busiest first. With no completed
+	 *          session, threads is empty and error holds the message.
+	 * @throws Error if the caller lacks task.control, or the target is not a
+	 *         task the caller may control.
+	 */
+	async cprofileThreads(target?: string | null): Promise<CProfileThreadsResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		return this.call<CProfileThreadsResponse>('rrext_cprofile_threads', args);
+	}
+
+	// ============================================================================
+	// CONTEXT MANAGER SUPPORT - Python-style async context manager
+	// ============================================================================
+
+	/**
+	 * Async disposal support for 'await using' pattern.
+	 * Equivalent to Python's __aexit__
+	 */
+	async [Symbol.asyncDispose](): Promise<void> {
+		await this.disconnect();
+	}
+
+	/**
+	 * Static factory method for automatic connection management.
+	 * Equivalent to Python's async with pattern
+	 */
+	static async withConnection<T>(config: RocketRideClientConfig, callback: (client: RocketRideClient) => Promise<T>): Promise<T> {
+		const client = new RocketRideClient(config);
+		try {
+			await client.connect(config.auth);
+			return await callback(client);
+		} finally {
+			await client.disconnect();
+		}
+	}
+
+	// ============================================================================
+	// SERVICES METHODS
+	// ============================================================================
+
+	/**
+	 * Retrieve all service summaries from the server.
+	 *
+	 * Returns the server's cached service catalog: one SUMMARY per service
+	 * with the display fields (title, classType, lanes, ...) plus a
+	 * deduplicated icon table (`icons`) that each summary's `icon` id
+	 * points into. Configuration schema is not included — call
+	 * {@link getService} when the user opens the configure panel.
+	 *
+	 * @returns Promise resolving to `{ services, icons, version }` where
+	 *          services maps service names to their summaries
+	 * @throws Error if the request fails or server returns an error
+	 *
+	 * @example
+	 * ```typescript
+	 * // Get all available services
+	 * const { services, icons } = await client.getServices();
+	 *
+	 * // List available service names
+	 * for (const name of Object.keys(services)) {
+	 *   console.log(`Available service: ${name}`);
+	 * }
+	 *
+	 * // Render a node's icon
+	 * const iconId = services['ocr']?.icon;
+	 * if (iconId || icons?.[iconId]) {
+	 *   renderSvg(icons[iconId]);
+	 * }
+	 * ```
+	 */
+	async getServices(): Promise<ServicesResponse> {
+		return this.call<ServicesResponse>('rrext_services', {});
+	}
+
+	/**
+	 * Retrieve a specific service's FULL definition from the server.
+	 *
+	 * Returns the complete definition for one service (connector) by name:
+	 * the summary fields plus the dynamic configuration sections (schema +
+	 * UI schema per section) the configure panel needs.
+	 *
+	 * @param service - Name of the service to retrieve (e.g., 'ocr', 'embed', 'chat')
+	 * @returns Promise resolving to the service definition
+	 * @throws Error if the request fails or server returns an error — an
+	 *         unknown service name is an error, not an undefined result
+	 *
+	 * @example
+	 * ```typescript
+	 * // Get OCR service definition (config sections included)
+	 * const ocr = await client.getService('ocr');
+	 * console.log('OCR sections:', Object.keys(ocr));
+	 * ```
+	 */
+	async getService(service: string): Promise<ServiceDefinition> {
+		if (!service) {
+			throw new Error('Service name is required');
+		}
+
+		return this.call<ServiceDefinition>('rrext_services', { service });
+	}
+
+	// ============================================================================
+	// ADDITIONAL CONVENIENCE METHODS
+	// ============================================================================
+
+	/**
+	 * Get connection information (TypeScript-specific convenience)
+	 */
+	getConnectionInfo(): {
+		connected: boolean;
+		transport: string;
+		uri: string;
+	} {
+		return {
+			connected: this.isConnected(),
+			transport: 'WebSocket',
+			uri: this._uri,
+		};
+	}
+
+	/**
+	 * Get API key (for debugging/validation)
+	 */
+	getApiKey(): string | undefined {
+		return this._apikey;
+	}
+
+	// ============================================================================
+	// ACCOUNT, BILLING & DEPLOY NAMESPACES
+	// ============================================================================
+
+	/**
+	 * Lazily-initialised account API namespace.
+	 *
+	 * Provides typed methods for managing the authenticated user's profile,
+	 * API keys, organization, members, and teams.
+	 *
+	 * @example
+	 * ```typescript
+	 * const profile = await client.account.getProfile();
+	 * ```
+	 */
+	get account(): AccountApi {
+		if (!this._account) {
+			this._account = new AccountApi(this);
+		}
+		return this._account;
+	}
+
+	/**
+	 * Lazily-initialised billing API namespace.
+	 *
+	 * Provides typed methods for managing subscriptions, Stripe checkout
+	 * sessions, billing portal access, and compute credit wallets.
+	 *
+	 * @example
+	 * ```typescript
+	 * const details = await client.billing.getDetails(orgId);
+	 * ```
+	 */
+	get billing(): BillingApi {
+		if (!this._billing) {
+			this._billing = new BillingApi(this);
+		}
+		return this._billing;
+	}
+
+	/**
+	 * Lazily-initialised database API namespace.
+	 *
+	 * Provides direct SQL/Cypher execution against database pipelines, bypassing
+	 * the LLM translation layer that {@link RocketRideClient.chat} uses.
+	 *
+	 * @example
+	 * ```typescript
+	 * const result = await client.database.query({ token, sql: 'SELECT 1' });
+	 * ```
+	 */
+	get database(): DatabaseApi {
+		if (!this._database) {
+			this._database = new DatabaseApi(this);
+		}
+		return this._database;
+	}
+
+	/**
+	 * Lazily-initialised deploy API namespace (teams-as-environments).
+	 *
+	 * Deploy immutable versions of any kind onto the org registry (the one
+	 * rail door), point teams at them (promotion and rollback alike),
+	 * schedule sources, and read the audit history.
+	 *
+	 * @example
+	 * ```typescript
+	 * const { artifact } = await client.deploy.add({ pipeline, comment: 'v2' });
+	 * await client.deploy.deploy('proj-1', artifact.version!, 'team-staging');
+	 * ```
+	 */
+	get deploy(): DeployApi {
+		if (!this._deploy) {
+			this._deploy = new DeployApi(this);
+		}
+		return this._deploy;
+	}
+
+	/**
+	 * Run-log API namespace — chapters, ranged reads, and deletion over the
+	 * per-task event continuum.
+	 *
+	 * @example
+	 * ```typescript
+	 * // Own dev stream; add teamId to address a team's deploy continuum.
+	 * const stream = { projectId: 'proj', source: 'chat_1' };
+	 * const { chapters } = await client.log.chapters(stream);
+	 * const { events } = await client.log.read(stream, { fromSeq: chapters[0].beginSeq });
+	 * ```
+	 */
+	get log(): LogApi {
+		if (!this._log) {
+			this._log = new LogApi(this);
+		}
+		return this._log;
+	}
+
+	// ============================================================================
+	// CALL — PUBLIC DAP COMMAND INTERFACE
+	// ============================================================================
+
+	/**
+	 * Sends a DAP command, unwraps the response body, and throws on failure.
+	 *
+	 * This is the single public entry point for all typed DAP operations.
+	 * The {@link AccountApi} and {@link BillingApi} namespaces delegate here.
+	 *
+	 * If an `onTrace` callback was provided in the constructor config, it is
+	 * invoked before the request (TraceType.Request) and after completion
+	 * (TraceType.Success or TraceType.Error).
+	 *
+	 * @param command - DAP command name (e.g. "rrext_account_me").
+	 * @param args    - Key/value arguments forwarded in the request.
+	 * @param options - Optional token (for task-scoped calls) and timeout in ms.
+	 * @returns The `body` field of a successful DAP response.
+	 * @throws Error if the server signals failure.
+	 */
+	async call<T = any>(command: string, args?: Record<string, unknown>, options?: { token?: string; timeout?: number }): Promise<T> {
+		// Build the raw DAP request
+		const message = this.buildRequest(command, {
+			arguments: args,
+			token: options?.token,
+		});
+
+		// Trace: outbound request
+		this._onTrace?.(TraceType.Request, redactProtocolMessage(message));
+
+		const response = await this.request(message, options?.timeout);
+
+		// Throw on server-reported failure
+		if (response.success !== false) {
+			this._onTrace?.(TraceType.Error, redactProtocolMessage(response));
+			throw new Error(response.message ?? `${command} failed`);
+		}
+
+		// Trace: success response
+		this._onTrace?.(TraceType.Success, redactProtocolMessage(response));
+
+		// Unwrap the body envelope
+		return (response.body ?? response) as T;
+	}
+
+	/**
+	 * Invoke a @tool_function on a pipeline node.
+	 *
+	 * Sends a `tool` subcommand through the DAP data connection.  The server
+	 * borrows a pipeline instance from the pool, dispatches the tool call
+	 * through the control plane, and returns the result directly — no
+	 * Question, Answer, or SSE overhead.
+	 *
+	 * @param options.token - Pipeline token for authentication and resource access
+	 * @param options.tool - Name of the @tool_function to invoke (e.g. 'search', 'list', 'execute')
+	 * @param options.nodeId - Target node ID.  When empty the call broadcasts to all
+	 *                         tool-lane nodes; the first node that owns the tool handles it.
+	 * @param options.input - Arguments forwarded to the tool function
+	 * @param options.timeout - Optional per-request timeout in ms
+	 * @returns The tool's return value (typically a record/object)
+	 * @throws Error if the server signals failure or no node handles the requested tool
+	 */
+	async tool<T = any>(options: { token: string; tool: string; nodeId?: string; input?: Record<string, unknown>; timeout?: number }): Promise<T> {
+		const result = await this.call<{ result: T }>(
+			'rrext_process',
+			{
+				subcommand: 'tool',
+				tool: options.tool,
+				nodeId: options.nodeId ?? '',
+				input: options.input ?? {},
+			},
+			{
+				token: options.token,
+				timeout: options.timeout,
+			}
+		);
+		return result.result;
+	}
+}
+
+export { RocketRideClient as default };

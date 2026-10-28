@@ -1,0 +1,18 @@
+faster-whisper
+
+# Floor shared with packages/ai/src/ai/common/models/audio/requirements_whisper.txt:
+# 4.7.x with the CUDA 12.8 runtime is refused by the loader's GPU probe, and a stale
+# engine cache kept resolving it (#2498). The two files must agree.
+ctranslate2>=4.8,<5
+av
+tokenizers
+huggingface-hub
+tqdm
+# onnxruntime is an indirect dep (via faster-whisper), not imported here.
+# One shared version across every onnxruntime consumer, so the ~200 MB runtime installs once.
+# rtmlib/gliner declare it unpinned and faster-whisper wants <2,>=1.14 -- the exact number is
+# ours to choose, but all these files must agree. 1.20.1 was withdrawn from PyPI for the -gpu
+# build (the CPU build of it survives), which is why this moved; 1.20.2 is the mirror trap --
+# it exists only for -gpu, so pinning it would break macOS.
+onnxruntime-gpu==1.22.0; platform_system != 'Darwin'
+onnxruntime==1.22.0; platform_system == 'Darwin'

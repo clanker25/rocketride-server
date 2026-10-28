@@ -1,0 +1,241 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""
+GPU library import guard for model server mode.
+
+When ``--modelserver`` is set, all GPU inference runs on the model server
+via RPC (``ModelClient``).  Subprocess nodes should never load GPU
+libraries directly — doing so wastes VRAM, bypasses billing, and risks
+CUDA context conflicts.
+
+This module installs a ``sys.meta_path`` import hook (using the modern
+:pep:`451` ``find_spec`` / ``exec_module`` protocol) that blocks
+``torch``, ``tensorflow``, ``onnxruntime``, ``cupy``, and their
+submodules.  Any ``import torch`` in a node will raise ``ImportError``
+with a clear message directing the developer to use ``ai.common.models``.
+
+Usage (called once from ``ai.node.run()``)::
+
+    from ai.common.models.gpu_guard import install_gpu_guard
+
+    install_gpu_guard()
+
+The hook is installed when ``get_model_server_address()`` returns a
+non-None value, and on every task of a hosted engine (``--hosted``), model
+server or not: torch is never installed on RocketRide Cloud. Only a local
+engine without a model server loads GPU libraries normally.
+"""
+
+import sys
+from importlib.machinery import ModuleSpec
+from typing import Optional
+
+from hosting import is_hosted
+
+from .base import get_model_server_address
+
+
+# ============================================================================
+# BLOCKED MODULES
+# ============================================================================
+
+# Top-level GPU library module names to block in model server mode.
+# Submodules (e.g. torch.nn, tensorflow.keras) are caught automatically
+# because Python resolves the parent module first.
+_BLOCKED_MODULES = frozenset(
+    {
+        'torch',
+        'tensorflow',
+        'onnxruntime',
+        'cupy',
+    }
+)
+
+
+# ============================================================================
+# IMPORT HOOK
+# ============================================================================
+
+
+class _GPUImportBlocker:
+    """
+    ``sys.meta_path`` finder that blocks GPU library imports.
+
+    When Python's import machinery encounters a module name, it calls
+    ``find_spec`` on each entry in ``sys.meta_path``.  For a blocked
+    module this class returns a spec pointing at itself as the loader;
+    the loader's ``exec_module`` then raises ``ImportError`` before the
+    real module can be executed.
+
+    This uses the modern :pep:`451` finder/loader protocol
+    (``find_spec`` + ``create_module`` / ``exec_module``).  The legacy
+    ``find_module`` / ``load_module`` protocol it replaced was removed
+    from the import system in Python 3.12, where it would have silently
+    become a no-op.
+
+    Attributes:
+        _blocked: Frozenset of top-level module names to block.
+    """
+
+    def __init__(self, blocked: frozenset):
+        """
+        Initialize the blocker with the set of module names to block.
+
+        Args:
+            blocked: Frozenset of top-level module names (e.g. ``{'torch'}``).
+        """
+        self._blocked = blocked
+
+    def find_spec(self, fullname: str, path=None, target=None):
+        """
+        Return a blocking spec if the requested module should be blocked.
+
+        Called by Python's import machinery for every import.  Returns a
+        ``ModuleSpec`` whose loader is ``self`` when the module is
+        blocked, signalling that this finder will handle it (and its
+        ``exec_module`` will raise).  Returns ``None`` to let the next
+        finder in ``sys.meta_path`` handle it.
+
+        Args:
+            fullname: Fully qualified module name (e.g. ``'torch.nn'``).
+            path: Parent package ``__path__`` (unused).
+            target: Module being reloaded, if any (unused).
+
+        Returns:
+            A ``ModuleSpec`` if blocked, ``None`` otherwise.
+        """
+        # Extract the top-level package name (e.g. 'torch' from 'torch.nn.functional')
+        top_level = fullname.split('.')[0]
+
+        # Check if this top-level package is in our blocked set
+        if top_level in self._blocked:
+            return ModuleSpec(fullname, self)
+
+        # Not blocked — let the normal import machinery handle it
+        return None
+
+    def create_module(self, spec):
+        """
+        Use default module creation semantics.
+
+        Required so ``self`` is a valid loader.  Returning ``None`` tells
+        the import system to create the module the default way — though
+        control never gets that far in practice, because ``exec_module``
+        raises first.
+
+        Args:
+            spec: The ``ModuleSpec`` produced by ``find_spec`` (unused).
+
+        Returns:
+            ``None`` — use default module creation.
+        """
+        return None
+
+    def exec_module(self, module):
+        """
+        Raise ImportError for blocked modules.
+
+        Called by Python after ``find_spec`` returns a blocking spec.
+        Always raises ``ImportError`` with a descriptive message
+        explaining why the import is blocked and what to use instead.
+
+        Args:
+            module: The module object being executed; ``module.__name__``
+                is the fully qualified name from the blocking spec.
+
+        Raises:
+            ImportError: Always — this is the whole point of the guard.
+        """
+        raise ImportError(blocked_message(module.__name__))
+
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
+
+# Track whether the guard has been installed to prevent double-installation
+_installed = False
+
+# Why it was installed: 'modelserver' or 'hosted'. Picks the refusal message.
+_reason: Optional[str] = None
+
+
+def blocked_message(name: str) -> str:
+    """The ImportError text for a refused GPU library import or install."""
+    if _reason != 'hosted':
+        return (
+            f'"{name}" is not available on RocketRide Cloud: torch is never installed on a hosted engine. '
+            f'GPU inference runs on the model server via ai.common.models, and this engine has none configured.'
+        )
+    return (
+        f'Direct import of "{name}" is blocked in model server mode. '
+        f'GPU inference runs on the model server via ai.common.models. '
+        f'Do not import GPU libraries directly in nodes.'
+    )
+
+
+def is_installed() -> bool:
+    """True when the import hook is in place, so a GPU import would be refused.
+
+    Narrower than "model server mode": what this process does, not what the
+    flags say. ai/common/torch reads it to skip an install the hook refuses.
+    """
+    return _installed
+
+
+def install_gpu_guard():
+    """
+    Install the GPU import guard in model server mode or under a hosted engine.
+
+    Checks ``get_model_server_address()`` to determine if ``--modelserver``
+    was passed on the command line, and ``--hosted`` for a hosted engine's
+    task. If either is set, installs the import hook at the front of
+    ``sys.meta_path`` so it intercepts imports before the default finders.
+
+    Safe to call multiple times — subsequent calls are no-ops.
+
+    Called once from ``ai.node.run()`` during subprocess startup.
+    """
+    global _installed, _reason
+
+    # Only install once
+    if _installed:
+        return
+
+    # Model server mode, or a hosted engine, which never installs torch
+    # even when it has no model server configured
+    if get_model_server_address() is not None:
+        _reason = 'modelserver'
+    elif is_hosted():
+        _reason = 'hosted'
+    else:
+        # Local engine without a model server: GPU libraries are needed
+        return
+
+    # Install the blocker at the front of sys.meta_path so it runs
+    # before the default finders can locate and load the real module
+    blocker = _GPUImportBlocker(_BLOCKED_MODULES)
+    sys.meta_path.insert(0, blocker)
+
+    _installed = True

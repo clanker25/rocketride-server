@@ -1,0 +1,116 @@
+{
+	"title": "CrewAI Manager",
+	"protocol": "agent_crewai_manager://",
+	"classType": ["agent", "tool"],
+	"capabilities": ["invoke"],
+	"register": "filter",
+	"node": "python",
+	"path": "nodes.agent_crewai.crewai_manager",
+	"prefix": "agent",
+	"description": ["Multi-agent manager using CrewAI hierarchical process.", "Fans out to connected CrewAI Subagent nodes, assembles a Crew, and synthesizes their outputs.", "Can be invoked as a tool (`<nodeId>.run_agent`) for nested orchestration."],
+	"icon": "crewai.svg",
+	"documentation": "https://docs.rocketride.org/nodes/agent_crewai/crewai_manager",
+	"invoke": {
+		"llm": {
+			"description": "LLM used by the manager agent",
+			"min": 2
+		},
+		"crewai": {
+			"description": "Connected CrewAI Subagent nodes",
+			"min": 1
+		},
+		"tool": {
+			"description": "Cross-cutting tools available to the manager itself (via control-plane invoke)",
+			"min": 0
+		}
+	},
+	"lanes": {
+		"questions": ["answers"]
+	},
+	"preconfig": {
+		"default": "default",
+		"profiles": {
+			"default": {
+				"agent_description": "",
+				"instructions": [],
+				"advanced_mode": true,
+				"goal": "",
+				"backstory": "",
+				"planning": false,
+				"require_tool_call": false
+			}
+		}
+	},
+	"fields": {
+		"agent_description": {
+			"type": "string",
+			"title": "Agent description",
+			"default": "",
+			"optional": false,
+			"description": "What this manager + its sub-agent crew does. Used by parent agents that call this manager as a tool via `<nodeId>.run_agent` to decide when to invoke it.",
+			"ui": {
+				"ui:widget": "textarea"
+			}
+		},
+		"instructions": {
+			"type": "array",
+			"title": "Instructions",
+			"description": "Additional instructions to guide the manager's delegation strategy.",
+			"items": {
+				"type": "string",
+				"format": "textarea"
+			}
+		},
+		"require_tool_call": {
+			"type": "boolean",
+			"title": "Require tool call",
+			"default": false,
+			"description": "Require at least one tool call (including calls delegated to sub-agents) before answering. When on, a run that answers without any tool invocation fails with a guard error. Use for determinism-critical pipelines where an ungrounded or narrated answer must never be delivered. Off by default."
+		},
+		"advanced_mode": {
+			"type": "boolean",
+			"title": "Advanced Mode",
+			"description": "Expose CrewAI manager Agent configuration directly.",
+			"default": false,
+			"enum": [
+				[false, "Off"],
+				[true, "On"]
+			],
+			"conditional": [
+				{
+					"value": true,
+					"properties": ["goal", "backstory", "planning"]
+				}
+			]
+		},
+		"goal": {
+			"type": "string",
+			"format": "textarea",
+			"title": "Manager Goal",
+			"description": "What the manager is trying to achieve. Maps to CrewAI Agent(goal=...)."
+		},
+		"backstory": {
+			"type": "string",
+			"format": "textarea",
+			"title": "Manager Backstory",
+			"description": "Background context for the manager's persona. Maps to CrewAI Agent(backstory=...)."
+		},
+		"planning": {
+			"type": "boolean",
+			"title": "Crew Planning",
+			"description": "Run CrewAI's planner before the crew executes, adding a step-by-step plan to each task. Off by default: the planner requires the LLM to return JSON matching CrewAI's plan schema, and a model that answers in prose instead fails the whole run with <b>Failed to get the Planning output</b>. It also costs one extra LLM call per kickoff. Enable only with a model that reliably emits well-formed JSON.",
+			"default": false,
+			"enum": [
+				[false, "Off"],
+				[true, "On"]
+			]
+		}
+	},
+	"shape": [
+		{
+			"section": "Pipe",
+			"title": "CrewAI Manager",
+			"properties": ["agent_description", "instructions", "require_tool_call", "advanced_mode"]
+		}
+	]
+}

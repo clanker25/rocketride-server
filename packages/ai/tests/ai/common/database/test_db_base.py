@@ -1,0 +1,1095 @@
+"""
+Unit tests for ai.common.database.db_global_base.DatabaseGlobalBase and
+ai.common.database.db_instance_base.DatabaseInstanceBase.
+
+The base classes are ABCs with two abstract methods (``_connection_params``,
+``_build_connection_url``). Tests use a concrete ``_TestableGlobal``
+subclass that supplies SQLite-compatible stubs, then exercise:
+
+- Pure-logic helpers (no engine needed):
+  - ``_format_db_error`` — driver message only, never the statement/parameters
+  - ``_is_datetime_string`` — strptime two formats
+  - ``_inferColumnType`` — Python type → SQLAlchemy type
+  - ``_sanitize_value`` / ``_sanitize_row`` (db_instance_base) — JSON-safe coercion
+
+- Engine-backed helpers (use the ``base`` fixture, which carries an
+  in-memory SQLite engine):
+  - ``_tableExists``
+  - ``_createTableFromData``
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import (
+    DateTime,
+    Float,
+    Integer,
+    Text,
+    create_engine,
+    inspect,
+)
+
+from sqlalchemy.exc import DBAPIError
+
+from ai.common.database.db_global_base import DatabaseGlobalBase
+from ai.common.database.db_instance_base import DatabaseInstanceBase, MissingLlmError
+from ai.common.schema import Question
+from ai.common.utils import parse_bool
+
+
+# ---------------------------------------------------------------------------
+# Test subclass that satisfies the two abstract methods
+# ---------------------------------------------------------------------------
+
+
+class _TestableGlobal(DatabaseGlobalBase):
+    """Concrete DatabaseGlobalBase that knows how to build a SQLite URL."""
+
+    def _connection_params(self, config):
+        """Trivial mapping — every key passes through."""
+        return dict(config)
+
+    def _build_connection_url(self, params):
+        """Build a sqlite:///:memory: URL (params ignored)."""
+        return 'sqlite:///:memory:'
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def base():
+    """A DatabaseGlobalBase subclass instance with an in-memory engine attached."""
+    instance = _TestableGlobal.__new__(_TestableGlobal)
+    instance.engine = create_engine('sqlite:///:memory:')
+    instance.schema = {}
+    yield instance
+    instance.engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# _format_db_error
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_extracts_numeric_code_and_message(base):
+    """A DBAPIError-like exception with .orig.args=(code, msg) becomes 'Error <code>: <msg>'."""
+    orig = SimpleNamespace(args=(1146, "Table 'x' doesn't exist"))
+    exc = SimpleNamespace(orig=orig)
+    result = base._format_db_error(exc)
+    assert result == "Error 1146: Table 'x' doesn't exist"
+
+
+def test_format_db_error_uses_the_driver_message_when_args_not_int_first(base):
+    """A string-args driver (sqlite3, psycopg2) yields its own message.
+
+    It must NOT fall through to ``str(exc)``: on a real SQLAlchemy
+    StatementError that repr carries the statement and its bind parameters.
+    """
+    orig = SimpleNamespace(args=('no such column: foo',))
+    exc = RuntimeError('outer message')
+    exc.orig = orig
+    assert base._format_db_error(exc) == 'no such column: foo'
+
+
+def test_format_db_error_handles_exception_without_orig(base):
+    """An exception without .orig falls through to str(exc)."""
+    exc = RuntimeError('plain error')
+    assert base._format_db_error(exc) == 'plain error'
+
+
+def test_format_db_error_drops_the_sqlalchemy_statement_and_parameters(base):
+    """The ``[SQL: ...]`` / ``[parameters: ...]`` tail must never reach a caller.
+
+    This is the shape ``str(exc)`` produces for any SQLAlchemy
+    ``StatementError``; ``_executeRawQuery`` re-raises the formatted string
+    as a RuntimeError that the ``execute`` tool returns to whoever called it.
+    """
+    exc = RuntimeError(
+        '(sqlite3.OperationalError) no such column: foo\n'
+        '[SQL: SELECT foo FROM users WHERE email = ?]\n'
+        "[parameters: ('ada@example.com',)]\n"
+        '(Background on this error at: https://sqlalche.me/e/20/e3q8)'
+    )
+    result = base._format_db_error(exc)
+    assert result == '(sqlite3.OperationalError) no such column: foo'
+    assert 'SELECT foo' not in result
+    assert 'ada@example.com' not in result
+
+
+def test_format_db_error_sqlite3_shape_keeps_only_the_driver_message(base):
+    """sqlite3 puts the bare message in ``.orig.args[0]``."""
+    orig = SimpleNamespace(args=('no such table: widgets',))
+    exc = RuntimeError(
+        '(sqlite3.OperationalError) no such table: widgets\n'
+        '[SQL: INSERT INTO widgets (secret) VALUES (?)]\n'
+        "[parameters: ('hunter2',)]"
+    )
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'no such table: widgets'
+    assert 'hunter2' not in result
+    assert 'INSERT INTO' not in result
+
+
+def test_format_db_error_psycopg2_shape_uses_diag_and_drops_the_line_echo(base):
+    """psycopg2 interpolates binds client-side, so its ``LINE n:`` echo leaks them."""
+    orig = SimpleNamespace(
+        args=(
+            'column "foo" does not exist\nLINE 1: SELECT foo FROM users WHERE email = \'ada@example.com\'\n        ^\n',
+        ),
+        diag=SimpleNamespace(message_primary='column "foo" does not exist'),
+        pgcode='42703',
+    )
+    exc = RuntimeError('(psycopg2.errors.UndefinedColumn) ... [SQL: ...] [parameters: ...]')
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'Error 42703: column "foo" does not exist'
+    assert 'ada@example.com' not in result
+    assert 'LINE 1' not in result
+
+
+def test_format_db_error_psycopg2_without_diag_still_trims_the_line_echo(base):
+    """Falling back to ``args[0]`` must not carry the interpolated statement."""
+    orig = SimpleNamespace(
+        args=(
+            'duplicate key value violates unique constraint "users_email_key"\n'
+            'DETAIL:  Key (email)=(ada@example.com) already exists.\n',
+        )
+    )
+    exc = RuntimeError('outer')
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in result
+
+
+def test_format_db_error_pymysql_shape_is_unchanged(base):
+    """The numeric-code branch keeps its existing ``Error <code>: <msg>`` output."""
+    orig = SimpleNamespace(args=(1054, "Unknown column 'foo' in 'field list'"))
+    exc = RuntimeError('outer')
+    exc.orig = orig
+    assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
+
+
+# ---------------------------------------------------------------------------
+# _format_db_error against real DBAPIError wrappers (PostgreSQL / MySQL)
+#
+# The tests above hand _format_db_error a hand-built exception. These build the
+# real SQLAlchemy wrapper with DBAPIError.instance, so str(exc) genuinely ends
+# in the `[SQL: ...]` / `[parameters: ...]` tail, and pin the caller-facing
+# policy for the two drivers whose messages quote literals. Mock-based by
+# necessity: there is no live PostgreSQL or MySQL in this suite, so the driver
+# exception shapes are reproduced rather than provoked.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDriverError(Exception):
+    """Stand-in for a DBAPI driver exception (psycopg2 / pymysql shapes)."""
+
+
+def _wrapped(orig, statement, params):
+    """Wrap a driver exception the way SQLAlchemy wraps one it catches."""
+    return DBAPIError.instance(statement, params, orig, dbapi_base_err=Exception)
+
+
+def test_format_db_error_postgres_duplicate_key_keeps_only_the_primary_sentence(base):
+    """PostgreSQL restates the offending key in DETAIL; only the primary line survives.
+
+    The DETAIL block is where another row's values would appear
+    ("Key (email)=(ada@example.com) already exists."), so it is dropped along
+    with the statement and its binds.
+    """
+    orig = _FakeDriverError(
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        'DETAIL:  Key (email)=(ada@example.com) already exists.\n'
+    )
+    orig.diag = SimpleNamespace(message_primary='duplicate key value violates unique constraint "users_email_key"')
+    orig.pgcode = '23505'
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%(email)s)', {'email': 'ada@example.com'})
+
+    # The wrapper really does carry the tail, so the assertions below bite.
+    assert '[SQL:' in str(exc)
+    assert '[parameters:' in str(exc)
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 23505: duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in message
+    assert 'DETAIL' not in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+
+def test_format_db_error_postgres_without_diag_drops_the_line_echo(base):
+    """Without .diag the fallback is args[0], which psycopg2 fills with the statement.
+
+    psycopg2 interpolates bind values client-side, so its ``LINE n:`` echo
+    reproduces them verbatim -- the reason that marker is stripped too.
+    """
+    orig = _FakeDriverError(
+        'invalid input syntax for type integer: "abc"\n'
+        "LINE 1: SELECT * FROM users WHERE id = 'abc' AND email = 'ada@example.com'\n"
+        '                                       ^\n'
+    )
+    exc = _wrapped(orig, 'SELECT * FROM users WHERE id = %(id)s', {'id': 'abc'})
+
+    message = base._format_db_error(exc)
+    assert message == 'invalid input syntax for type integer: "abc"'
+    assert 'LINE 1' not in message
+    assert 'ada@example.com' not in message
+    assert '[SQL:' not in message
+
+
+def test_format_db_error_mysql_duplicate_entry_keeps_the_value_the_caller_sent(base):
+    """The accepted residual, stated as a test rather than left implicit.
+
+    MySQL's primary sentence quotes the value that collided -- a value this
+    caller submitted in the statement being reported, not another row's. The
+    statement and the full bind list still never leave the server log.
+    """
+    orig = _FakeDriverError(1062, "Duplicate entry 'ada@example.com' for key 'users.email'")
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%s)', ('ada@example.com',))
+
+    message = base._format_db_error(exc)
+    assert message == "Error 1062: Duplicate entry 'ada@example.com' for key 'users.email'"
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+
+
+class _StandInClickHouseServerException(Exception):
+    """Stand-in for clickhouse_driver.errors.ServerException.
+
+    Carries the ClickHouse error code on ``.code`` and the text on ``.message``
+    (and in ``args``), which is where the code lives for this driver — not in
+    ``args[0]`` as an int, the way pymysql reports it.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self):
+        """Render the driver's ``Code: N.`` form."""
+        return f'Code: {self.code}.\n{self.message}'
+
+
+class _StandInClickHouseDatabaseException(Exception):
+    """Stand-in for clickhouse_sqlalchemy.exceptions.DatabaseException.
+
+    A plain ``Exception`` subclass — not a DBAPI error — carrying the driver's
+    exception on ``.orig``. This is what ``clickhouse+native://`` raises, so it
+    is the shape the db_clickhouse node actually produces.
+    """
+
+    def __init__(self, orig):
+        super().__init__(orig)
+        self.orig = orig
+
+    def __str__(self):
+        """Prefix the wrapped driver error, as the real class does."""
+        return f'Orig exception: {self.orig}'
+
+
+def test_format_db_error_clickhouse_native_connector_shape_keeps_the_code(base):
+    """The shape `clickhouse+native://` really raises, formatted like pymysql's.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed here. Its
+    ``ServerException`` puts the code on ``.code`` rather than in ``args``, so
+    without a branch for it the caller saw the bare message and lost the code
+    that identifies the failure.
+    """
+    orig = _StandInClickHouseServerException(60, "Table default.widgets doesn't exist")
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    assert base._format_db_error(exc) == "Error 60: Table default.widgets doesn't exist"
+
+
+def test_format_db_error_keeps_the_words_in_scope_inside_an_application_message(base):
+    """The prose "in scope" is not a ClickHouse echo and must not truncate.
+
+    Constructed psycopg2 shape; no live PostgreSQL here. The phrase only marks
+    a statement echo when ClickHouse's AST formatter follows it with an
+    uppercase statement keyword, so the marker is written to require one — the
+    same lesson the DETAIL/HINT anchoring above came from.
+    """
+    orig = _FakeDriverError('temp table is not in scope for this trigger')
+    exc = _wrapped(orig, 'CALL audit()', {})
+
+    assert base._format_db_error(exc) == 'temp table is not in scope for this trigger'
+
+
+def test_format_db_error_mysql_keeps_a_quoted_identifier_intact(base):
+    """Why quoted tokens are not redacted wholesale.
+
+    MySQL quotes IDENTIFIERS with single quotes as well as values, so a rule
+    that blanked every quoted token would delete "which column" from the one
+    message a caller most needs it in.
+    """
+    orig = _FakeDriverError(1054, "Unknown column 'foo' in 'field list'")
+    exc = _wrapped(orig, 'SELECT foo FROM users', {})
+
+    assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
+
+
+# ---------------------------------------------------------------------------
+# _format_db_error — the block markers must not fire mid-sentence
+#
+# PostgreSQL writes DETAIL / HINT / CONTEXT / QUERY / STATEMENT as separate
+# LINES of the server message, so a bare substring search also matched those
+# five words inside an application's own error text and truncated it. No live
+# PostgreSQL or MySQL server is available in this suite, so each case below is
+# a constructed exception shape reproducing what the driver hands SQLAlchemy.
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_keeps_an_inline_hint_word_in_an_application_message(base):
+    """``RAISE EXCEPTION 'Order rejected. HINT: contact billing'`` survives whole.
+
+    Constructed psycopg2 shape; no live PostgreSQL here. A PL/pgSQL ``RAISE``
+    puts the author's whole sentence in ``diag.message_primary``, where the
+    server has already split its own context blocks off — so nothing in it is
+    a marker, and truncating at the word "HINT:" would delete the half of the
+    message that says what to do about the failure.
+    """
+    orig = _FakeDriverError('Order rejected. HINT: contact billing')
+    orig.diag = SimpleNamespace(message_primary='Order rejected. HINT: contact billing')
+    orig.pgcode = 'P0001'
+    exc = _wrapped(orig, 'SELECT place_order(%(id)s)', {'id': 7})
+
+    message = base._format_db_error(exc)
+    assert message == 'Error P0001: Order rejected. HINT: contact billing'
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+
+def test_format_db_error_keeps_an_inline_hint_word_without_diag(base):
+    """The same sentence via the ``args[0]`` fallback, where the blocks are real lines.
+
+    Constructed psycopg2 shape. Here the message carries a genuine trailing
+    ``DETAIL:`` block on its own line: that one is still cut, while the word
+    "HINT:" in the middle of the primary sentence is not.
+    """
+    orig = _FakeDriverError('Order rejected. HINT: contact billing\nDETAIL:  Key (id)=(7) is on hold.\n')
+    exc = _wrapped(orig, 'SELECT place_order(%(id)s)', {'id': 7})
+
+    message = base._format_db_error(exc)
+    assert message == 'Order rejected. HINT: contact billing'
+    assert 'Key (id)=(7)' not in message
+
+
+def test_format_db_error_keeps_a_mysql_message_containing_the_word_query(base):
+    """A pymysql 1644 from a ``SIGNAL SQLSTATE`` whose text contains "QUERY:".
+
+    Constructed pymysql shape; no live MySQL here. MySQL has no DETAIL/HINT/
+    CONTEXT block structure at all, so any of those words in a MySQL message
+    is part of the message.
+    """
+    orig = _FakeDriverError(1644, 'Invalid QUERY: missing tenant filter')
+    exc = _wrapped(orig, 'SELECT * FROM orders', {})
+
+    assert base._format_db_error(exc) == 'Error 1644: Invalid QUERY: missing tenant filter'
+
+
+def test_format_db_error_keeps_a_message_that_begins_with_a_block_word(base):
+    """A message whose FIRST token is "HINT:" must not degrade to the fallback.
+
+    Constructed shape. Anchoring the block markers to the start of the STRING
+    as well as to a line start would make the whole message detail, and the
+    caller would get the neutral 'Database error' constant instead of the one
+    sentence that tells them what went wrong.
+    """
+    orig = _FakeDriverError('HINT: use a smaller value for the batch size')
+    exc = _wrapped(orig, 'INSERT INTO t VALUES (%(n)s)', {'n': 10**9})
+
+    assert base._format_db_error(exc) == 'HINT: use a smaller value for the batch size'
+
+
+def test_format_db_error_still_cuts_a_real_postgres_detail_block(base):
+    """The anchoring must not reopen the leak: a real DETAIL line is still cut.
+
+    Constructed psycopg2 shape. This is the ``args[0]`` path (no ``.diag``),
+    where the server's DETAIL block — the one that restates another row's key
+    values — arrives as its own line and must still go.
+    """
+    orig = _FakeDriverError(
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        'DETAIL:  Key (email)=(ada@example.com) already exists.\n'
+    )
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%(email)s)', {'email': 'ada@example.com'})
+
+    message = base._format_db_error(exc)
+    assert message == 'duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in message
+
+
+# ---------------------------------------------------------------------------
+# _format_db_error — the generic (sqlstate, message) DBAPI shape
+#
+# No node in this repo uses a driver of this family today (there is no pyodbc
+# dialect under nodes/src/nodes), so these are constructed from the shape the
+# DBAPI specifies rather than provoked from a live server.
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_keeps_the_sqlstate_with_its_message(base):
+    """``('42S02', '…not found')`` must not degrade to just ``42S02``.
+
+    pyodbc and other ODBC-backed drivers put a five-character SQLSTATE where
+    pymysql puts an integer errno, so the numeric branch misses them and the
+    generic ``args[0]`` branch returned the code ALONE -- the one part of the
+    pair a caller cannot act on.
+    """
+    orig = _FakeDriverError('42S02', "[42S02] [ODBC Driver] Base table or view not found: 'widgets'")
+    exc = _wrapped(orig, 'SELECT * FROM widgets', {})
+
+    message = base._format_db_error(exc)
+    assert message == "Error 42S02: [42S02] [ODBC Driver] Base table or view not found: 'widgets'"
+    assert '[SQL:' not in message
+
+
+def test_format_db_error_sqlstate_branch_still_strips_the_tail(base):
+    """The new branch is not an escape hatch around the stripper."""
+    orig = _FakeDriverError('42000', 'Syntax error\nSTATEMENT:  SELECT secret FROM users')
+    exc = _wrapped(orig, 'SELECT secret FROM users', {})
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 42000: Syntax error'
+    assert 'secret' not in message
+
+
+def test_format_db_error_does_not_read_any_first_string_as_a_sqlstate(base):
+    """Only a real SQLSTATE shape (five chars, digits and capitals) qualifies.
+
+    A driver that happens to put two strings in ``args`` keeps the old
+    behaviour: the first one is the message, not a code to prefix.
+    """
+    orig = _FakeDriverError('syntax error at or near "FROM"', 'position 14')
+    exc = _wrapped(orig, 'SELECT FROM users', {})
+
+    assert base._format_db_error(exc) == 'syntax error at or near "FROM"'
+
+
+def test_format_db_error_keeps_a_single_argument_message_unprefixed(base):
+    """The sqlite3 shape -- one string in ``args`` -- is untouched by the branch."""
+    orig = _FakeDriverError('no such table: widgets')
+    exc = _wrapped(orig, 'SELECT * FROM widgets', {})
+
+    assert base._format_db_error(exc) == 'no such table: widgets'
+
+
+def test_format_db_error_returns_a_neutral_string_when_the_message_is_only_detail(base):
+    """A message that is nothing but detail must not fall back to the statement.
+
+    There is no primary sentence to keep here, and the first line is the
+    ``[SQL: ...]`` echo the stripper exists to remove -- so the fallback is a
+    neutral constant. Narrow (it needs a DBAPI error with an empty message),
+    but it is the one input where leaking the statement would be silent.
+    """
+    exc = RuntimeError('[SQL: SELECT 1]')
+    assert base._format_db_error(exc) == 'Database error'
+
+
+# MySQL 8.4.11 through pymysql, 2026-10-20: other databases' text is left alone.
+@pytest.mark.parametrize(
+    ('errno', 'text', 'kept'),
+    [
+        (1644, 'Upload failed at position 3 of batch', 'Upload failed at position 3 of batch'),
+        (
+            1644,
+            'DB::Exception: tenant QA_APP_T1 rejected. Upload failed at position 3 of batch',
+            'DB::Exception: tenant QA_APP_T1 rejected. Upload failed at position 3 of batch',
+        ),
+        (
+            1064,
+            'You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version '
+            "for the right syntax to use near 'BY id LIMIT 1, 'QA_CANARY_M2'' at line 1",
+            'You have an error in your SQL syntax',
+        ),
+    ],
+    ids=['signal', 'signal-looking-like-clickhouse', 'syntax-error'],
+)
+def test_format_db_error_leaves_other_databases_text_alone(base, errno, text, kept):
+    exc = _wrapped(_FakeDriverError(errno, text), 'SELECT 1', {})
+
+    result = base._format_db_error(exc)
+
+    assert result.startswith(f'Error {errno}: ')
+    assert kept in result
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        'Upload failed at position 3 of batch',
+        'Retry later. Stack trace: unavailable',
+        'Import aborted: While processing row 5 of upload.csv',
+        'Rejected: In query WITH clause not allowed',
+        "constraint failed while processing: 'batch 7'",
+    ],
+)
+def test_format_db_error_leaves_text_that_resembles_a_clickhouse_echo_alone(base, text):
+    assert base._format_db_error(_wrapped(_FakeDriverError(text), 'SELECT 1', {})) == text
+
+
+@pytest.mark.parametrize('filler', [' ', ' \n', '\n '])
+def test_format_db_error_time_does_not_grow_with_whitespace(base, filler):
+    # Small first: a cubic pattern takes ~0.5 s here and would take an hour at 20,000.
+    for size, limit in ((1000, 0.1), (20000, 1)):
+        exc = _wrapped(_FakeDriverError(f'bad{filler * size}value [SQL: SELECT 1]'), 'SELECT 1', {})
+
+        start = time.perf_counter()
+        base._format_db_error(exc)
+
+        assert time.perf_counter() - start < limit
+
+
+# ---------------------------------------------------------------------------
+# _is_datetime_string
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'value, expected',
+    [
+        ('2026-01-01', True),
+        ('2026-01-01 12:30:45', True),
+        ('not a date', False),
+        ('2026/01/01', False),  # wrong separator
+        ('', False),
+        ('2026-01-01T12:30:45', False),  # ISO 'T' separator not in the two supported formats
+    ],
+)
+def test_is_datetime_string(base, value, expected):
+    """The function recognises the two supported date formats and rejects the rest."""
+    assert base._is_datetime_string(value) is expected
+
+
+def test_is_datetime_string_rejects_non_string_input(base):
+    """Non-string inputs are rejected outright (False, not exception)."""
+    assert base._is_datetime_string(42) is False
+    assert base._is_datetime_string(None) is False
+
+
+# ---------------------------------------------------------------------------
+# _inferColumnType
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'value, expected_type',
+    [
+        (None, Text),
+        (42, Integer),
+        (3.14, Float),
+        (True, Integer),  # bool → Integer (SQL stores 0/1)
+        (False, Integer),
+        ([1, 2, 3], Text),  # complex types → Text (JSON-serialised)
+        ({'a': 1}, Text),
+        ('plain text', Text),
+        ('2026-01-01', DateTime),  # date string → DateTime
+        ('2026-01-01 12:30:45', DateTime),
+        (b'bytes', Text),
+    ],
+)
+def test_infer_column_type(base, value, expected_type):
+    """Every Python value maps to the documented SQLAlchemy type."""
+    assert base._inferColumnType(value) is expected_type
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_value / _sanitize_row (db_instance_base)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'value, expected',
+    [
+        (None, None),
+        ('hello', 'hello'),
+        (42, 42),
+        (3.14, 3.14),
+        (True, True),
+        (b'bytes', 'bytes'),
+    ],
+)
+def test_sanitize_value_passthrough_for_primitives(value, expected):
+    """JSON-safe primitives pass through unchanged."""
+    assert DatabaseInstanceBase._sanitize_value(value) == expected
+
+
+def test_sanitize_value_uses_isoformat_for_datetime():
+    """A datetime is rendered via .isoformat()."""
+    dt = datetime(2026, 1, 1, 12, 30, 45)
+    result = DatabaseInstanceBase._sanitize_value(dt)
+    assert result == '2026-01-01T12:30:45'
+
+
+def test_sanitize_value_decodes_utf8_bytes():
+    """UTF-8 bytes are decoded; invalid bytes use 'replace' error handling."""
+    assert DatabaseInstanceBase._sanitize_value(b'hello') == 'hello'
+    # Invalid UTF-8 should be safely substituted.
+    result = DatabaseInstanceBase._sanitize_value(b'\xff\xfe-bad')
+    assert isinstance(result, str)
+
+
+def test_sanitize_value_falls_back_to_str_for_unknown_types():
+    """An object with no special handler is rendered via str()."""
+
+    class Foo:
+        """A type that exercises the str() fallback path."""
+
+        def __str__(self):
+            """Return a known string so the test can assert on it."""
+            return 'Foo()'
+
+    assert DatabaseInstanceBase._sanitize_value(Foo()) == 'Foo()'
+
+
+def test_sanitize_row_dict_input():
+    """A row given as a dict has every value sanitized."""
+    row = {'name': 'alice', 'age': 30, 'ts': datetime(2026, 1, 1)}
+    result = DatabaseInstanceBase._sanitize_row(row)
+    assert result == {'name': 'alice', 'age': 30, 'ts': '2026-01-01T00:00:00'}
+
+
+def test_sanitize_row_list_input():
+    """A row given as a list/tuple yields a list of sanitized values."""
+    row = ['alice', 30, datetime(2026, 1, 1)]
+    result = DatabaseInstanceBase._sanitize_row(row)
+    assert result == ['alice', 30, '2026-01-01T00:00:00']
+
+
+def test_sanitize_row_scalar_input():
+    """A scalar value is sanitized directly (not wrapped in a list)."""
+    assert DatabaseInstanceBase._sanitize_row(42) == 42
+
+
+# ---------------------------------------------------------------------------
+# _buildSQLQuery (EXPLAIN exhaustion + isValid parsing) — regression for #1601
+# ---------------------------------------------------------------------------
+
+
+class _TestableInstance(DatabaseInstanceBase):
+    """Concrete DatabaseInstanceBase that satisfies the two abstract methods."""
+
+    def _db_display_name(self):
+        """Human-readable name used in tool descriptions."""
+        return 'TestDB'
+
+    def _db_dialect(self):
+        """Machine-readable dialect identifier."""
+        return 'testdb'
+
+
+class _FakeGlobal:
+    """Stub IGlobal: every EXPLAIN attempt rejects the query."""
+
+    def __init__(self, max_attempts=2, explain_error='syntax error near FROM'):
+        self.max_validation_attempts = max_attempts
+        self._explain_error = explain_error
+
+    def _validateQuery(self, sql):
+        return False, self._explain_error
+
+
+def _sql_instance(fake_global):
+    inst = _TestableInstance.__new__(_TestableInstance)
+    inst.IGlobal = fake_global
+    return inst
+
+
+def test_build_sql_query_marks_invalid_after_explain_exhaustion():
+    """Every EXPLAIN attempt failing must flip isValid to False, not leave the LLM's 'true'.
+
+    Before the fix, exhaustion returned the last LLM response unchanged, so
+    get_sql/get_data/writeQuestions executed a statement the database had
+    already refused on every attempt.
+    """
+    inst = _sql_instance(_FakeGlobal())
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': 'true',
+        'query': 'SELECT * FROM users',
+    }
+
+    result = inst._buildSQLQuery('all users')
+
+    assert parse_bool(result.get('isValid')) is False
+    assert result.get('error')  # the EXPLAIN error is carried for the caller
+
+
+def test_build_sql_query_accepts_real_json_bool_isvalid():
+    """A real JSON bool from the LLM must not crash isValid parsing.
+
+    Before the fix, `result.get('isValid', '').lower()` raised AttributeError
+    the moment the LLM returned a real bool instead of the string 'true'.
+    """
+    fake_global = _FakeGlobal()
+    fake_global._validateQuery = lambda sql: (True, None)
+    inst = _sql_instance(fake_global)
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': True,  # real bool, not the string 'true'
+        'query': 'SELECT 1',
+    }
+
+    result = inst._buildSQLQuery('anything')  # must not raise AttributeError
+
+    assert parse_bool(result.get('isValid')) is True
+
+
+def test_get_sql_surfaces_explain_error_not_rejected_sql():
+    """get_sql() must return the EXPLAIN error, not the rejected SQL as prose.
+
+    Before this fix, the invalid branch always returned {'answer': sql_query,
+    'valid': False}, so a caller could not tell an EXPLAIN rejection (rejected
+    SQL text) apart from a genuinely off-topic question (LLM prose answer).
+    """
+    fake_global = _FakeGlobal(explain_error='column "userz" does not exist')
+    inst = _sql_instance(fake_global)
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': 'true',
+        'query': 'SELECT * FROM userz',
+    }
+
+    result = inst.get_sql({'question': 'all users'})
+
+    assert result == {'error': 'column "userz" does not exist', 'valid': False}
+
+
+class _FakeInstance:
+    """Minimal stand-in for IFilterInstance: records what each lane receives."""
+
+    def __init__(self, lanes):
+        self._lanes = lanes
+        self.text_written = None
+        self.table_written = None
+        self.answer_written = None
+
+    def getListeners(self):
+        return list(self._lanes)
+
+    def writeText(self, text):
+        self.text_written = text
+
+    def writeTable(self, markdown):
+        self.table_written = markdown
+
+    def writeAnswers(self, answer):
+        self.answer_written = answer
+
+
+@pytest.mark.parametrize('is_valid_value', [True, 'true'])
+def test_write_questions_surfaces_explain_error_not_rejected_sql(is_valid_value):
+    """writeQuestions() must report the EXPLAIN error on text/answer lanes, not the rejected SQL.
+
+    Mirrors the get_sql() fix: writeQuestions() has its own separate fallback
+    path (db_instance_base.py) that must not regress to emitting the rejected
+    SQL as if it were the LLM's prose answer. Parametrized over a real JSON
+    boolean and the string 'true' so a regression in isValid parsing inside
+    this specific caller would also be caught.
+    """
+    fake_global = _FakeGlobal(explain_error='syntax error near FROM')
+    inst = _sql_instance(fake_global)
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': is_valid_value,
+        'query': 'SELECT * FROM',
+    }
+    fake_instance = _FakeInstance(lanes=['text', 'answers'])
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('all users')
+
+    inst.writeQuestions(question)
+
+    assert fake_instance.text_written == 'syntax error near FROM'
+    assert fake_instance.answer_written.getJson() == {'error': 'syntax error near FROM'}
+
+
+@pytest.mark.parametrize('is_valid_value', [True, 'true'])
+def test_write_questions_executes_query_when_valid(is_valid_value):
+    """writeQuestions() must execute and emit results when EXPLAIN accepts the
+    query on the first attempt, for both a real JSON boolean and the string
+    'true'.
+
+    The EXPLAIN-exhaustion test above always ends with isValid forced to
+    False by _buildSQLQuery, so it can't distinguish True from 'true' -- both
+    parametrized cases hit the same overwritten value. This test exercises
+    the success path instead, where EXPLAIN accepts the query immediately and
+    the LLM's isValid value passes through _buildSQLQuery unchanged.
+    """
+    fake_global = _FakeGlobal()
+    fake_global._validateQuery = lambda sql: (True, None)  # EXPLAIN accepts it first try
+    inst = _sql_instance(fake_global)
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': is_valid_value,
+        'query': 'SELECT 1',
+    }
+    inst._executeSQLQuery = lambda sql: [{'answer': 42}]
+    fake_instance = _FakeInstance(lanes=['text'])
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('the answer')
+
+    inst.writeQuestions(question)
+
+    assert fake_instance.text_written == str([{'answer': 42}])
+
+
+def test_write_questions_emits_error_for_unsafe_sql_not_as_data():
+    """writeQuestions() must emit unsafe SQL as an error, not as formatted table/answer data.
+
+    Regression for the partial mirror caught in review: is_valid_query alone
+    doesn't mean the query ran. When the LLM claims isValid=true but the SQL
+    fails the safety gate, the old code still let the rejected SQL fall
+    through to _formatResultAsMarkdown on the table/answers lanes -- keyed off
+    is_valid_query rather than whether anything was actually executed -- so
+    the rejected SQL went out dressed up as a one-cell table of "data". Also
+    asserts the table lane stayed silent -- the test name promises that, but
+    _FakeInstance.writeTable() previously discarded its argument instead of
+    recording it, so a regression here would have passed unnoticed.
+    """
+    fake_global = _FakeGlobal()
+    inst = _sql_instance(fake_global)
+    inst._buildSQLQueryOnce = lambda question_text, *, limit, previous_sql, error: {
+        'isValid': 'true',
+        'query': 'DELETE FROM users',
+    }
+    fake_instance = _FakeInstance(lanes=['text', 'table', 'answers'])
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('delete all users')
+
+    inst.writeQuestions(question)
+
+    assert fake_instance.text_written == 'Generated query contains unsafe SQL'
+    assert fake_instance.answer_written.getJson() == {'error': 'Generated query contains unsafe SQL'}
+    assert fake_instance.table_written is None
+
+
+# ---------------------------------------------------------------------------
+# _tableExists (engine-backed)
+# ---------------------------------------------------------------------------
+
+
+def test_table_exists_returns_true_when_table_present(base):
+    """After creating a table via raw SQL, _tableExists reports True."""
+    from sqlalchemy import text
+
+    with base.engine.connect() as conn:
+        conn.execute(text('CREATE TABLE my_table (id INTEGER PRIMARY KEY)'))
+        conn.commit()
+    assert base._tableExists('my_table') is True
+
+
+def test_table_exists_returns_false_for_missing_table(base):
+    """An unknown table name yields False."""
+    assert base._tableExists('does_not_exist') is False
+
+
+def test_table_exists_returns_false_when_no_engine():
+    """_tableExists is defensive — returns False when no engine is attached."""
+    instance = _TestableGlobal.__new__(_TestableGlobal)
+    instance.engine = None
+    assert instance._tableExists('any_table') is False
+
+
+# ---------------------------------------------------------------------------
+# _createTableFromData (engine-backed)
+# ---------------------------------------------------------------------------
+
+
+def test_create_table_from_data_infers_types_and_creates_table(base):
+    """Inferred column types match the documented mapping; table is created with an id PK."""
+    sample = [
+        {'name': 'alice', 'age': 30, 'score': 95.5, 'tags': ['a', 'b']},
+        {'name': 'bob', 'age': 25, 'score': 88.0, 'tags': []},
+    ]
+    ok = base._createTableFromData('users', sample)
+    assert ok is True
+    assert base._tableExists('users') is True
+
+    # Inspect the created columns
+    inspector = inspect(base.engine)
+    cols = {c['name']: c for c in inspector.get_columns('users')}
+    assert 'id' in cols  # PK was auto-prepended
+    assert 'name' in cols
+    assert 'age' in cols
+    assert 'score' in cols
+    assert 'tags' in cols  # JSON-serialised → Text
+
+
+def test_create_table_from_data_handles_widening_int_to_float(base):
+    """A column with both ints and floats widens to Float."""
+    sample = [
+        {'value': 10},
+        {'value': 3.14},
+    ]
+    base._createTableFromData('numbers', sample)
+    # The schema map was populated.
+    assert 'value' in base.schema
+
+
+def test_create_table_from_data_empty_input_returns_false(base):
+    """An empty sample list yields False (no table created)."""
+    assert base._createTableFromData('empty', []) is False
+
+
+def test_create_table_from_data_non_dict_first_row_returns_false(base):
+    """If the first row is not a dict, the function returns False."""
+    assert base._createTableFromData('badshape', [['a', 'b']]) is False
+
+
+def test_create_table_from_data_no_engine_returns_false():
+    """Without an engine, the function returns False before touching SQL."""
+    instance = _TestableGlobal.__new__(_TestableGlobal)
+    instance.engine = None
+    assert instance._createTableFromData('x', [{'a': 1}]) is False
+
+
+def test_create_table_from_data_populates_schema_cache(base):
+    """After creating a table, base.schema is filled with column name → (type_str, '') tuples."""
+    sample = [{'col_a': 1, 'col_b': 'text'}]
+    base._createTableFromData('cache_check', sample)
+
+    # Keys: data columns are present, the auto-PK 'id' is not.
+    assert 'col_a' in base.schema
+    assert 'col_b' in base.schema
+    assert 'id' not in base.schema
+
+    # Values: each entry is (type_str, comment). Verify both the shape and
+    # that the inferred SQL type matches the Python type of the sample.
+    # Note: the source picks String(255) (rendered VARCHAR(255) on SQLite)
+    # for short strings, and only falls back to TEXT for values > 255 chars.
+    type_a, comment_a = base.schema['col_a']
+    type_b, comment_b = base.schema['col_b']
+    assert 'INTEGER' in type_a.upper()  # int → Integer → 'INTEGER'
+    assert 'VARCHAR' in type_b.upper() or 'TEXT' in type_b.upper()  # short str → VARCHAR(255)
+    assert comment_a == ''
+    assert comment_b == ''
+
+
+# ---------------------------------------------------------------------------
+# Base-class subclass-able sanity
+# ---------------------------------------------------------------------------
+
+
+def test_testable_global_satisfies_abc_contract():
+    """The two abstract methods are implemented in the test subclass."""
+    # If the ABC wasn't satisfied, instantiating would raise TypeError.
+    _TestableGlobal.__new__(_TestableGlobal)
+
+
+# ---------------------------------------------------------------------------
+# Optional llm connection
+# ---------------------------------------------------------------------------
+
+
+class _InstanceWithLlms:
+    """Stand-in for IFilterInstance that reports which llm nodes are connected."""
+
+    def __init__(self, llm_node_ids):
+        self._llm_node_ids = llm_node_ids
+        self.asked = False
+
+    def getControllerNodeIds(self, class_type):
+        return list(self._llm_node_ids) if class_type == 'llm' else []
+
+    def invoke(self, *args, **kwargs):
+        self.asked = True
+        raise RuntimeError('stop after the LLM call')
+
+
+def test_question_without_llm_names_the_cause_and_the_raw_sql_path():
+    """With no llm connected, a question fails with a clear message, not an engine error.
+
+    The connection is optional because execute (raw SQL) never uses it, so the
+    message also tells the caller what still works.
+    """
+    inst = _sql_instance(None)
+    inst.instance = _InstanceWithLlms([])
+
+    with pytest.raises(ValueError, match='No LLM is connected to this TestDB node') as excinfo:
+        inst._buildSQLQueryOnce('all users')
+
+    assert 'execute' in str(excinfo.value)
+    assert inst.instance.asked is False
+
+
+def test_question_with_llm_reaches_the_llm():
+    inst = _sql_instance(SimpleNamespace(db_schema={}, db_description='', dialect='testdb', max_validation_attempts=1))
+    inst.instance = _InstanceWithLlms(['llm_openai_1'])
+
+    with pytest.raises(RuntimeError, match='stop after the LLM call'):
+        inst._buildSQLQueryOnce('all users')
+
+    assert inst.instance.asked is True
+
+
+class _LaneInstanceWithoutLlm(_FakeInstance):
+    """Lane-recording instance with no llm controller connected."""
+
+    def getControllerNodeIds(self, class_type):
+        return []
+
+
+def test_write_questions_without_llm_reports_the_cause_on_the_lanes():
+    """A question on the lane with no llm connected tells the lane readers why.
+
+    The clear message must reach text/answers, not only the log, or a chat
+    pipeline gets no reply at all.
+    """
+    inst = _sql_instance(_FakeGlobal(max_attempts=1))
+    fake_instance = _LaneInstanceWithoutLlm(lanes=['text', 'answers'])
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('all users')
+
+    inst.writeQuestions(question)
+
+    assert fake_instance.text_written.startswith('No LLM is connected to this TestDB node')
+    assert fake_instance.answer_written.getJson()['error'] == fake_instance.text_written
+
+
+@pytest.mark.parametrize('lanes', [['table'], []])
+def test_write_questions_without_llm_raises_when_no_lane_carries_the_error(lanes):
+    """With no text/answers listener, the missing LLM reaches the caller as an error.
+
+    A table-only pipeline has no lane for an error message, so the failure goes
+    through the engine's error path instead of vanishing into the log.
+    """
+    inst = _sql_instance(_FakeGlobal(max_attempts=1))
+    fake_instance = _LaneInstanceWithoutLlm(lanes=lanes)
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('all users')
+
+    with pytest.raises(MissingLlmError, match='No LLM is connected to this TestDB node'):
+        inst.writeQuestions(question)
+    assert fake_instance.table_written is None
+
+
+def test_write_questions_without_llm_does_not_raise_when_text_is_wired():
+    inst = _sql_instance(_FakeGlobal(max_attempts=1))
+    fake_instance = _LaneInstanceWithoutLlm(lanes=['text', 'table'])
+    inst.instance = fake_instance
+
+    question = Question()
+    question.addQuestion('all users')
+
+    inst.writeQuestions(question)
+
+    assert fake_instance.text_written.startswith('No LLM is connected')
+    assert fake_instance.table_written is None

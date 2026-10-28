@@ -1,0 +1,216 @@
+# db_clickhouse
+
+A RocketRide database node for asking natural-language questions of ClickHouse
+with an LLM, either on pipeline lanes or through agent tools. Choose it when
+your data is in ClickHouse and you need its native-protocol connection.
+
+## About ClickHouse
+
+ClickHouse is the database product this node connects to. This implementation
+uses the `clickhouse-sqlalchemy` dialect with the `clickhouse-driver` backend
+over ClickHouse's native TCP protocol.
+
+## What it does
+
+On the `questions` lane, the node gives its reflected database schema and
+optional database description to the connected LLM, asks it for a `SELECT`,
+validates that query with `EXPLAIN`, and sends the result to the requested
+`table`, `text`, or `answers` lane. It is also an agent tool node, so an agent
+can retrieve data, inspect the cached schema snapshot (refreshable with
+`refresh_schema`), generate SQL, or—when explicitly enabled—run raw SQL.
+Unlike a write-oriented relational database node, its declared lanes contain
+no data-ingestion input.
+
+## Connections
+
+| Connection | Required | Description |
+| --- | --- | --- |
+| `llm` | no | LLM used to craft SQL queries from questions; not needed for execute (raw SQL) |
+
+## Lanes
+
+| Lane in | Lane out | Description |
+| --- | --- | --- |
+| `questions` | `table` | Send query results as a Markdown table. |
+| `questions` | `text` | Send the result as text. |
+| `questions` | `answers` | Send the result as an answer. |
+
+## As a tool
+
+The registered tool names are bare method names; this node declares no
+configurable server-name prefix.
+
+| Function | Description |
+| --- | --- |
+| `get_data` | Generate a safe `SELECT` from a question and execute it. |
+| `get_schema` | Return the schema snapshot the node currently holds. |
+| `refresh_schema` | Re-read the schema, replace the cache, and return it. |
+| `get_sql` | Generate a safe `SELECT` without executing it. |
+| `execute` | Run raw SQL, bypassing LLM translation and the safety check. |
+| `begin` | Reserve a connection and return its session ID; no transaction is opened. |
+| `commit` | Close a session; its statements were already executed. |
+| `rollback` | Close a session; this undoes nothing. |
+| `dialect` | Return `{ "dialect": "clickhouse" }`. |
+
+`get_data` and `get_sql` require a non-empty `question`; `get_data` accepts an
+optional `limit`, defaulting to 250 and clamped to 1–25,000. `get_schema`
+accepts an optional `table`; an unknown table returns an `error` field, while
+omitting it returns all reflected tables. `get_schema` serves the snapshot the
+node currently holds — the reflection taken at start-up, replaced by each
+`refresh_schema` call — so DDL run since the last reflection is invisible to
+it until the next one. `refresh_schema` takes no arguments, re-reflects the
+database, replaces that database-wide cache, and returns the `get_schema`
+shape plus a `refreshed_at` UTC timestamp. If the database refuses the
+reflection — a revoked grant, a lock timeout, a table dropped mid-walk — the
+call fails with `Schema refresh failed:` followed by the database's own
+message (for a table that disappeared mid-walk, the name of that table) and
+leaves the cached schema exactly as it was. `get_data` returns
+`{valid, rows, sql, row_limit}` on success; a non-database question returns
+`{valid: false, answer}`, and a query execution failure returns
+`{valid: false, error, sql, rows: []}`.
+
+`execute` requires non-empty `sql` and optionally accepts a `session_id`
+from `begin` plus positional values for `$1`, `$2`, and so on. It returns
+`{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
+followed by `Error <code>:` and ClickHouse's own primary message,
+identically with and without a `session_id`. The `clickhouse+native://`
+driver does not raise a DBAPI error, so the node unwraps it to the driver
+error it carries; the code and message come from the server's
+own `ServerException`. The driver interpolates bound values into the
+statement, so where ClickHouse repeats the statement or its input it repeats
+the caller's values. That is removed: SQLAlchemy's `[SQL: ...]` /
+`[parameters: ...]` echo, the stack trace, the `failed at position` quotation,
+the rest of the input after `here:`, `before:` or `at:` (the remaining
+`INSERT ... VALUES` rows), the expression after `Cannot deduce template of
+expression:` and `(result column not found):`, the `Row N:` dump of a CSV or
+TSV parse error, the text after `in scope`, `In query`, `while processing
+query:`, `while processing:` and `While processing` (with the `required
+columns` list), and a runtime context, `: while executing 'FUNCTION ...'`.
+These are the shapes the node recognises, not a promise that ClickHouse has no
+other. ClickHouse's own sentence is kept, so it can name a value or an
+identifier the statement carried or touched. A `throwIf` message (code 395) is
+the caller's own text: it comes back whole with its runtime context dropped,
+while one reported without that context gets the markers like any other
+message. If the cut leaves only the exception class, the result says the
+server's message only repeated the statement. That is deliberate:
+reaching this tool at all requires **Allow direct query execution**, and a
+caller who has it can read the same data with a `SELECT`. The full text is
+written to the server log. `begin` takes no arguments and returns `{session_id}`;
+`commit` and `rollback` require that ID and return `{ok: true}`. These four
+write-capable operations fail when **Allow direct query execution** is off;
+unknown or expired session IDs also fail. Invalid tool input raises an error.
+
+A session opens no ClickHouse transaction. `begin` reserves a connection for
+the `session_id`, but every statement sent on it is executed when it is sent,
+and other connections see its effect without waiting for a `commit`;
+`commit` and `rollback` only close the session, so `rollback` discards
+nothing. Savepoints do not exist either: `SAVEPOINT` is a syntax error, and
+`rollback to savepoint <name>` fails with `unknown savepoint`. To undo a
+write, run a statement that reverses it. A failed statement leaves the
+session open. Its error text is byte-identical with and without a
+`session_id` and carries no advice, so this policy is stated in the `execute`
+tool description instead. The idle reaper closes a session that is abandoned.
+
+## Configuration
+
+Start with the default connection values, then set the database endpoint and
+target table. Most question-answering setups need the host, credentials,
+database, and a useful database description; the generated schema below is the
+complete field reference.
+
+### Database description
+
+This text is added to every LLM SQL-generation request alongside the reflected
+schema. Describe the data's purpose, meanings, and conventions when names
+alone are ambiguous—for example, explain whether `amount` is a gross or net
+value. Change it when queries choose the wrong interpretation; it does not
+replace the actual table and column information collected at startup.
+
+### ClickHouse host and TLS
+
+With TLS off, a host without an explicit port uses ClickHouse's native default
+of 9000. Turn TLS on for a TLS endpoint: the node adds `secure=true` to the
+native DSN and supplies port 9440 if no port is present. Keep TLS off for a
+plaintext local server. User, password, and database are URL-encoded when the
+connection string is built, so reserved characters in those values are safe.
+
+### Target database and table
+
+The database selects the connection's database; the table identifies the
+target table whose schema is also cached at startup. Set both to the exact
+objects the LLM should use. The node reflects the full database for LLM context,
+but it warns if this particular target table does not exist. Since the declared
+lanes do not accept data for insertion, create and populate ClickHouse tables
+outside this node.
+
+### Max validation attempts
+
+The default of five gives the LLM several chances to repair a query rejected by
+`EXPLAIN`. Lower it when fast failure matters more than recovery; raise it for
+complex schemas that need another correction cycle. The runtime clamps this
+setting to 1–20. After the final rejected attempt it returns the last generated
+result, so `EXPLAIN` retries improve generated SQL but do not guarantee that a
+subsequent execution will succeed.
+
+### Allow direct query execution
+
+Leave this off by default. When on, the `execute`, `begin`, `commit`, and
+`rollback` tools can bypass LLM translation and the generated-query safety
+check, and each raw statement is applied when it runs: ClickHouse holds no
+transaction for it to commit or roll back. Enable it only for trusted callers
+that need writes or dialect-specific SQL; use `get_data` for ordinary
+read-only retrieval.
+
+## Limitations
+
+This node declares the `noremote` capability, so it cannot run in a remote
+execution environment. It requires network reachability to the ClickHouse
+server from the environment where the pipeline runs.
+
+## Notes
+
+### Generated-query safety
+
+For LLM-generated SQL, the node only accepts `SELECT`, optionally preceded by
+`EXPLAIN`. It strips comments, checks every semicolon-separated statement, and
+rejects CTEs plus `SELECT ... INTO OUTFILE` or `INTO DUMPFILE`. It validates
+each safe candidate with `EXPLAIN` and feeds database errors to the LLM for the
+next attempt.
+
+### ClickHouse schema details
+
+The ClickHouse driver reports no foreign keys, so reflected schema output has
+columns and best-effort primary keys but no foreign-key relationships.
+
+## Upstream docs
+
+- [ClickHouse documentation](https://clickhouse.com/docs/)
+
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `clickhouse.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
+| `clickhouse.database` | `string` | **Database name**<br/>Name of database | `"default"` |
+| `clickhouse.db_description` | `string` | **Database description**<br/>What is this database used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
+| `clickhouse.host` | `string` | **ClickHouse host**<br/>Host name or IP address of the ClickHouse server, optionally including a native-protocol port (e.g. localhost:9440). Defaults to port 9000 when none is given. | `"localhost"` |
+| `clickhouse.max_attempts` | `integer` | **Max validation attempts**<br/>Maximum number of times to re-ask the LLM if EXPLAIN rejects the generated SQL | `5` |
+| `clickhouse.password` | `string` | **Password**<br/>Password to connect to the ClickHouse server |  |
+| `clickhouse.profile` | `string` |  | `"default"` |
+| `clickhouse.table` | `string` | **Table name**<br/>Name of table | `"table"` |
+| `clickhouse.tls` | `boolean` | **Use TLS**<br/>Connect over TLS. Required for managed services such as ClickHouse Cloud (native TLS port 9440 is assumed when the host has no explicit port). Leave OFF for a plaintext local server on port 9000. ClickHouse-specific, MySQL/PostgreSQL nodes do not expose this. | `false` |
+| `clickhouse.user` | `string` | **User**<br/>User to connect to the ClickHouse server | `"default"` |
+
+## Dependencies
+
+- `clickhouse-sqlalchemy` `==0.3.2`
+- `clickhouse-driver` `==0.2.9`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/db_clickhouse)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

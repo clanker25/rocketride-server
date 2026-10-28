@@ -1,0 +1,129 @@
+# aparavi_aql
+
+A RocketRide tool node that lets an agent retrieve Aparavi STORE metadata by
+asking questions in plain English. Pick it when the data is governed by an
+Aparavi server rather than stored in one of RocketRide's managed databases.
+
+## About Aparavi
+
+Aparavi is a data governance platform whose server exposes a query API over
+metadata in its STORE table. This node uses Aparavi Query Language (AQL), an
+SQL-like language, to retrieve those rows without requiring the calling agent
+to construct the query itself.
+
+## What it does
+
+The node is a pure tool node: it has no pipeline lanes. Its required LLM turns
+a natural-language request into a SELECT-only AQL query over the fixed STORE
+schema, then the node sends that query to the configured Aparavi server. Pick
+it over rocketride_sql when the authoritative data is Aparavi file metadata;
+use the SQL node for the managed relational tenant database.
+
+## Connections
+
+| Connection | Required | Description |
+| --- | --- | --- |
+| llm | yes | Generates AQL from natural-language questions. |
+
+## As a tool
+
+The functions are registered under the bare names below; this node defines no
+configurable server-name prefix. question arguments must be non-empty strings
+in a JSON object.
+
+| Function | Description |
+| --- | --- |
+| get_data | Generates safe AQL for required question, executes it, and returns STORE rows. |
+| get_aql | Generates AQL for required question without executing it. |
+| get_schema | Returns the fixed STORE table schema; use only after retrieval fails or is unexpected. |
+
+get_data returns {rows, aql, count} when successful. If the client was not
+initialized, a generated query is unsafe, generation never succeeds, or all
+execution retries fail, it returns {error, aql, rows: []}. Invalid tool input
+raises ValueError. The node tries generation and execution up to three times;
+after an API error, the next LLM attempt receives the failed AQL and error.
+
+get_aql returns {aql} and does not run the safety check or contact the API;
+invalid input or an LLM failure raises. get_schema accepts an empty object and
+returns {store: "STORE", columns: [...]}, where each column has a name, type,
+and description.
+
+## Configuration
+
+The single built-in profile has no endpoint defaults. Supply the Aparavi server
+connection, then describe the data in terms that help the required LLM select
+the correct fixed STORE fields. Query retry count and result limit are fixed in
+the implementation rather than configurable fields.
+
+### Aparavi Server URL
+
+Provide the base URL of the Aparavi server, including its scheme, for example
+https://aparavi.example.com. The node removes a trailing slash before adding
+its database-query path. Change this value when the target Aparavi deployment
+changes; an empty or unreachable URL leaves the tool client uninitialized or
+causes its HTTP calls to return errors after a 30-second timeout.
+
+### Username and password
+
+Username and Password are sent as HTTP Basic Auth on every Aparavi
+database-query request. Set them to credentials accepted by the configured
+server. Change both together when switching servers or users; a mismatched
+endpoint and credentials becomes an API HTTP or connection error returned by
+get_data after its retry loop.
+
+### Data description
+
+Data description is empty by default and is added as context to the LLM that
+writes AQL. Describe the collection's purpose, vocabulary, and useful metadata
+conventions when they are not evident from the fixed schema. This can improve
+query selection without giving the model a new table: STORE remains the only
+table in the generated-query prompt.
+
+## Authentication
+
+The node uses HTTP Basic Auth with the configured username and password for
+the Aparavi database-query API. It sends POST requests to
+/server/api/v3/database/query and does not use a separate token field.
+
+## Limitations
+
+This node runs on the RocketRide engine host and does not support remote
+execution. The engine host must be able to reach the configured Aparavi server
+using the supplied Basic Auth credentials. It only retrieves from the fixed
+STORE schema: the safety check permits one SELECT statement, rejects embedded
+multi-statement input, and blocks mutation and execution keywords before
+sending AQL to the server. The API request uses a fixed 250-object limit and a
+30-second timeout.
+
+## Notes
+
+### Query generation and result normalization
+
+The LLM prompt supplies the fixed STORE schema, AQL syntax rules, and examples.
+It asks for LIMIT 250 unless the question specifies another limit, while the
+HTTP client itself requests at most 250 objects. Accidental Markdown fences in
+the LLM output are removed. Timestamp values above 10,000,000,000 in the known
+Aparavi date fields are treated as milliseconds and normalized to seconds in
+returned rows.
+
+## Upstream docs
+
+- [Aparavi Data Suite documentation](https://aparavi.com/docs/data-suite/reports/create-a-new-report/)
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `aparavi.db_description` | `string` | **Data description**<br/>What is this data used for? Describe its content and purpose, this helps the LLM generate more accurate AQL queries. | `""` |
+| `aparavi.password` | `string` | **Password**<br/>Aparavi login password |  |
+| `aparavi.profile` | `string` |  | `"default"` |
+| `aparavi.url` | `string` | **Aparavi Server URL**<br/>Base URL of the Aparavi server, e.g. https://aparavi.example.com | `""` |
+| `aparavi.user` | `string` | **Username**<br/>Aparavi login username | `""` |
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/aparavi_aql)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->
