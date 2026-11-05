@@ -1,2 +1,2 @@
 imageio_ffmpeg
-sounddevice>=0.5
+sounddevice>=0.5.6
