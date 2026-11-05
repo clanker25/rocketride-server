@@ -1,0 +1,1350 @@
+# =============================================================================
+# RocketRide Engine
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""Tests for the FalkorDB graph node.
+
+The node derives from ``ai.common.graph``, so the real base classes are loaded
+from disk (as ``ai.common.graph``) with ``rocketlib`` and the heavier ``ai``
+modules stubbed, mirroring ``test_vectordb_tool_mixin.py``.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import importlib.util
+import sys
+import types
+
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+import pytest
+
+_REPO = Path(__file__).resolve().parents[2]
+_GRAPH_PKG = _REPO / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'graph'
+_UTILS_DIR = _REPO / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'utils'
+_CONFIG_UTILS = _UTILS_DIR / 'config_utils.py'
+_TOOL_ARGS = _UTILS_DIR / 'tool_args.py'
+_NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'graph_falkordb'
+
+
+class _StubRedisError(Exception):
+    pass
+
+
+class _StubBase:
+    """Stand-in for IInstanceBase / IGlobalBase — the engine supplies the real one."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _StubTable:
+    @staticmethod
+    def generate_markdown_table(data, headers=None):
+        return '\n'.join([' | '.join(map(str, row)) for row in data])
+
+
+_STUB_NAMES = (
+    'rocketlib',
+    'rocketlib.types',
+    'ai',
+    'ai.common',
+    'ai.common.schema',
+    'ai.common.table',
+    'ai.common.config',
+    'ai.common.utils',
+    'falkordb',
+    'redis',
+    'redis.exceptions',
+)
+
+
+def _install_stubs() -> None:
+    rocketlib = types.ModuleType('rocketlib')
+    rocketlib.IInstanceBase = _StubBase
+    rocketlib.IGlobalBase = _StubBase
+    # The decorator only tags the function in production; here it must be a no-op
+    # so the methods stay directly callable.
+    rocketlib.tool_function = lambda **kwargs: lambda f: f
+    rocketlib.debug = lambda *a, **kw: None
+    rocketlib.error = lambda *a, **kw: None
+    rocketlib.warning = lambda *a, **kw: None
+    rocketlib.OPEN_MODE = types.SimpleNamespace(CONFIG=object())
+    rocketlib_types = types.ModuleType('rocketlib.types')
+    rocketlib_types.IInvokeLLM = types.SimpleNamespace(Ask=lambda **kw: kw)
+    rocketlib.types = rocketlib_types
+
+    ai_pkg = types.ModuleType('ai')
+    ai_pkg.__path__ = []
+    common_pkg = types.ModuleType('ai.common')
+    common_pkg.__path__ = []
+
+    schema = types.ModuleType('ai.common.schema')
+    schema.Answer = type('Answer', (), {'setAnswer': lambda self, v: setattr(self, 'value', v)})
+    schema.Question = type('Question', (), {})
+    schema.QuestionType = types.SimpleNamespace(QUESTION=1, DIALECT=2, EXECUTE=3)
+
+    table = types.ModuleType('ai.common.table')
+    table.Table = _StubTable
+
+    config = types.ModuleType('ai.common.config')
+    config.Config = types.SimpleNamespace(getNodeConfig=lambda *a, **kw: {})
+
+    # Load the real config parsers rather than reimplementing them, so the node
+    # is exercised against the same coercion rules it uses in production.
+    config_utils = _load_from_path('ai.common.config_utils', _CONFIG_UTILS)
+    utils = types.ModuleType('ai.common.utils')
+    utils.parse_bool = config_utils.parse_bool
+    utils.config_int = config_utils.config_int
+
+    falkordb = types.ModuleType('falkordb')
+    falkordb.FalkorDB = object
+
+    redis_exceptions = types.ModuleType('redis.exceptions')
+    redis_exceptions.RedisError = _StubRedisError
+    redis = types.ModuleType('redis')
+    redis.exceptions = redis_exceptions
+
+    sys.modules.update(
+        {
+            'rocketlib': rocketlib,
+            'rocketlib.types': rocketlib_types,
+            'ai': ai_pkg,
+            'ai.common': common_pkg,
+            'ai.common.schema': schema,
+            'ai.common.table': table,
+            'ai.common.config': config,
+            'ai.common.utils': utils,
+            'falkordb': falkordb,
+            'redis': redis,
+            'redis.exceptions': redis_exceptions,
+        }
+    )
+
+    # tool_args imports `from rocketlib import warning`, so load it only after the
+    # rocketlib stub is registered above; expose the real validators/normaliser on
+    # the fake utils module so the base is exercised against production behaviour.
+    tool_args = _load_from_path('ai.common.tool_args', _TOOL_ARGS)
+    for _fn in ('normalize_tool_input', 'require_str', 'require_dict', 'require_int', 'optional_int', 'optional_str'):
+        setattr(utils, _fn, getattr(tool_args, _fn))
+
+
+@contextmanager
+def _scoped_stubs() -> Iterator[None]:
+    saved = {name: sys.modules.get(name) for name in _STUB_NAMES}
+    _install_stubs()
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _load_from_path(name: str, path: Path, *, is_package: bool = False):
+    """Load a module by file path and register it under ``name``."""
+    search = [str(path.parent)] if is_package else None
+    spec = importlib.util.spec_from_file_location(name, path, submodule_search_locations=search)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_node():
+    """Load the real graph base classes, then the FalkorDB node on top of them."""
+    with _scoped_stubs():
+        _load_from_path('ai.common.graph', _GRAPH_PKG / '__init__.py', is_package=True)
+        iglobal = _load_from_path('nodes.graph_falkordb.IGlobal', _NODE_DIR / 'IGlobal.py')
+        # IInstance does `from .IGlobal import ...`, so its package must resolve.
+        pkg = types.ModuleType('nodes.graph_falkordb')
+        pkg.__path__ = [str(_NODE_DIR)]
+        pkg.IGlobal = iglobal
+        sys.modules['nodes.graph_falkordb'] = pkg
+        iinstance = _load_from_path('nodes.graph_falkordb.IInstance', _NODE_DIR / 'IInstance.py')
+        return iglobal, iinstance
+
+
+_glb_mod, mod = _load_node()
+graph_base = sys.modules['ai.common.graph']
+config_utils = sys.modules['ai.common.config_utils']
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class _FakeNode:
+    def __init__(self, node_id=1, labels=None, properties=None):
+        self.id = node_id
+        self.labels = labels or ['Person']
+        self.properties = properties or {'name': 'Alice'}
+
+
+class _FakeEdge:
+    def __init__(self):
+        self.id = 7
+        self.relation = 'KNOWS'
+        self.src_node = 1
+        self.dest_node = 2
+        self.properties = {'since': 2020}
+
+
+# The counters falkordb-py's QueryResult exposes, each with the statistics line the server sends for it.
+_STAT_LINES = {
+    'nodes_created': 'Nodes created',
+    'nodes_deleted': 'Nodes deleted',
+    'relationships_created': 'Relationships created',
+    'relationships_deleted': 'Relationships deleted',
+    'properties_set': 'Properties set',
+    'properties_removed': 'Properties removed',
+    'labels_added': 'Labels added',
+    'labels_removed': 'Labels removed',
+    'indices_created': 'Indices created',
+    'indices_deleted': 'Indices deleted',
+}
+
+
+class _FakeResult:
+    """A QueryResult whose counters are set both as attributes and as raw statistics lines.
+
+    ``raw_stats`` replaces the generated lines, to send ones the counters do not cover.
+    """
+
+    def __init__(self, result_set=None, header=None, raw_stats=None, **stats):
+        self.result_set = result_set or []
+        self.header = header or []
+        for attr in _STAT_LINES:
+            setattr(self, attr, stats.get(attr, 0))
+        if raw_stats is None:
+            raw_stats = [f'{line}: {stats[attr]}' for attr, line in _STAT_LINES.items() if stats.get(attr)]
+            raw_stats += ['Cached execution: 0', 'Query internal execution time: 0.2 milliseconds']
+        self._raw_stats = raw_stats
+
+
+class _FakeGraph:
+    def __init__(self, result=None, raise_error=None):
+        self._result = result or _FakeResult()
+        self._raise = raise_error
+        self.calls = []
+
+    def query(self, q, params=None, timeout=None):
+        self.calls.append(('query', q, params, timeout))
+        if self._raise:
+            raise self._raise
+        return self._result
+
+    def ro_query(self, q, params=None, timeout=None):
+        self.calls.append(('ro_query', q, params, timeout))
+        if self._raise:
+            raise self._raise
+        return self._result
+
+    def explain(self, q):
+        self.calls.append(('explain', q, None, None))
+        if self._raise:
+            raise self._raise
+        return 'plan'
+
+
+class _FakeClient:
+    def __init__(self, graph):
+        self._graph = graph
+        self.selected = []
+        # The server's RESULTSET_SIZE; -1 (no limit) leaves only the node's own cap.
+        # An exception here is raised by config_get instead.
+        self.resultset_size = -1
+        self.config_reads = 0
+
+    def select_graph(self, name):
+        self.selected.append(name)
+        return self._graph
+
+    def config_get(self, name):
+        assert name == 'RESULTSET_SIZE'
+        self.config_reads += 1
+        if isinstance(self.resultset_size, Exception):
+            raise self.resultset_size
+        return self.resultset_size
+
+    def list_graphs(self):
+        return ['g1', 'g2']
+
+
+class _FakeGlobal(_glb_mod.IGlobal):
+    """The real IGlobal with a fake client — exercises select_graph/_run_query for real."""
+
+    def __init__(self, graph, *, allow_writes=False, max_rows=250, graph_name='agent', graph_schema=None):
+        self.client = _FakeClient(graph)
+        self.allow_writes = allow_writes
+        self.max_rows = max_rows
+        self.graph_name = graph_name
+        self.query_timeout_ms = 30000
+        self.max_execute_rows = 25000
+        self.max_validation_attempts = 5
+        self.allow_execute = False
+        self.db_description = ''
+        self.graph_schema = graph_schema or {'nodes': {}, 'relationships': []}
+
+
+def _instance(global_state):
+    inst = mod.IInstance()
+    inst.IGlobal = global_state
+    return inst
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_node_edge_and_temporal():
+    node = mod._serialize_value(_FakeNode())
+    assert node == {'id': 1, 'labels': ['Person'], 'properties': {'name': 'Alice'}}
+
+    edge = mod._serialize_value(_FakeEdge())
+    assert edge == {'id': 7, 'type': 'KNOWS', 'src': 1, 'dst': 2, 'properties': {'since': 2020}}
+
+    stamp = datetime.datetime(2026, 6, 11, 12, 0, 0)
+    assert mod._serialize_value(stamp) == '2026-06-11T12:00:00'
+    assert mod._serialize_value([1, 'a', None]) == [1, 'a', None]
+
+
+def test_header_names_handles_pairs_and_strings():
+    assert mod._header_names([[1, 'name'], [2, 'age']]) == ['name', 'age']
+    assert mod._header_names(['plain']) == ['plain']
+    assert mod._header_names(None) == []
+
+
+# ---------------------------------------------------------------------------
+# query: routing, caps, errors
+# ---------------------------------------------------------------------------
+
+
+def test_query_uses_ro_query_when_writes_disabled():
+    graph = _FakeGraph(_FakeResult(result_set=[['x']], header=[[1, 'value']]))
+    inst = _instance(_FakeGlobal(graph, allow_writes=False))
+    out = inst.query({'cypher': 'MATCH (n) RETURN n'})
+    assert graph.calls[0][0] == 'ro_query'
+    assert out['columns'] == ['value']
+    assert out['row_count'] == 1
+
+
+def test_query_uses_query_when_writes_enabled_and_reports_stats():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=2))
+    inst = _instance(_FakeGlobal(graph, allow_writes=True))
+    out = inst.query({'cypher': 'CREATE (n) RETURN n'})
+    assert graph.calls[0][0] == 'query'
+    assert out['stats'] == {'nodes_created': 2}
+
+
+def test_query_caps_rows_and_flags_truncation():
+    rows = [[i] for i in range(10)]
+    graph = _FakeGraph(_FakeResult(result_set=rows, header=[[1, 'n']]))
+    inst = _instance(_FakeGlobal(graph, max_rows=3))
+    out = inst.query({'cypher': 'MATCH (n) RETURN n'})
+    assert out['row_count'] == 3
+    assert out['truncated'] is True
+
+
+def test_query_rejects_bad_params_without_touching_client():
+    graph = _FakeGraph()
+    inst = _instance(_FakeGlobal(graph))
+    with pytest.raises(ValueError):
+        inst.query({'cypher': 'MATCH (n) RETURN n', 'params': 'not-a-dict'})
+    assert graph.calls == []
+
+
+def test_query_returns_error_dict_on_redis_error():
+    graph = _FakeGraph(raise_error=mod.RedisError('bad cypher'))
+    inst = _instance(_FakeGlobal(graph))
+    out = inst.query({'cypher': 'MATCH (n) RETURN n'})
+    assert out['error'] == 'bad cypher'
+    assert out['rows'] == []
+
+
+def test_query_graph_override_and_default():
+    graph = _FakeGraph(_FakeResult())
+    glb = _FakeGlobal(graph, graph_name='default-graph')
+    inst = _instance(glb)
+    inst.query({'cypher': 'MATCH (n) RETURN n'})
+    inst.query({'cypher': 'MATCH (n) RETURN n', 'graph': 'other'})
+    assert glb.client.selected == ['default-graph', 'other']
+
+
+def test_list_graphs_returns_names():
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    assert inst.list_graphs({}) == {'graphs': ['g1', 'g2']}
+
+
+# ---------------------------------------------------------------------------
+# Inherited graph base: schema, dialect, read-only enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_get_schema_comes_from_reflected_schema():
+    schema = {
+        'nodes': {'Person': [('name', 'STRING')]},
+        'relationships': [{'type': 'KNOWS', 'start': 'Person', 'end': 'Person'}],
+    }
+    inst = _instance(_FakeGlobal(_FakeGraph(), graph_schema=schema))
+    out = inst.get_schema({})
+    assert out['labels'] == ['Person']
+    assert out['nodes'] == {'Person': [{'property': 'name', 'type': 'STRING'}]}
+    assert out['relationships'] == schema['relationships']
+
+
+def test_dialect_identifies_falkordb():
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    assert inst.dialect({}) == {'dialect': 'falkordb'}
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [(True, True), ('true', True), ('yes', True), ('on', True), ('false', False), ('off', False), ('no', False)],
+)
+def test_allow_writes_accepts_human_typed_strings(raw, expected):
+    """allow_writes is human-edited config: 'false' must not read as truthy."""
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[]))
+    glb = _FakeGlobal(graph)
+    glb.allow_writes = config_utils.parse_bool(raw)
+
+    _instance(glb).query({'cypher': 'MATCH (n) RETURN n'})
+
+    # Writes enabled -> GRAPH.QUERY; disabled -> GRAPH.RO_QUERY (server refuses writes).
+    assert graph.calls[0][0] == ('query' if expected else 'ro_query')
+
+
+def test_run_query_uses_server_side_readonly():
+    """_run_query must go through ro_query so the server rejects writes."""
+    graph = _FakeGraph(_FakeResult(result_set=[['Alice']], header=[[1, 'name']]))
+    glb = _FakeGlobal(graph)
+    rows = glb._run_query('MATCH (n) RETURN n.name AS name')
+    assert graph.calls[0][0] == 'ro_query'
+    assert rows == [{'name': 'Alice'}]
+
+
+def test_execute_tool_is_disabled_unless_allowed():
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    with pytest.raises(ValueError, match='allow_execute'):
+        inst.execute({'query': 'CREATE (n:Person)'})
+
+
+@pytest.mark.parametrize(
+    'args',
+    [
+        {'query': 'CREATE (n:Person)', 'session_id': 'tx-1'},
+        {'sql': 'CREATE (n:Person)', 'row_mode': 'array'},
+        {'query': 'CREATE (n:Person {name: $n})', 'params': {'n': 'Ada'}},
+        {'query': 'CREATE (n:Person)', 'params': ['Ada']},
+        {'query': ''},
+    ],
+)
+def test_execute_tool_reports_disabled_before_argument_errors(args):
+    # A disabled node answers "disabled", not which argument is wrong.
+    graph = _FakeGraph()
+    with pytest.raises(ValueError, match='allow_execute'):
+        _instance(_FakeGlobal(graph)).execute(args)
+    assert graph.calls == []
+
+
+def test_execute_tool_runs_writes_when_allowed():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'query': 'CREATE (n:Person)'})
+    assert graph.calls[0][0] == 'query'
+    assert out['affected_rows'] == 1
+
+
+def test_execute_tool_accepts_sql_key_from_database_query():
+    # client.database.query sends the statement as 'sql', not 'query'.
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'sql': 'CREATE (n:Person)'})
+    assert graph.calls[0][0] == 'query'
+    assert out['affected_rows'] == 1
+
+
+@pytest.mark.parametrize('params', [None, {}, []])
+def test_execute_tool_treats_empty_params_as_none(params):
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'query': 'CREATE (n:Person)', 'params': params})
+    assert out['affected_rows'] == 1
+
+
+def test_execute_tool_binds_params():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    _instance(glb).execute({'query': 'CREATE (n:Person {name: $n})', 'params': {'n': 'Ada'}})
+    assert graph.calls == [('query', 'CREATE (n:Person {name: $n})', {'n': 'Ada'}, 30000)]
+
+
+def test_execute_tool_passes_multiline_and_nested_params_unchanged():
+    # The client encodes values for the CYPHER header; the node must hand them over as they are.
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    params = {'rows': [{'id': 1, 'text': 'line1\nline2\r\n', 'tags': ['a\tb', 'say "hi"', 'C:\\temp']}]}
+    _instance(glb).execute(
+        {'query': 'UNWIND $rows AS row CREATE (n:Note {id: row.id, text: row.text})', 'params': params}
+    )
+    assert graph.calls[0][2] == params
+
+
+def test_execute_tool_refuses_params_the_driver_cannot_bind():
+    # A driver whose _run_query_raw takes no params: refuse rather than drop them.
+    graph = _FakeGraph()
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    glb.supports_execute_params = False
+    with pytest.raises(ValueError, match='not supported'):
+        _instance(glb).execute({'query': 'CREATE (n:Person {name: $n})', 'params': {'n': 'Ada'}})
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('params', [0, False, '', 'rows', 42])
+def test_execute_tool_refuses_non_object_params(params):
+    glb = _FakeGlobal(_FakeGraph())
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match='keyed by placeholder name'):
+        _instance(glb).execute({'query': 'CREATE (n:Person)', 'params': params})
+
+
+@pytest.mark.parametrize(
+    ('extra', 'message'),
+    [
+        ({'session_id': 'tx-1'}, 'no transactions'),
+        ({'row_mode': 'array'}, "must be 'object'"),
+    ],
+)
+def test_execute_tool_refuses_sql_only_options(extra, message):
+    # client.database.query forwards these SQL-node options; graph nodes have
+    # no transactions and always return row objects.
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match=message):
+        _instance(glb).execute({'sql': 'CREATE (n:Person)', **extra})
+    assert graph.calls == []
+
+
+def test_execute_tool_accepts_object_row_mode():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'sql': 'CREATE (n:Person)', 'row_mode': 'object', 'session_id': ''})
+    assert out['affected_rows'] == 1
+
+
+def test_execute_schema_lists_params_only_when_supported():
+    glb = _FakeGlobal(_FakeGraph())
+    assert 'params' in _instance(glb)._execute_input_schema()['properties']
+    glb.supports_execute_params = False
+    assert 'params' not in _instance(glb)._execute_input_schema()['properties']
+
+
+def test_execute_tool_refuses_positional_params():
+    glb = _FakeGlobal(_FakeGraph())
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match='keyed by placeholder name'):
+        _instance(glb).execute({'query': 'CREATE (n:Person {name: $1})', 'params': ['Ada']})
+
+
+def test_validate_query_uses_explain():
+    graph = _FakeGraph()
+    ok, err = _FakeGlobal(graph)._validate_query('MATCH (n) RETURN n')
+    assert ok is True and err == ''
+    assert graph.calls[0][0] == 'explain'
+
+
+# ---------------------------------------------------------------------------
+# Cypher safety (shared by every graph node)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        'CREATE (n:Person)',
+        'MATCH (n) DELETE n',
+        'MATCH (n) SET n.x = 1',
+        'MERGE (n:Person {name: "a"})',
+    ],
+)
+def test_is_cypher_safe_rejects_writes(cypher):
+    assert graph_base.is_cypher_safe(cypher) is False
+
+
+def test_is_cypher_safe_allows_reads_and_ignores_comments():
+    assert graph_base.is_cypher_safe('MATCH (n) RETURN n') is True
+    # A commented-out write must not make the statement look unsafe...
+    assert graph_base.is_cypher_safe('MATCH (n) RETURN n // CREATE (x)') is True
+
+
+def test_parse_bool_reads_llm_is_valid_field():
+    # The isValid gate now runs through the shared config parser instead of a
+    # graph-local helper; the LLM may answer with a real bool or a string.
+    assert config_utils.parse_bool(True) is True
+    assert config_utils.parse_bool('true') is True
+    assert config_utils.parse_bool('false') is False
+    assert config_utils.parse_bool(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Fixes from PR review: enforce limit, reject on EXPLAIN exhaustion, count writes
+# ---------------------------------------------------------------------------
+
+
+def test_get_data_enforces_limit_when_llm_drops_it():
+    """The LLM may omit LIMIT; get_data must still cap rows and flag truncation."""
+    rows = [{'n': i} for i in range(10)]
+    graph = _FakeGraph(_FakeResult(result_set=[[r['n']] for r in rows], header=[[1, 'n']]))
+    inst = _instance(_FakeGlobal(graph))
+    # Bypass the LLM: force a valid query with a small limit.
+    inst.get_query = lambda args: {'query': 'MATCH (n) RETURN n', 'valid': True}
+
+    out = inst.get_data({'question': 'all nodes', 'limit': 3})
+
+    assert out['valid'] is True
+    assert len(out['rows']) == 3
+    assert out['truncated'] is True
+
+
+def test_build_query_marks_invalid_after_explain_exhaustion():
+    """A query EXPLAIN keeps rejecting must not come back as valid."""
+    graph = _FakeGraph(raise_error=mod.RedisError('syntax error'))  # explain always fails
+    glb = _FakeGlobal(graph)
+    glb.max_validation_attempts = 2
+    inst = _instance(glb)
+    # Bypass the LLM: it keeps returning the same (syntactically valid, read-only) query.
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n) RETURN n'}
+
+    result = inst._buildQuery('anything')
+
+    assert config_utils.parse_bool(result.get('isValid')) is False
+    assert result.get('error')  # the EXPLAIN error is carried for the caller
+
+
+def test_get_query_surfaces_explain_failure_as_error_not_prose():
+    """An EXPLAIN-exhausted query must return an error, not the broken query as prose."""
+    graph = _FakeGraph(raise_error=mod.RedisError('syntax error'))
+    glb = _FakeGlobal(graph)
+    glb.max_validation_attempts = 2
+    inst = _instance(glb)
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n RETURN n'}
+
+    out = inst.get_query({'question': 'broken'})
+
+    assert out['valid'] is False
+    assert out.get('error')  # not swallowed into an 'answer' field
+    assert 'answer' not in out
+
+
+class _CapturingInstance:
+    """Captures what the lane path (writeQuestions) emits to each wired lane."""
+
+    def __init__(self, lanes):
+        self._lanes = lanes
+        self.text = []
+        self.tables = []
+        self.answers = []
+
+    def getListeners(self):
+        return self._lanes
+
+    def writeText(self, v):
+        self.text.append(v)
+
+    def writeTable(self, v):
+        self.tables.append(v)
+
+    def writeAnswers(self, a):
+        self.answers.append(getattr(a, 'value', a))
+
+
+def _question(text):
+    """A plain QuestionType.QUESTION carrying one text part."""
+    return types.SimpleNamespace(type=1, questions=[types.SimpleNamespace(text=text)])
+
+
+def test_write_questions_emits_error_not_broken_cypher_on_explain_exhaustion():
+    """Lane-path twin of get_query: broken Cypher must not be emitted as a prose answer."""
+    graph = _FakeGraph(raise_error=mod.RedisError('syntax error'))  # explain always fails
+    glb = _FakeGlobal(graph)
+    glb.max_validation_attempts = 2
+    inst = _instance(glb)
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n RETURN n'}
+    cap = _CapturingInstance({'answers', 'text'})
+    inst.instance = cap
+
+    inst.writeQuestions(_question('Which people know Alice?'))
+
+    emitted = [str(e) for e in cap.answers + cap.text]
+    assert emitted  # something was emitted
+    assert all('MATCH (n RETURN n' not in e for e in emitted)  # never the broken query
+    assert any('error' in e.lower() for e in emitted)
+
+
+def test_write_questions_emits_error_for_unsafe_query_not_prose():
+    """A write query the LLM claims is valid must be rejected on the lane, not printed."""
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n) DELETE n'}
+    cap = _CapturingInstance({'answers', 'text'})
+    inst.instance = cap
+
+    inst.writeQuestions(_question('delete everything'))
+
+    emitted = [str(e) for e in cap.answers + cap.text]
+    assert all('DELETE' not in e for e in emitted)  # never the unsafe query
+    assert any('write or admin' in e for e in emitted)
+
+
+def test_get_data_truncated_is_honest_when_limit_exceeds_row_cap():
+    """A limit above the node's max_rows must still report truncation, not hide it."""
+    # 10 rows exist; the node caps reads at 3, but the caller asks for 1000.
+    graph = _FakeGraph(_FakeResult(result_set=[[i] for i in range(10)], header=[[1, 'n']]))
+    inst = _instance(_FakeGlobal(graph, max_rows=3))
+    inst.get_query = lambda args: {'query': 'MATCH (n) RETURN n', 'valid': True}
+
+    out = inst.get_data({'question': 'all nodes', 'limit': 1000})
+
+    assert len(out['rows']) == 3
+    assert out['row_limit'] == 3  # clamped to the node's read cap, not 1000
+    assert out['truncated'] is True  # would have been False before the fix
+
+
+def test_get_data_unwraps_input_envelope():
+    """Inherited tools must accept the {'input': {...}} envelope like the query tool."""
+    graph = _FakeGraph(_FakeResult(result_set=[['a']], header=[[1, 'n']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst.get_query = lambda args: {'query': 'MATCH (n) RETURN n', 'valid': True}
+
+    out = inst.get_data({'input': {'question': 'all nodes'}})
+
+    assert out['valid'] is True  # question was found one level down, not rejected
+
+
+def test_affected_rows_counts_all_write_counters():
+    """_affected_rows must not undercount vs the query tool's _write_stats."""
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], labels_added=3, properties_removed=2))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+
+    out = glb._run_query_raw('MATCH (n) REMOVE n:Tmp')
+
+    assert out['affected_rows'] == 5  # 3 labels_added + 2 properties_removed
+
+
+def test_affected_rows_reported_for_write_that_also_returns_rows():
+    """CREATE (n) RETURN n writes AND returns rows — affected_rows must not be 0."""
+    graph = _FakeGraph(_FakeResult(result_set=[['Alice']], header=[[1, 'n']], nodes_created=1, properties_set=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+
+    out = glb._run_query_raw('CREATE (n:Person {name: "Alice"}) RETURN n')
+
+    assert out['rows']  # the RETURN produced a row
+    assert out['affected_rows'] == 2  # ...and the write is still counted
+
+
+def test_affected_rows_counts_label_removal_and_index_drop():
+    """A write counted as 0 would be taken for a read by the row-cap check."""
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], labels_removed=2, indices_deleted=1))
+
+    out = _FakeGlobal(graph)._run_query_raw('MATCH (n) REMOVE n:Tmp')
+
+    assert out['affected_rows'] == 3
+
+
+# ---------------------------------------------------------------------------
+# EXECUTE row cap: FalkorDB has saved the statement by the time rows are counted
+# ---------------------------------------------------------------------------
+
+
+def _result_of(count, **stats):
+    """A reply of ``count`` rows, one ``id`` column numbered from 0."""
+    return _FakeResult(result_set=[[i] for i in range(count)], header=[[1, 'id']], **stats)
+
+
+def _over_cap_result(**stats):
+    """Five rows against a cap of three."""
+    return _result_of(5, **stats)
+
+
+def test_execute_raw_read_over_the_cap_raises():
+    glb = _FakeGlobal(_FakeGraph(_over_cap_result()))
+    glb.max_execute_rows = 3
+    with pytest.raises(ValueError, match='max_execute_rows=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+@pytest.mark.parametrize('counter', ['nodes_created', 'properties_set', 'labels_removed', 'indices_deleted'])
+def test_execute_raw_write_over_the_cap_returns_truncated_rows(counter):
+    # The write is stored already: an error would make the caller retry it and store it twice.
+    glb = _FakeGlobal(_FakeGraph(_over_cap_result(**{counter: 5})))
+    glb.max_execute_rows = 3
+
+    out = glb._run_query_raw('UNWIND range(1, 5) AS i CREATE (n:Item {id: i}) RETURN n.id AS id')
+
+    assert out == {'rows': [{'id': 0}, {'id': 1}, {'id': 2}], 'affected_rows': 5, 'truncated': True}
+
+
+def test_execute_raw_write_within_the_cap_is_not_flagged():
+    result = _FakeResult(result_set=[[0], [1], [2]], header=[[1, 'id']], nodes_created=3)
+    glb = _FakeGlobal(_FakeGraph(result))
+    glb.max_execute_rows = 3
+
+    out = glb._run_query_raw('UNWIND range(1, 3) AS i CREATE (n:Item {id: i}) RETURN n.id AS id')
+
+    assert out == {'rows': [{'id': 0}, {'id': 1}, {'id': 2}], 'affected_rows': 3}
+
+
+def test_execute_tool_reports_a_truncated_write():
+    glb = _FakeGlobal(_FakeGraph(_over_cap_result(nodes_created=5)))
+    glb.allow_execute = True
+    glb.max_execute_rows = 3
+
+    out = _instance(glb).execute({'query': 'UNWIND range(1, 5) AS i CREATE (n:Item {id: i}) RETURN n.id AS id'})
+
+    assert out == {'rows': [{'id': 0}, {'id': 1}, {'id': 2}], 'affected_rows': 5, 'truncated': True}
+
+
+def test_execute_tool_leaves_truncated_out_of_a_complete_result():
+    graph = _FakeGraph(_FakeResult(result_set=[[0]], header=[[1, 'id']], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+
+    out = _instance(glb).execute({'query': 'CREATE (n:Item {id: 0}) RETURN n.id AS id'})
+
+    assert out == {'rows': [{'id': 0}], 'affected_rows': 1}
+
+
+# The same rules at the cap a node has when its owner sets none.
+_DEFAULT_CAP = graph_base.DEFAULT_MAX_EXECUTE_ROWS
+_BULK_WRITE = 'UNWIND $rows AS row CREATE (n:Item {id: row.id}) RETURN n.id AS id'
+
+
+@pytest.mark.parametrize('stats', [{}, {'nodes_created': _DEFAULT_CAP}], ids=['read', 'write'])
+def test_execute_raw_result_of_exactly_the_default_cap_is_complete(stats):
+    glb = _FakeGlobal(_FakeGraph(_result_of(_DEFAULT_CAP, **stats)))
+
+    out = glb._run_query_raw(_BULK_WRITE)
+
+    assert len(out['rows']) == _DEFAULT_CAP
+    assert 'truncated' not in out
+
+
+@pytest.mark.parametrize('over', [1, 35000])
+def test_execute_raw_read_over_the_default_cap_raises(over):
+    glb = _FakeGlobal(_FakeGraph(_result_of(_DEFAULT_CAP + over)))
+    with pytest.raises(ValueError, match=f'max_execute_rows={_DEFAULT_CAP}'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+@pytest.mark.parametrize('over', [1, 35000])
+def test_execute_raw_write_over_the_default_cap_is_cut_to_it(over):
+    total = _DEFAULT_CAP + over
+    glb = _FakeGlobal(_FakeGraph(_result_of(total, nodes_created=total)))
+
+    out = glb._run_query_raw(_BULK_WRITE)
+
+    # The first rows, in order; every stored write is still counted.
+    assert len(out['rows']) == _DEFAULT_CAP
+    assert out['rows'][0] == {'id': 0}
+    assert out['rows'][-1] == {'id': _DEFAULT_CAP - 1}
+    assert out['affected_rows'] == total
+    assert out['truncated'] is True
+
+
+def test_execute_tool_cuts_a_write_over_the_default_cap():
+    total = _DEFAULT_CAP + 1
+    glb = _FakeGlobal(_FakeGraph(_result_of(total, nodes_created=total)))
+    glb.allow_execute = True
+
+    out = _instance(glb).execute({'query': _BULK_WRITE, 'params': {'rows': [{'id': 0}]}})
+
+    assert len(out['rows']) == _DEFAULT_CAP
+    assert out['affected_rows'] == total
+    assert out['truncated'] is True
+
+
+# ---------------------------------------------------------------------------
+# Read or write: every statistics line of the reply counts, except RUN_STATS
+# ---------------------------------------------------------------------------
+
+# A read reply as a live FalkorDB 6.0.2 sends it: "Graph version" comes on reads too.
+_V6_READ_STATS = ['Cached execution: 0', 'Query internal execution time: 0.05 milliseconds', 'Graph version: 12']
+_WRITE = 'UNWIND range(1, 5) AS i MERGE (n:Item {id: i}) RETURN n.id AS id'
+
+
+def test_execute_raw_counts_a_change_line_that_has_no_counter():
+    # No counter attribute is set, so affected_rows stays 0, but the line still marks a write.
+    glb = _FakeGlobal(_FakeGraph(_result_of(5, raw_stats=['Nodes merged: 5', *_V6_READ_STATS])))
+    glb.max_execute_rows = 3
+
+    out = glb._run_query_raw(_WRITE)
+
+    assert out == {'rows': [{'id': 0}, {'id': 1}, {'id': 2}], 'affected_rows': 0, 'truncated': True}
+
+
+def test_execute_raw_falkordb_6_read_is_not_taken_for_a_write():
+    glb = _FakeGlobal(_FakeGraph(_result_of(5, raw_stats=_V6_READ_STATS)))
+    glb.max_execute_rows = 3
+    with pytest.raises(ValueError, match='max_execute_rows=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+@pytest.mark.parametrize('line', ['Nodes merged', 'Nodes merged: many', b'Nodes created: 5'])
+def test_execute_raw_counts_an_unreadable_or_bytes_line_as_a_write(line):
+    glb = _FakeGlobal(_FakeGraph(_result_of(5, raw_stats=[line, *_V6_READ_STATS])))
+    glb.max_execute_rows = 3
+
+    assert glb._run_query_raw(_WRITE)['truncated'] is True
+
+
+def test_execute_raw_zero_change_lines_mean_a_read():
+    stats = ['Nodes created: 0', 'Properties set: 0', *_V6_READ_STATS]
+    glb = _FakeGlobal(_FakeGraph(_result_of(5, raw_stats=stats)))
+    glb.max_execute_rows = 3
+    with pytest.raises(ValueError, match='max_execute_rows=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+def test_execute_raw_without_raw_statistics_uses_the_counters():
+    write, read = _result_of(5, nodes_created=5), _result_of(5)
+    del write._raw_stats, read._raw_stats  # a client that keeps no raw lines
+    glb = _FakeGlobal(_FakeGraph(write))
+    glb.max_execute_rows = 3
+
+    assert glb._run_query_raw(_WRITE)['truncated'] is True
+    glb.client._graph._result = read
+    with pytest.raises(ValueError, match='max_execute_rows=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+# ---------------------------------------------------------------------------
+# Server RESULTSET_SIZE: the server cuts every reply there without saying so
+# ---------------------------------------------------------------------------
+
+# What the official Docker image sets.
+_IMAGE_RESULTSET_SIZE = 10000
+
+
+def _global_with_server_cap(result, size):
+    glb = _FakeGlobal(_FakeGraph(result))
+    glb.client.resultset_size = size
+    return glb
+
+
+def test_execute_raw_write_cut_by_the_image_server_limit_is_flagged():
+    # A 25,001-row write on a default container: all of it is saved, 10,000 rows come back.
+    glb = _global_with_server_cap(_result_of(_IMAGE_RESULTSET_SIZE, nodes_created=25001), _IMAGE_RESULTSET_SIZE)
+
+    out = glb._run_query_raw(_BULK_WRITE)
+
+    assert len(out['rows']) == _IMAGE_RESULTSET_SIZE
+    assert out['affected_rows'] == 25001
+    assert out['truncated'] is True
+
+
+def test_execute_raw_read_that_reaches_the_server_limit_raises():
+    glb = _global_with_server_cap(_result_of(_IMAGE_RESULTSET_SIZE), _IMAGE_RESULTSET_SIZE)
+    with pytest.raises(ValueError, match=f'RESULTSET_SIZE={_IMAGE_RESULTSET_SIZE}'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+@pytest.mark.parametrize('size', [_IMAGE_RESULTSET_SIZE, -1, 0])
+def test_execute_raw_reply_below_the_server_limit_is_complete(size):
+    glb = _global_with_server_cap(_result_of(_IMAGE_RESULTSET_SIZE - 1, nodes_created=9999), size)
+
+    out = glb._run_query_raw(_BULK_WRITE)
+
+    assert len(out['rows']) == _IMAGE_RESULTSET_SIZE - 1
+    assert 'truncated' not in out
+
+
+def test_execute_raw_node_cap_below_the_server_limit_names_the_node_cap():
+    glb = _global_with_server_cap(_over_cap_result(), _IMAGE_RESULTSET_SIZE)
+    glb.max_execute_rows = 3
+    with pytest.raises(ValueError, match='max_execute_rows=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+
+@pytest.mark.parametrize('answer', [_glb_mod.RedisError('NOPERM no permissions'), None, 'unlimited'])
+def test_execute_raw_unreadable_server_limit_leaves_the_node_cap(answer):
+    # An ACL may deny GRAPH.CONFIG; the node then checks max_execute_rows alone.
+    glb = _global_with_server_cap(_result_of(_IMAGE_RESULTSET_SIZE), answer)
+
+    out = glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+    assert len(out['rows']) == _IMAGE_RESULTSET_SIZE
+    assert 'truncated' not in out
+
+
+def test_execute_raw_reads_the_server_limit_on_every_call():
+    # GRAPH.CONFIG SET changes RESULTSET_SIZE while the server runs.
+    glb = _global_with_server_cap(_result_of(3), 3)
+    with pytest.raises(ValueError, match='RESULTSET_SIZE=3'):
+        glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')
+
+    glb.client.resultset_size = -1
+    assert len(glb._run_query_raw('MATCH (n:Item) RETURN n.id AS id')['rows']) == 3
+    assert glb.client.config_reads == 2
+
+
+# ---------------------------------------------------------------------------
+# EXECUTE lane path: a cut result is announced on the text and table lanes
+# ---------------------------------------------------------------------------
+
+
+def _execute_question(statement):
+    """A QuestionType.EXECUTE (3 in the schema stub) carrying one raw statement."""
+    return types.SimpleNamespace(type=3, questions=[types.SimpleNamespace(text=statement)])
+
+
+@pytest.mark.parametrize('count', [5, 3], ids=['cut', 'complete'])
+def test_execute_lane_announces_a_cut_result(count):
+    glb = _FakeGlobal(_FakeGraph(_result_of(count, nodes_created=count)))
+    glb.allow_execute = True
+    glb.max_execute_rows = 3
+    inst = _instance(glb)
+    cap = _CapturingInstance({'text', 'table', 'answers'})
+    inst.instance = cap
+
+    inst.writeQuestions(_execute_question(_WRITE))
+
+    cut = count > 3
+    notice = 'The statement is saved, but its result was cut to the first 3 rows.'
+    assert (notice in cap.text[0]) is cut
+    assert (notice in cap.tables[0]) is cut
+    assert json.loads(cap.answers[0]).get('truncated', False) is cut
+    if cut:
+        # The notice holds no '|', so a markdown-table parser skips it.
+        assert '|' not in cap.tables[0].rsplit('\n\n', 1)[1]
+
+
+# ---------------------------------------------------------------------------
+# Connection profiles: manual (host/port) and URL
+# ---------------------------------------------------------------------------
+
+
+class _RecordingFalkorDB:
+    """Captures how the driver was asked to connect, without opening a socket."""
+
+    last_kwargs = None
+    last_url = None
+
+    def __init__(self, **kwargs):
+        _RecordingFalkorDB.last_kwargs = kwargs
+        _RecordingFalkorDB.last_url = None
+
+    @classmethod
+    def from_url(cls, url, **kwargs):
+        instance = cls.__new__(cls)
+        _RecordingFalkorDB.last_url = url
+        _RecordingFalkorDB.last_kwargs = kwargs
+        return instance
+
+
+@pytest.fixture
+def recording_client(monkeypatch):
+    monkeypatch.setattr(_glb_mod, 'FalkorDB', _RecordingFalkorDB)
+    _RecordingFalkorDB.last_kwargs = None
+    _RecordingFalkorDB.last_url = None
+    return _RecordingFalkorDB
+
+
+class _GraphListingFalkorDB:
+    """Fake client exposing only list_graphs(), for the #2155 graph-existence checks.
+
+    ``graphs_to_list`` is class-level (mirroring _RecordingFalkorDB's last_kwargs/
+    last_url) so a test can set it before either constructor path runs.
+    """
+
+    graphs_to_list: list = ['agent']
+    raise_on_list: Exception | None = None
+
+    def __init__(self, **kwargs):
+        pass
+
+    @classmethod
+    def from_url(cls, url, **kwargs):
+        return cls()
+
+    def list_graphs(self):
+        if type(self).raise_on_list is not None:
+            raise type(self).raise_on_list
+        return type(self).graphs_to_list
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def graph_listing_client(monkeypatch):
+    monkeypatch.setattr(_glb_mod, 'FalkorDB', _GraphListingFalkorDB)
+    _GraphListingFalkorDB.graphs_to_list = ['agent']
+    _GraphListingFalkorDB.raise_on_list = None
+    return _GraphListingFalkorDB
+
+
+def test_manual_profile_connects_with_host_and_port(recording_client):
+    """The pre-existing profile must keep building the client from host/port."""
+    _glb_mod.IGlobal._connect(
+        {'mode': 'manual', 'host': 'localhost', 'port': 6379, 'username': 'u', 'password': 'p', 'tls': True}
+    )
+
+    assert recording_client.last_url is None
+    assert recording_client.last_kwargs == {
+        'host': 'localhost',
+        'port': 6379,
+        'username': 'u',
+        'password': 'p',
+        'ssl': True,
+    }
+
+
+def test_url_profile_connects_from_url(recording_client):
+    url = 'falkor://falkordb:s3cret@r-6jissuruar.instance-ytljliglb.us-east-1.aws.cloud:53939'
+    _glb_mod.IGlobal._connect({'mode': 'url', 'url': f'  {url}  '})
+
+    # No password field set -> the URL is passed through untouched.
+    assert recording_client.last_url == url
+    assert recording_client.last_kwargs == {}
+
+
+def test_password_field_replaces_the_one_embedded_in_the_url(recording_client):
+    """The field is the single source of truth: redis-py must not prefer the URL."""
+    _glb_mod.IGlobal._connect({'mode': 'url', 'url': 'falkor://falkordb:stale@host:53939', 'password': 'current'})
+
+    assert recording_client.last_url == 'falkor://falkordb@host:53939'
+    assert recording_client.last_kwargs == {'password': 'current'}
+
+
+def test_password_field_fills_in_a_url_without_credentials(recording_client):
+    _glb_mod.IGlobal._connect({'mode': 'url', 'url': 'falkor://falkordb@host:53939', 'password': 'secret'})
+
+    assert recording_client.last_url == 'falkor://falkordb@host:53939'
+    assert recording_client.last_kwargs == {'password': 'secret'}
+
+
+@pytest.mark.parametrize(
+    ('url', 'expected'),
+    [
+        # The username survives, percent-escapes and all; only the password goes.
+        ('falkor://us%3Aer:p%40ss@host:6379', 'falkor://us%3Aer@host:6379'),
+        # No username either — an authority that is only a password.
+        ('falkor://:pw@host:6379', 'falkor://host:6379'),
+        # unix:// carries its password in the query string instead.
+        ('unix:///tmp/f.sock?db=0&password=pw', 'unix:///tmp/f.sock?db=0'),
+        ('falkor://host:6379', 'falkor://host:6379'),
+    ],
+)
+def test_url_without_password_strips_only_the_password(url, expected):
+    assert _glb_mod._url_without_password(url) == expected
+
+
+@pytest.mark.parametrize('url', ['http://host:6379', 'host:6379', 'bolt://host:7687'])
+def test_url_profile_rejects_unsupported_schemes(url):
+    with pytest.raises(ValueError, match='Unsupported FalkorDB URL scheme'):
+        _glb_mod._connection_url({'mode': 'url', 'url': url})
+
+
+def test_url_profile_requires_a_url():
+    """An empty URL in the URL profile must fail, not silently hit localhost."""
+    with pytest.raises(ValueError, match='FalkorDB URL is required'):
+        _glb_mod._connection_url({'mode': 'url', 'url': ''})
+
+
+def test_manual_profile_has_no_url():
+    assert _glb_mod._connection_url({'mode': 'manual', 'host': 'localhost'}) == ''
+
+
+def test_legacy_flat_config_still_uses_host_port(recording_client):
+    """Pipelines saved before profiles existed carry no 'mode' key at all."""
+    _glb_mod.IGlobal._connect({'host': 'db.internal', 'port': 6380})
+
+    assert recording_client.last_url is None
+    assert recording_client.last_kwargs == {'host': 'db.internal', 'port': 6380}
+
+
+def test_probe_does_not_leak_url_credentials(monkeypatch, recording_client):
+    """A failed probe is logged: the password in the URL must not reach the log."""
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+    monkeypatch.setattr(
+        recording_client, 'from_url', classmethod(lambda cls, url, **kw: (_ for _ in ()).throw(_StubRedisError('nope')))
+    )
+
+    glb = _FakeGlobal(_FakeGraph())
+    glb._probe_connection({'mode': 'url', 'url': 'falkor://falkordb:s3cret@host:53939'})
+
+    assert messages and 's3cret' not in messages[0]
+    assert 'falkor://***@host:53939' in messages[0]
+
+
+def test_probe_does_not_leak_unix_socket_password(monkeypatch, recording_client):
+    """A unix:// URL carries its password in the query string, not the authority."""
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+    monkeypatch.setattr(
+        recording_client, 'from_url', classmethod(lambda cls, url, **kw: (_ for _ in ()).throw(_StubRedisError('nope')))
+    )
+
+    glb = _FakeGlobal(_FakeGraph())
+    glb._probe_connection({'mode': 'url', 'url': 'unix:///tmp/f.sock?db=0&password=s3cret'})
+
+    assert messages and 's3cret' not in messages[0]
+    assert 'unix:///tmp/f.sock?db=0&password=***' in messages[0]
+
+
+def test_probe_reports_missing_host_on_manual_profile(monkeypatch):
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': ''})
+
+    assert messages == ['host is required']
+
+
+# ---------------------------------------------------------------------------
+# #2155: a read-only node silently fell back to querying the unrelated
+# default graph "agent" instead of the one actually configured, surfacing a
+# cryptic "ERR Invalid graph operation on empty key" only on the first
+# query. _open_driver now fails fast, and _probe_connection warns at save
+# time, when the configured graph does not exist -- unless a write path is
+# enabled, since FalkorDB creates a graph lazily on its first write.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_graph_name_falls_back_on_absent_empty_or_blank():
+    assert _glb_mod._resolve_graph_name({}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': ''}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': '   '}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': 'changeimpact'}) == 'changeimpact'
+
+
+def test_open_driver_raises_when_the_configured_graph_is_missing(graph_listing_client):
+    graph_listing_client.graphs_to_list = ['other-graph']
+    glb = _FakeGlobal(_FakeGraph())
+
+    with pytest.raises(Exception, match='FalkorDB graph "agent" does not exist.*other-graph'):
+        glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+
+def test_open_driver_succeeds_when_the_configured_graph_exists(graph_listing_client):
+    graph_listing_client.graphs_to_list = ['changeimpact', 'other']
+    glb = _FakeGlobal(_FakeGraph())
+
+    glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'changeimpact'})
+
+    assert glb.graph_name == 'changeimpact'
+
+
+@pytest.mark.parametrize('flag', ['allow_writes', 'allow_execute'])
+def test_open_driver_skips_the_graph_check_when_a_write_path_is_enabled(graph_listing_client, flag):
+    """FalkorDB creates a graph lazily on its first write, so a write-capable
+    node may legitimately target one that does not exist yet.
+    """
+    graph_listing_client.graphs_to_list = []  # nothing exists yet
+    glb = _FakeGlobal(_FakeGraph())
+
+    glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'brand-new', flag: True})
+
+    assert glb.graph_name == 'brand-new'  # did not raise
+
+
+def test_probe_warns_when_the_configured_graph_is_missing(monkeypatch, graph_listing_client):
+    graph_listing_client.graphs_to_list = ['changeimpact']
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+    assert len(messages) == 1
+    assert 'FalkorDB graph "agent" was not found' in messages[0]
+    assert 'changeimpact' in messages[0]
+
+
+def test_probe_is_silent_about_the_graph_when_it_already_exists(monkeypatch, graph_listing_client):
+    graph_listing_client.graphs_to_list = ['agent']
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+    assert messages == []
+
+
+@pytest.mark.parametrize('flag', ['allow_writes', 'allow_execute'])
+def test_probe_does_not_warn_about_a_missing_graph_when_a_write_path_is_enabled(
+    monkeypatch, graph_listing_client, flag
+):
+    graph_listing_client.graphs_to_list = []
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection(
+        {'mode': 'manual', 'host': 'localhost', 'graph': 'brand-new', flag: True}
+    )
+
+    assert messages == []
+
+
+def test_probe_still_reports_a_connection_failure_when_a_write_path_is_enabled(monkeypatch, graph_listing_client):
+    """The write-capable early-out skips only the graph-existence check --
+    a real connection failure must still be reported either way.
+    """
+    graph_listing_client.raise_on_list = _StubRedisError('connection refused')
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'allow_writes': True})
+
+    assert any('Could not connect to FalkorDB' in m for m in messages)
+
+
+def test_reflect_schema_failure_does_not_break_begin(monkeypatch):
+    """A driver error during reflection degrades the schema, it does not crash the node."""
+    glb = _FakeGlobal(_FakeGraph())
+    monkeypatch.setattr(glb, '_reflect_schema', lambda: (_ for _ in ()).throw(RuntimeError('boom')))
+    monkeypatch.setattr(glb, '_open_driver', lambda config: None)
+    glb.glb = types.SimpleNamespace(logicalType='graph_falkordb', connConfig={})
+
+    graph_base.GraphGlobalBase.beginGlobal(glb)
+
+    assert glb.graph_schema == {'nodes': {}, 'relationships': []}

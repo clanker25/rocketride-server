@@ -1,0 +1,253 @@
+# db_mysql
+
+A RocketRide database node for asking natural-language questions of MySQL and
+inserting structured answers into a MySQL table. Choose it when your pipeline
+needs both MySQL query tools and an `answers`-lane destination for rows.
+
+## About MySQL
+
+MySQL is the database product this node connects to. This implementation uses
+SQLAlchemy with the PyMySQL driver to connect and reflect MySQL table schemas.
+
+## What it does
+
+On the `questions` lane, the node gives a connected LLM its cached schema
+snapshot (the start-up reflection until `refresh_schema` replaces it) and
+optional database description, validates generated `SELECT` queries with
+`EXPLAIN`, and emits results as a table, text, or answer. On the `answers`
+lane, it inserts structured rows into the configured table, creating that table
+from the first incoming data shape when necessary. It is also an agent tool
+node, making it a better fit than a pipeline-only SQL destination when an agent
+must decide what to retrieve or needs gated raw SQL.
+
+## Connections
+
+| Connection | Required | Description |
+| --- | --- | --- |
+| `llm` | no | LLM used to craft SQL queries from questions; not needed for execute (raw SQL) |
+
+## Lanes
+
+| Lane in | Lane out | Description |
+| --- | --- | --- |
+| `answers` | — | Insert structured answer data into the configured table. |
+| `questions` | `table` | Send query results as a Markdown table. |
+| `questions` | `text` | Send the result as text. |
+| `questions` | `answers` | Send the result as an answer. |
+
+## As a tool
+
+The registered tool names are bare method names; this node declares no
+configurable server-name prefix.
+
+| Function | Description |
+| --- | --- |
+| `get_data` | Generate a safe `SELECT` from a question and execute it. |
+| `get_schema` | Return the schema snapshot the node currently holds. |
+| `refresh_schema` | Re-read the schema, replace the cache, and return it. |
+| `get_sql` | Generate a safe `SELECT` without executing it. |
+| `execute` | Run raw SQL, bypassing LLM translation and the safety check. |
+| `begin` | Open a transaction and return its session ID. |
+| `commit` | Commit and close a transaction session. |
+| `rollback` | Roll back and close a transaction session. |
+| `dialect` | Return `{ "dialect": "mysql" }`. |
+
+`get_data` and `get_sql` require a non-empty `question`; `get_data` accepts an
+optional `limit`, defaulting to 250 and clamped to 1–25,000. `get_schema`
+accepts an optional `table`; an unknown table returns an `error` field, while
+omitting it returns all reflected tables. `get_schema` serves the snapshot the
+node currently holds — the reflection taken at start-up, replaced by each
+`refresh_schema` call — so DDL run since the last reflection is invisible to
+it until the next one. `refresh_schema` takes no arguments, re-reflects the
+database, replaces that database-wide cache, and returns the `get_schema`
+shape plus a `refreshed_at` UTC timestamp. It also rebuilds the configured
+table's cached column map from the same walk, which is how the next
+`answers`-lane insert picks up added or dropped columns instead of continuing
+against the start-up shape; no second reflection is needed. A configured table
+the walk did not find leaves that map empty, and the next insert reflects the
+table itself if it has come back. If the database refuses the reflection — a revoked grant, a lock
+timeout, a table dropped mid-walk — the call fails with `Schema refresh
+failed:` followed by the database's own message (for a table that disappeared
+mid-walk, the name of that table) and leaves both cached schemas exactly as
+they were. `get_data` returns
+`{valid, rows, sql, row_limit}` on success; a non-database question returns
+`{valid: false, answer}`, and a query execution failure returns
+`{valid: false, error, sql, rows: []}`.
+
+`execute` requires non-empty `sql` and optionally accepts a transaction
+`session_id`, positional values for `$1`, `$2`, and so on, and a `row_mode`:
+`object` (default) keys rows by column name, while `array` returns positional
+arrays that preserve column order and keep duplicate column names — the shape
+ORM drivers such as Drizzle require. It returns `{rows, affected_rows}`. A
+failed statement raises `SQL execution failed:` followed by the database's own
+primary message, identically with and without a `session_id`. What is removed
+is the tail: SQLAlchemy's `[SQL: ...]` / `[parameters: ...]` echo. The primary
+sentence itself is passed through as MySQL wrote it: a `SIGNAL`'s text comes
+back whole, a constraint error names the value that collided, and a syntax
+error (1064) quotes the rest of the statement from where the parser stopped,
+up to 80 characters (`near '...' at line N`), so a value bound after that point
+can appear in it (the driver interpolates bound values client-side; see
+#2732). That is deliberate: reaching this tool at all requires **Allow direct
+query execution**, and a caller who has it can read the same data with a
+`SELECT`. The full text is written to the server log. For ClickHouse, use the
+`db_clickhouse` node: pointed at ClickHouse's MySQL interface, this node
+returns ClickHouse's error text as is, which can repeat the statement and its
+bound values. `begin` takes no arguments and returns `{session_id}`; `commit`
+and `rollback` require that ID and return
+`{ok: true}`. These four write-capable operations fail when **Allow direct
+query execution** is off; unknown or expired session IDs also fail. Invalid
+tool input raises an error.
+
+A failed statement does **not** roll the session back. The session stays open
+and MySQL leaves its transaction usable, so a later `commit` persists the work
+that preceded the error — recovery is the client's responsibility. Issue
+`rollback` to discard the session, or `rollback to savepoint <name>` to undo
+only the failed portion and continue; the idle reaper is the backstop for
+sessions that are abandoned instead. (Postgres differs: it aborts the whole
+transaction on any failure, so the node refuses the later commit rather than
+letting it degrade to a silent rollback.)
+
+## Configuration
+
+Start with the default connection values, then set the database endpoint and
+target table. The generated schema below is the complete field reference;
+describe the data well and leave direct execution disabled unless a trusted
+caller truly needs it.
+
+### Database description
+
+This text is added to every LLM SQL-generation request alongside the reflected
+schema. Describe the data's purpose, meanings, and conventions when names
+alone are ambiguous—for example, explain whether `amount` is a gross or net
+value. Change it when queries choose the wrong interpretation; it does not
+replace the actual table and column information collected at startup.
+
+### Connection and target table
+
+Set the host, user, password, database, and table to the MySQL server and
+target table. User, password, and database are URL-encoded before the PyMySQL
+DSN is built, so reserved characters in those values are safe. The node
+reflects the complete database for query context at startup, then separately
+checks the target table: if it is absent, it warns and waits to create it from
+the first incoming `answers` data.
+
+### Max validation attempts
+
+The default of five gives the LLM several chances to repair a query rejected by
+`EXPLAIN`. Lower it when fast failure matters more than recovery; raise it for
+complex schemas that need another correction cycle. The configuration field
+allows 1–20, while the runtime accepts any positive configured number and
+falls back to five for an invalid value. After the final rejected attempt it
+returns the last generated result, so retries improve generated SQL but do not
+guarantee that a subsequent execution will succeed.
+
+### Allow direct query execution
+
+Leave this off by default. When on, the `execute`, `begin`, `commit`, and
+`rollback` tools can bypass LLM translation and the generated-query safety
+check. A raw call without a session uses a transaction that commits on success;
+use `begin` followed by `execute` with its session ID when several statements
+must share a transaction. Enable it only for trusted callers that need writes
+or dialect-specific SQL; use `get_data` for ordinary read-only retrieval.
+
+## Limitations
+
+This node declares the `noremote` capability, so it cannot run in a remote
+execution environment. It requires network reachability to the MySQL server
+from the environment where the pipeline runs.
+
+## Notes
+
+### Generated-query safety
+
+For LLM-generated SQL, the node only accepts `SELECT`, optionally preceded by
+`EXPLAIN`. It strips comments, checks every semicolon-separated statement, and
+rejects CTEs plus `SELECT ... INTO OUTFILE` or `INTO DUMPFILE`. It validates
+each safe candidate with `EXPLAIN` and feeds database errors to the LLM for the
+next attempt. If the LLM decides a question is not a database query, its text
+answer is emitted instead of executing SQL.
+
+### Inserting answers
+
+Incoming JSON rows are matched to the target schema case-insensitively; unknown
+incoming keys are ignored. A schema column a row does not carry becomes `NULL`,
+unless the database fills it in itself: an `AUTO_INCREMENT` primary key or a
+column with a `DEFAULT` is left out of the statement so the server supplies
+the value rather than receiving an explicit `NULL`, which would override the
+default. A `null` supplied for any column the database fills in itself -- a
+generated primary key, a `DEFAULT` -- counts as not carried, because on this
+lane the sender is an upstream node that may emit every schema key with `null`
+for the ones it has no value for, while a `null` on a column with nothing
+behind it is inserted as `NULL` as given. A primary key MySQL is not known to
+generate (a composite key, a text key with no default) that a row omits is left
+out of the statement as well, and MySQL decides what to do with it. Lists and
+dictionaries are serialized as JSON strings and booleans as `0` or `1`. For a
+new table, the node adds an auto-increment `id` primary key and infers integer,
+float, datetime, or text columns; short text becomes `VARCHAR(255)` and longer
+text becomes `TEXT`.
+
+Why the node does not refuse such a row: whether the database generates a key
+is read from reflected metadata, which does not describe triggers. A `CHAR(36)`
+primary key filled by a `BEFORE INSERT` trigger -- the usual UUID idiom before
+MySQL 8.0.13 -- looks exactly like a text key with no default, so refusing the
+row meant the trigger never ran. Leaving the column out of the statement is
+what lets it run. Binding `NULL` is not the alternative: a `BEFORE INSERT`
+trigger fires before the not-null check and would fill a bound `NULL`, but an
+explicit `NULL` overrides a column default, and where no trigger exists it is a
+not-null violation -- omitting the column is the one shape that works for a
+default, a trigger and a generated key alike. Where nothing fills the key in,
+MySQL refuses the row itself (`Field '<name>' doesn't have a default value`, or
+a not-null error) in strict mode -- `STRICT_TRANS_TABLES`, the default since
+MySQL 5.7 -- and every row of the batch is rolled back. Under a non-strict
+`sql_mode` MySQL stores the implicit default instead, so an omitted `CHAR` key
+lands as an empty string and the next such row collides with a duplicate-key
+error. SQLAlchemy emits a Python `SAWarning` (once per column per process under
+the default filter) for a statement that leaves a primary key unbound; that is
+expected here.
+
+A failed insert raises `Insert into "<table>" failed:` followed by MySQL's own
+primary message, with SQLAlchemy's statement and parameter echo stripped the
+same way `execute` strips it. The `answers` lane logs that error rather than
+returning it, so the server log is where a batch that did not land is
+explained.
+
+### Connection checks and transactions
+
+Saving configuration probes the server with `SELECT 1` using a five-second
+connect timeout and reports the driver error when it cannot connect. The
+runtime connection pool allows 30 concurrent connections. It retains at most
+20 transaction sessions by default, rolls idle ones back after five minutes,
+and rolls all open sessions back when the pipeline closes.
+
+## Upstream docs
+
+- [MySQL documentation](https://dev.mysql.com/doc/)
+
+---
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `mysql.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
+| `mysql.database` | `string` | **Database name**<br/>Name of database | `"database"` |
+| `mysql.db_description` | `string` | **Database description**<br/>What is this database used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
+| `mysql.host` | `string` | **MySQL host**<br/>Host name or IP address of the MySQL server | `"localhost"` |
+| `mysql.max_attempts` | `integer` | **Max validation attempts**<br/>Maximum number of times to re-ask the LLM if EXPLAIN rejects the generated SQL | `5` |
+| `mysql.password` | `string` | **Password**<br/>Password to connect to the MySQL server |  |
+| `mysql.profile` | `string` |  | `"default"` |
+| `mysql.table` | `string` | **Table name**<br/>Name of table | `"table"` |
+| `mysql.user` | `string` | **User**<br/>User to connect to the MySQL server | `"root"` |
+
+## Dependencies
+
+- `pymysql` `>=1.2.0`
+- `cryptography`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/db_mysql)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

@@ -1,0 +1,21 @@
+# contract-check: skip-install  reason: ~400 MB of ASR deps (ctranslate2, av, onnxruntime) for an opt-in feature. PR lane skips; nightly --install-all installs and verifies.
+# Requirements for Whisper loader
+# Direct imports only
+
+faster-whisper
+# ctranslate2 is faster-whisper's inference engine. 4.7.x with the CUDA 12.8 runtime
+# corrupts the heap in cuBLAS 12.8.4, so the loader's GPU probe refuses that pair and
+# Whisper silently runs on the CPU. The runtime installer compiles these files into the
+# engine cache and keeps whatever version that cache already holds, so a host that once
+# resolved 4.7.1 stayed on it although nodes/src/nodes/constraints.lock had moved on.
+# The floor forces the resolver past it; the ceiling keeps the next major out (#2498).
+ctranslate2>=4.8,<5
+numpy
+# onnxruntime is an indirect dep (via faster-whisper), not imported here.
+# One shared version across every onnxruntime consumer, so the ~200 MB runtime installs once.
+# rtmlib/gliner declare it unpinned and faster-whisper wants <2,>=1.14 -- the exact number is
+# ours to choose, but all these files must agree. 1.20.1 was withdrawn from PyPI for the -gpu
+# build (the CPU build of it survives), which is why this moved; 1.20.2 is the mirror trap --
+# it exists only for -gpu, so pinning it would break macOS.
+onnxruntime-gpu==1.22.0; platform_system != 'Darwin'
+onnxruntime==1.22.0; platform_system == 'Darwin'

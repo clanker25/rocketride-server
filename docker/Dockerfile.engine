@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# Dockerfile.engine — RocketRide Engine container
+#
+# MIT License
+# Copyright (c) 2026 RocketRide
+#
+# Built FROM the engine-base image of the same version:
+#
+#   docker build -f docker/Dockerfile.engine-base -t rocketride/engine-base:<version> .
+#   docker build -f docker/Dockerfile.engine \
+#     --build-arg ENGINE_BASE=rocketride/engine-base:<version> .
+# ---------------------------------------------------------------------------
+
+ARG ENGINE_BASE=rocketride/engine-base:local
+FROM ${ENGINE_BASE}
+
+COPY --chown=rocketride:rocketride dist/server/static/ /opt/rocketride/static/
+
+# The server's task data persists; engine-base created it writable. See #1295.
+VOLUME /opt/data
+
+EXPOSE 5565
+
+# /version is public; /ping returns 401 behind the auth gate. See #1295.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:5565/version || exit 1
+
+ENTRYPOINT ["./engine", "./ai/eaas.py", "--host=0.0.0.0"]

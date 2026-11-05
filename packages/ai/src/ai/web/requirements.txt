@@ -1,0 +1,10 @@
+fastapi
+# 1.5.0 is the first release whose GZipMiddleware leaves 206 Partial Content alone.
+starlette>=1.5.0
+uvicorn
+python-multipart
+aiofiles
+websockets
+python_dotenv
+
+

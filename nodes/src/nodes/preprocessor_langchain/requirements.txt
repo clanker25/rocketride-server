@@ -1,0 +1,14 @@
+# Preprocessor: LangChain
+langchain
+langchain-text-splitters
+
+# LangChain deps
+langchain-core
+
+# No transformers stack: chunk length is len() or an estimate, and the NLTK
+# and spaCy splitters install their own requirements (nltk.txt, spacy.txt).
+# accelerate here pulled a CUDA torch into every run.
+pyyaml
+filelock
+regex
+tqdm

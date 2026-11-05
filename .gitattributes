@@ -1,0 +1,40 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Patch files MUST use LF line endings (critical for vcpkg)
+*.patch text eol=lf
+
+# Shell scripts should use LF
+*.sh text eol=lf
+
+# Python files should use LF
+*.py text eol=lf
+
+# Markdown files should use LF (node doc generator writes LF; prevents spurious diffs on Windows)
+*.md text eol=lf
+
+# Windows batch files should use CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Keep these binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.zip binary
+*.tar.gz binary
+*.whl binary
+
+
+.github/workflows/*.lock.yml linguist-generated=true merge=ours
+# ANTLR-generated openCypher/agtype parsers (committed so devs don't need Java);
+# vendored apache/age agtype decoder. Collapsed in diffs — see the age layer README.
+packages/ai/src/ai/common/graph/age/_cypher/gen/** linguist-generated=true
+packages/ai/src/ai/common/graph/age/_agtype/gen/** linguist-generated=true
+packages/ai/src/ai/common/graph/age/_agtype/** linguist-vendored=true

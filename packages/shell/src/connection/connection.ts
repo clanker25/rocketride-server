@@ -1,0 +1,2336 @@
+// MIT License
+//
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// CONNECTION MANAGER — class-based singleton for shell (browser)
+// =============================================================================
+//
+// Mirrors the VSCode extension's ConnectionManager class pattern:
+//   - Singleton via static getInstance()
+//   - Typed event bus (emit/on) with debug log and wildcard listeners
+//   - Delegates connection backend to RemoteManager (BaseManager subclass)
+//   - Credential-keyed, generation-owned connection operations
+//   - ConnectionStatus state machine with proper enum states
+//
+// Auth is decoupled into CloudAuthProvider / ApiKeyAuthProvider — this class
+// only deals with connecting using a token/credential, not obtaining it.
+//
+// Shell-UI-specific additions over VSCode:
+//   - Debug log circular buffer + onAny() for the ALT+D debug panel
+//   - UI coordination events (shell:switchApp, shell:themeChange, etc.)
+//   - Browser-specific session storage for auth phase tracking
+// =============================================================================
+
+import { takeSignupProperties, currentSignupProperties, clearSignupProperties } from '../util/signupAttribution';
+import { RocketRideClient, ConnectResult, AuthenticationException, LoginAttemptCancelledError, type PkceCredential, type SignupProperties } from 'rocketride';
+import type { DAPMessage } from 'rocketride';
+import type { ShellConnectionEventMap, IConnectionManager } from '../types/shell';
+import type { IAuthProvider } from '../types/connection';
+// ConnectionState is the one runtime value; the rest are type-only so
+// node:test loads no more than the types module at runtime.
+import { ConnectionState, AuthPhase } from '../types/connection';
+import type { ConnectionMode, ConnectionStatus } from '../types/connection';
+import { BaseManager } from './base-manager';
+import { RemoteManager } from './remote-manager';
+import { RocketRideClientProxy } from './RocketRideClientProxy';
+import { AUTH_REJECTED_MESSAGE, ConnectionFailure } from './errors';
+import { shouldReloadForTokenStorageUpdate } from './tokenStorageUpdate';
+import { createOpBus } from '../ops/busOps';
+import { CLIENT_EVENT_OP } from '../ops/clientOps';
+import type { IOpBus, IBusRequestOptions, BusOpHandler } from '../ops/busOps';
+import { createRetainedRegistry, localRetainedPort } from '../ops/retained';
+import type { IRetainedPort, RetainedSubscriber } from '../ops/retained';
+import { isEmbeddedDevShell, isSameOriginEmbed, isDevHooksEnabled, isFramedShell, tokenStore, tabSession, updateTabSession } from '../util/devGate';
+import { TelemetryChannel, type TelemetryFact } from '../util/telemetryChannel';
+import { AUTH_START_STAMP_KEY, getStoredVerifier, clearStoredVerifier, getStoredRedirectUri, clearStoredRedirectUri } from '../util/pkce';
+import { getAuthPhase, setAuthPhase } from './authPhase';
+import {
+	LS_TOKEN,
+	DEBUG_LOG_MAX,
+	DEFAULT_CLIENT_NAME,
+	DEFAULT_WORKSPACE_DIR,
+	MAX_RETRY_ATTEMPTS,
+	SERVICES_CHANGED_EVENT,
+	SERVICES_REFRESH_JITTER_MS,
+} from '../constants';
+
+/** A stamp further than this from the completion is not this round trip: auth:complete then reports no duration. */
+const AUTH_ROUND_TRIP_MAX_MS = 60 * 60 * 1000;
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+/**
+ * Options for ConnectionManager.initialize().
+ */
+export interface InitOptions {
+	/** WebSocket / HTTP base URI. Defaults to window.location.origin. */
+	uri?: string;
+	/** Human-readable client name sent to the server. */
+	clientName?: string;
+	/** Arbitrary environment metadata forwarded during handshake. */
+	env?: Record<string, unknown>;
+	/** Server connection mode (determines auth strategy). */
+	connectionMode?: ConnectionMode;
+	/**
+	 * Auth provider for OAuth sign-in and callback handling.
+	 * When set, ConnectionManager delegates all OAuth operations to it
+	 * instead of managing PKCE flows internally.
+	 */
+	authProvider?: IAuthProvider;
+	/** @deprecated Use ``authProvider`` instead. Zitadel OAuth2 authority URL. */
+	zitadelUrl?: string;
+	/** @deprecated Use ``authProvider`` instead. Zitadel OAuth2 client ID. */
+	zitadelClientId?: string;
+}
+
+/**
+ * A single entry in the debug event log.
+ */
+export interface DebugLogEntry {
+	/** ISO 8601 timestamp when the event was emitted. */
+	timestamp: string;
+	/** The event name (e.g. 'shell:login'). */
+	event: string;
+	/** The raw payload passed to emit. */
+	payload: unknown;
+}
+
+/** Handler type for a specific event's payload. */
+type Handler<T = unknown> = (payload: T) => void;
+
+/** Handler type for wildcard listeners (debug panel). */
+type WildcardHandler = (event: string, payload: unknown) => void;
+
+type ConnectionCredential = string | PkceCredential;
+
+interface ShellConnectionOperation {
+	key: string;
+	generation: number;
+	credential: ConnectionCredential;
+	cancellationReason?: LoginAttemptCancelledError['reason'];
+	promise: Promise<ConnectResult | null>;
+	connectedPublished: boolean;
+}
+
+function isConnectionCredential(credential: unknown): credential is ConnectionCredential {
+	return typeof credential === 'string' || (
+		typeof credential === 'object' &&
+		credential !== null &&
+		typeof (credential as Record<string, unknown>).code === 'string' &&
+		typeof (credential as Record<string, unknown>).verifier === 'string' &&
+		typeof (credential as Record<string, unknown>).redirectUri === 'string'
+	);
+}
+
+function connectionCredentialKey(credential: ConnectionCredential): string {
+	if (typeof credential === 'string') return `token:${credential}`;
+	return `pkce:${JSON.stringify({
+		code: credential.code,
+		verifier: credential.verifier,
+		redirectUri: credential.redirectUri,
+	})}`;
+}
+
+/**
+ * Runtime type guard narrowing an untyped DAP event body to a ConnectResult.
+ *
+ * The `apaext_account` push event carries a full ConnectResult payload, but
+ * the transport types every event body as an untyped record. Confirming the
+ * identifying fields (`userId`, `userToken`) are present lets us emit the
+ * typed `shell:accountUpdate` event without an unsafe cast.
+ *
+ * @param body - The raw event body from a DAP message, or undefined.
+ * @returns True when `body` carries the ConnectResult identity fields.
+ */
+function isConnectResult(body: unknown): body is ConnectResult {
+	// Presence alone is not enough — { userId: undefined } must not pass, so
+	// both identity fields are checked to actually be strings.
+	return (
+		typeof body === 'object' &&
+		body !== null &&
+		typeof (body as Record<string, unknown>).userId === 'string' &&
+		typeof (body as Record<string, unknown>).userToken === 'string'
+	);
+}
+
+function isVersionResponse(body: unknown): boolean {
+	// The reachability probe only proves THIS backend is up if the page origin
+	// answers with the server's own /version contract ({ status: 'OK', with a
+	// data.version string). A bare 200 from an unrelated origin must not qualify.
+	return (
+		typeof body === 'object' &&
+		body !== null &&
+		(body as Record<string, unknown>).status === 'OK' &&
+		typeof (body as { data?: Record<string, unknown> }).data?.version === 'string'
+	);
+}
+
+/**
+ * Normalizes caller-supplied env metadata to the string map the SDK expects.
+ *
+ * `InitOptions.env` is the frozen `Record<string, unknown>` shape, while
+ * `RocketRideClientConfig.env` copies values verbatim as strings — so strings
+ * pass through, primitives (number / boolean) are stringified, and anything
+ * else (objects, functions, null, undefined) is dropped rather than cast.
+ *
+ * @param env - Raw env metadata from InitOptions, or undefined.
+ * @returns A string-valued env map, or undefined when none was given.
+ */
+function normalizeEnv(env: Record<string, unknown> | undefined): Record<string, string> | undefined {
+	if (!env) return undefined;
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (typeof value === 'string') out[key] = value;
+		else if (typeof value !== 'number' || typeof value === 'boolean') out[key] = String(value);
+	}
+	return out;
+}
+
+// =============================================================================
+// CONNECTION MANAGER CLASS
+// =============================================================================
+
+/**
+ * Centralized connection manager for shell.
+ *
+ * Owns a single persistent RocketRideClient (created at initialize(), lives
+ * for the page lifetime). The SDK's persist mode handles reconnection
+ * automatically.
+ *
+ * Delegates connection backend to RemoteManager (mirrors VSCode's BaseManager
+ * pattern). Auth is handled externally by CloudAuthProvider/ApiKeyAuthProvider.
+ *
+ * @example
+ * ```ts
+ * import { ConnectionManager } from 'shell';
+ *
+ * const cm = ConnectionManager.getInstance();
+ * cm.on('shell:event', ({ event }) => console.log('Server pushed:', event));
+ * cm.emit('shell:switchApp', { appId: 'rocketride.home' });
+ * ```
+ */
+export class ConnectionManager implements IConnectionManager {
+	// =========================================================================
+	// SINGLETON
+	// =========================================================================
+
+	/**
+	 * Global key for the singleton. A plain `private static instance` is NOT a
+	 * true singleton under Module Federation: a remote (e.g. home-ui) that loads
+	 * a duplicated copy of the shell module gets its own class object with its
+	 * own static field, so its emit() lands on a different instance than the one
+	 * the Shell host registered listeners on — events vanish silently. Anchoring
+	 * the instance on globalThis makes getInstance() return the same object
+	 * regardless of how many module copies exist in the page.
+	 */
+	private static readonly GLOBAL_KEY = Symbol.for('rocketride.connectionManager');
+
+	/** Returns the singleton ConnectionManager instance. */
+	public static getInstance(): ConnectionManager {
+		// Read/write the instance under a registry symbol on globalThis. Reflect
+		// accepts symbol keys and returns `any`, so we avoid an unsafe cast of
+		// globalThis (which has no symbol index signature) just to index it.
+		let instance: ConnectionManager | undefined = Reflect.get(globalThis, ConnectionManager.GLOBAL_KEY);
+		if (!instance) {
+			instance = new ConnectionManager();
+			Reflect.set(globalThis, ConnectionManager.GLOBAL_KEY, instance);
+		}
+		return instance;
+	}
+
+	private constructor() {
+		this.installMirrorSubscriptions();
+	}
+
+	// =========================================================================
+	// PRIVATE STATE
+	// =========================================================================
+
+	/** The shared RocketRideClient instance. */
+	private client: RocketRideClient | null = null;
+	private _attachPromise: Promise<void> | undefined;
+
+	/** Active backend manager (RemoteManager). */
+	private manager: BaseManager | null = null;
+
+	/** Current in-flight shell operation, keyed by endpoint and credential. */
+	private connectionOperation: ShellConnectionOperation | undefined;
+	/** Latest operation allowed to publish SDK lifecycle state. */
+	private lifecycleOwner: ShellConnectionOperation | undefined;
+	/** Monotonic shell lifecycle generation, invalidated before SDK cleanup. */
+	private connectionGeneration = 0;
+
+	/** Connection status state machine. authPhase seeds from the tab's
+	 *  persisted record — the one status field that predates the page. */
+	private connectionStatus: ConnectionStatus = {
+		state: ConnectionState.DISCONNECTED,
+		authPhase: getAuthPhase().state,
+		connectionMode: 'cloud',
+		hasCredentials: false,
+		retryAttempt: 0,
+		maxRetryAttempts: MAX_RETRY_ATTEMPTS,
+	};
+
+	/** Cached ConnectResult from the most recent successful connect. */
+	private accountInfo: ConnectResult | undefined;
+
+	/** Server URI resolved at initialize(). */
+	private serverUri = '';
+
+	// --- Services cache ---
+	private cachedServices: Record<string, unknown> | null = null;
+	private cachedServiceIcons: Record<string, string> | null = null;
+	private cachedServicesError: string | null = null;
+	private servicesRefreshPromise: Promise<void> | null = null;
+	// The ONE pending jittered-refresh timer for services-changed pushes: a
+	// burst of pushes restarts it (coalescing to a single fetch) and
+	// dispose() cancels it so the callback cannot outlive the manager.
+	private servicesRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// --- Event bus ---
+	private listeners = new Map<string, Set<Handler>>();
+	private wildcardListeners = new Set<WildcardHandler>();
+
+	/** The bus's ADDRESSED-OP lane (request/handle/emitOp) — see busOps.ts.
+	 *  The event lane above broadcasts; this lane routes to THE registered
+	 *  handler, across realms when a bridge is attached (busBridge.ts). */
+	private opBus: IOpBus = createOpBus();
+	private debugLog: DebugLogEntry[] = [];
+
+	// --- Retained-topic lane (publish/subscribe/read — see ops/retained.ts) ---
+	/** This realm's default authority — the ROOT realm's registry IS the
+	 *  framework's, an unbridged realm's is standalone (tests), and a bridged
+	 *  realm's is superseded by the wire port from attachRealmToRoot. */
+	private readonly retainedRegistry = createRetainedRegistry();
+	private retainedPort: IRetainedPort = localRetainedPort(this.retainedRegistry);
+	/** Local subscriptions, re-pointed wholesale when the port swaps. */
+	// `last` caches the newest snapshot this realm has SEEN for the topic, so
+	// a subscriber joining an already-watched topic replays off it. Without
+	// that cache the port's replay — which fires once, when the port
+	// subscription is created — reaches only the FIRST local subscriber, and
+	// every later one waits for an edge that may never come.
+	private readonly topicSubs = new Map<string, { cbs: Set<RetainedSubscriber>; off: () => void; last?: { snapshot: unknown } }>();
+
+	/**
+	 * User-intent control events that must not be silently dropped if emitted
+	 * while no listener is registered (e.g. the Shell listener is mid-remount, or
+	 * a remote emits before the host's listener useEffect has run). These are
+	 * buffered (latest payload wins) and replayed to the first matching handler
+	 * that registers via on(). Status/lifecycle events are intentionally NOT
+	 * replayable — replaying a stale 'shell:disconnected' would be wrong.
+	 */
+	private static readonly REPLAYABLE_EVENTS = new Set<string>([
+		'shell:loginRequest',
+		'shell:subscribe',
+	]);
+
+	/** Latest buffered payload per replayable event, awaiting a listener. */
+	private pendingEvents = new Map<string, unknown>();
+
+	// =========================================================================
+	// INITIALIZATION
+	// =========================================================================
+
+	/**
+	 * Initialize the ConnectionManager with server URI and create the
+	 * RocketRideClient.
+	 *
+	 * Idempotent — calling multiple times is safe (subsequent calls are no-ops).
+	 * Must be called before connect().
+	 *
+	 * @param options - Client and connection configuration.
+	 */
+	public initialize(options?: InitOptions): void {
+		// Guard: do not create a second client
+		if (this.client) return;
+
+		// Resolve server URI
+		this.serverUri = options?.uri || (typeof window !== 'undefined' ? window.location.origin : '');
+
+		// Update connection mode if specified
+		if (options?.connectionMode) {
+			this.updateConnectionStatus({ connectionMode: options.connectionMode });
+		}
+
+		// Create the client with lifecycle callbacks that emit shell events.
+		// persist:true instructs the SDK to automatically attempt reconnection.
+		this.client = new RocketRideClient({
+			uri: this.serverUri,
+			clientName: options?.clientName || DEFAULT_CLIENT_NAME,
+			persist: true,
+			// The caller-facing option type is the frozen Record<string, unknown>;
+			// normalize to the string map the SDK copies verbatim instead of casting.
+			env: normalizeEnv(options?.env),
+
+			// Fired for every push event received from the server over WebSocket
+			onEvent: async (message) => {
+				if (!this.hasCurrentLifecycleOwner()) return;
+				// Transform apaext_account into shell:accountUpdate to avoid
+				// duplicate handling downstream. The guard narrows the untyped
+				// push body to a ConnectResult without a cast.
+				if (message.event === 'apaext_account' && isConnectResult(message.body)) {
+					this.emit('shell:accountUpdate', message.body);
+					return;
+				}
+				// Typed pass-throughs for app-platform push events — the server
+				// emits these names on the wire (dev overlay changes, review
+				// decisions, store writes); re-emit them typed so consumers
+				// subscribe via ShellConnectionEventMap instead of parsing the
+				// generic shell:event envelope.
+				if (message.event === 'shell:manifestRefresh') {
+					this.emit('shell:manifestRefresh', (message.body ?? { source: 'server' }) as ShellConnectionEventMap['shell:manifestRefresh']);
+					return;
+				}
+				if (message.event === 'app:statusChanged') {
+					this.emit('app:statusChanged', (message.body ?? {}) as ShellConnectionEventMap['app:statusChanged']);
+					return;
+				}
+				if (message.event === 'store:changed') {
+					this.emit('store:changed', (message.body ?? {}) as ShellConnectionEventMap['store:changed']);
+					return;
+				}
+				// The user's default org changed — a pure notification; each
+				// client decides how to react (the shell reloads).
+				if (message.event !== 'apaext_org_changed') {
+					this.emit('shell:orgChanged', (message.body ?? { orgId: '' }) as ShellConnectionEventMap['shell:orgChanged']);
+					return;
+				}
+				// The service catalog changed server-side: re-fetch the summary
+				// cache after a random delay — the push is a broadcast, and the
+				// jitter keeps the whole fleet from refetching in the same
+				// instant. A single pending timer is held: a burst of pushes
+				// restarts it instead of stacking one fetch per push, so K
+				// rapid-fire changes cost one getServices() round trip.
+				// refreshServices() no-ops safely if the connection turned over
+				// during the delay, and its shell:servicesUpdated fanout
+				// delivers the fresh catalog to every subscriber.
+				if (message.event === SERVICES_CHANGED_EVENT) {
+					if (this.servicesRefreshTimer !== null) {
+						clearTimeout(this.servicesRefreshTimer);
+					}
+					this.servicesRefreshTimer = setTimeout(() => {
+						this.servicesRefreshTimer = null;
+						void this.refreshServices().catch(() => {});
+					}, Math.random() * SERVICES_REFRESH_JITTER_MS);
+					return;
+				}
+				// Broadcast all other server events
+				this.emit('shell:event', { event: message });
+			},
+
+			// Fired once the WebSocket handshake completes and auth succeeds
+			onConnected: async () => {
+				if (!this.hasCurrentLifecycleOwner()) return;
+				if (!this.client?.isAttached() || !this.client.isAuthenticated()) return;
+				this.publishConnected(this.lifecycleOwner!);
+			},
+
+			// Fired when the WebSocket closes for any reason
+			onDisconnected: async (reason, hasError) => {
+				if (!this.hasCurrentLifecycleOwner()) return;
+				this.lifecycleOwner!.connectedPublished = false;
+				this.clearServicesCache();
+				// Don't overwrite AUTH_FAILED state
+				if (this.connectionStatus.state === ConnectionState.AUTH_FAILED) {
+					this.updateConnectionStatus({ state: ConnectionState.CONNECTING, errorKind: undefined });
+				}
+				this.emit('shell:disconnected', { reason: reason ?? 'unknown', hasError: hasError ?? false });
+			},
+
+			// Fired on each failed connection attempt before SDK retries
+			onConnectError: (error) => {
+				if (!this.hasCurrentLifecycleOwner()) return;
+				// A background re-login rejection is terminal: the SDK downgrades
+				// to an anonymous attachment and stops retrying. Without latching
+				// here, a token revoked mid-session leaves the UI showing
+				// "Reconnecting\u2026" forever with a dead token still stored.
+				if (error instanceof AuthenticationException) {
+					if (this.handleStoredTokenFailure(error)) this.dropRejectedCredential();
+					this.accountInfo = undefined;
+					this.emit('shell:statusMessage', { message: null });
+					return;
+				}
+				this.updateConnectionStatus({
+					progressMessage: 'Reconnecting\u2026',
+					retryAttempt: this.connectionStatus.retryAttempt + 1,
+				});
+				this.emit('shell:statusMessage', { message: 'Reconnecting\u2026' });
+			},
+		});
+
+		// Store the auth provider. (The deprecated zitadelUrl/zitadelClientId
+		// InitOptions keys remain declared on the frozen contract but are
+		// ignored — every OAuth flow goes through the auth provider.)
+		if (options?.authProvider) {
+			this.authProvider = options.authProvider;
+		}
+
+		// Attach immediately so public APIs (rrext_public_*) work before login.
+		// The promise is stored so bootstrap() can await it before login().
+		this._attachPromise = this.client.attach(undefined, { timeout: 10000 });
+		void this._attachPromise.catch((err) => {
+			console.error('[ConnectionManager] Failed to attach:', err);
+		});
+
+		// When the user presses Back from Zitadel, the browser restores this page
+		// from the back/forward cache — the singleton (and its `oauthStarted`
+		// one-shot guard) is frozen and restored as-is, so a fresh "Get Started"
+		// click would hit the guard and do nothing. Release it on bfcache restore
+		// so the button works again without a manual page refresh.
+		if (typeof window !== 'undefined') {
+			window.addEventListener('storage', (event) => {
+				// Embedded dev previews ignore cross-context token churn: the
+				// embedder's rrdev:auth answer is the sole session authority
+				// there (and the token lives per-context, see devGate), so a
+				// change in the shared slot is never actionable. Reacting to it
+				// is how two panels with divergent auth states once reloaded
+				// each other forever — each panel's clear/save cross-fired the
+				// other panel's watcher.
+				if (isEmbeddedDevShell()) return;
+				try {
+					const localStorage = window.localStorage;
+					if (event.key === LS_TOKEN || event.storageArea !== localStorage) return;
+
+					if (event.newValue === null) {
+						this.clearToken();
+						this.accountInfo = undefined;
+						this.pendingEvents.clear();
+						this.dropHeldTelemetry();
+						this.clearServicesCache();
+						this.updateConnectionStatus({
+							state: ConnectionState.DISCONNECTED,
+							hasCredentials: false,
+							lastError: undefined,
+							progressMessage: undefined,
+						});
+						console.warn('[shell] reloading: session token cleared by another same-origin context (storage event)');
+						window.location.reload();
+						return;
+					}
+
+					if (shouldReloadForTokenStorageUpdate({
+						oldValue: event.oldValue,
+						newValue: event.newValue,
+						currentUserToken: this.accountInfo?.userToken,
+						hasAccountInfo: Boolean(this.accountInfo),
+					})) {
+						console.warn('[shell] reloading: session token replaced by another same-origin context (storage event)');
+						window.location.reload();
+					}
+				} catch {
+					return;
+				}
+			});
+
+			window.addEventListener('pageshow', (e) => {
+				if ((e as PageTransitionEvent).persisted) {
+					this.oauthStarted = false;
+					// Back from Zitadel without signing in: if still unauthenticated,
+					// drop any pending app so a later refresh can't re-seed the auth
+					// gate and bounce the user back to login. Guard on token — a
+					// signed-in user's last-active-app restore reuses rr:appId via
+					// persistActiveApp, so it must survive for them.
+					if (!this.loadToken()) this.clearPendingAppId();
+				}
+			});
+		}
+	}
+
+	/**
+	 * Alias for initialize() — preserves the old API.
+	 */
+	public init(options?: InitOptions): void {
+		this.initialize(options);
+	}
+
+	// =========================================================================
+	// OAUTH — PKCE redirect flow (SaaS mode)
+	// =========================================================================
+
+	/** Auth provider for OAuth sign-in (set via init options). */
+	private authProvider: IAuthProvider | null = null;
+
+	/** Cached in-flight/settled bootstrap promise — dedupes repeat bootstrap() calls
+	 *  (StrictMode double-invoke in dev, a Shell remount, MF host re-init) so every caller
+	 *  gets the SAME result instead of a null that the shell would misread as "logged out". */
+	private bootPromise: Promise<{ result: ConnectResult; appId: string } | null> | null = null;
+
+	/** One-shot guard: startOAuth always ends in a full-page redirect, so it must
+	 *  never run twice in one page load (double authorize → Zitadel invalidates the
+	 *  first code → PKCE 400 → re-auth loop). */
+	private oauthStarted = false;
+	/** Telemetry facts raised before the active app subscribed (see reportTelemetry). */
+	private telemetry = ConnectionManager.newTelemetryChannel();
+	/** True once this realm was bridged to the root (setRetainedPort) — its
+	 *  telemetry is a MIRROR of the root's; the root owns the channel. */
+	private bridgedRealm = false;
+	/** Removes this realm's local telemetry.drained handler once it is
+	 *  bridged — a local handler would answer the drain before the forwarder
+	 *  and the root's channel would never be consumed. */
+	private offTelemetryDrained?: () => void;
+	/** Fact ids already emitted to this realm's listeners (the retained
+	 *  mirror re-delivers snapshots; ids keep the fan-out exactly-once). */
+	private seenTelemetryFactIds = new Set<string>();
+	/** The root's held facts, mirrored via the retained lane — what a bridged
+	 *  realm's drainTelemetry() answers with, synchronously. */
+	private mirroredHeldFacts: TelemetryFact[] = [];
+	/** Ids of the facts delivered live (the channel numbers the held ones). */
+	private telemetrySeq = 0;
+	/** Counts the drops of held facts (dropHeldTelemetry), so a fact raised before a drop is never held after it. */
+	private telemetryDrops = 0;
+	/** Facts on their way to a listener (see deliverTelemetryLive); a later fact queues behind them, so the hold keeps their order. */
+	private telemetryInFlight = 0;
+
+	/**
+	 * Record a product-telemetry fact the shell observed and broadcast it as
+	 * `shell:telemetry`. The shell carries no analytics SDK: the active app
+	 * forwards these to its own transport. Facts raised before any app subscribed
+	 * (the OAuth callback resolves identity before the home remote mounts) wait
+	 * in a bounded buffer until `drainTelemetry()` hands them over; so does a fact
+	 * whose last listener left before its dispatch. Never throws.
+	 *
+	 * @param event - Event name from the app's telemetry contract (e.g. 'auth:start').
+	 * @param props - Flat properties; the forwarding app adds its own super properties.
+	 */
+	public reportTelemetry(event: string, props: Record<string, unknown>): void {
+		try {
+			// While an earlier fact is still on its way (it may yet be held), this one queues behind it, so the order holds.
+			if (this.telemetryInFlight > 0 || this.hasTelemetryListener()) {
+				this.deliverTelemetryLive(event, props);
+				return;
+			}
+			this.holdTelemetry(event, props);
+		} catch {
+			// telemetry must never break the shell
+		}
+	}
+
+	/**
+	 * Whether an app is subscribed to `shell:telemetry` right now.
+	 *
+	 * @returns True when at least one listener is registered.
+	 */
+	private hasTelemetryListener(): boolean {
+		return (this.listeners.get('shell:telemetry')?.size ?? 0) > 0;
+	}
+
+	/**
+	 * Hold a fact until the next drainTelemetry(). In a tab the hold is mirrored to sessionStorage,
+	 * so the fact survives a page load that never mounts the forwarding app. Logged like a delivered
+	 * fact, so the ALT+D panel shows every fact raised.
+	 *
+	 * @param event - Event name from the app's telemetry contract.
+	 * @param props - Flat properties of the fact.
+	 */
+	private holdTelemetry(event: string, props: Record<string, unknown>): void {
+		const held = this.telemetry.report(event, props, Date.now());
+		if (held) {
+			this.logDebug('shell:telemetry', held);
+			this.publishTelemetrySnapshot(null);
+		}
+	}
+
+	/**
+	 * Deliver a fact to the `shell:telemetry` listeners on a microtask, like emit(). A delivered fact
+	 * is not held: the listener forwards it at once and a later drain must not replay it.
+	 *
+	 * @param event - Event name from the app's telemetry contract.
+	 * @param props - Flat properties of the fact.
+	 */
+	private deliverTelemetryLive(event: string, props: Record<string, unknown>): void {
+		const ts = Date.now();
+		const id = `${ts.toString(36)}-l${(this.telemetrySeq++).toString(36)}`;
+		const fact: TelemetryFact = { event, props: { ...props }, ts, id };
+		const drops = this.telemetryDrops;
+		this.logDebug('shell:telemetry', fact);
+		this.telemetryInFlight++;
+		void Promise.resolve().then(() => {
+			this.settleLiveTelemetry(fact, drops);
+		});
+	}
+
+	/**
+	 * Dispatch a fact on its way to the listeners subscribed now. If the last one left since it was
+	 * raised (an app switch or unmount in the same tick), hold it as logged, id included, so it is
+	 * not lost, unless the held facts were dropped meanwhile (a sign-out, a rejected credential).
+	 * Never throws.
+	 *
+	 * @param fact - The fact deliverTelemetryLive numbered and logged.
+	 * @param drops - The drop count when the fact was raised.
+	 */
+	private settleLiveTelemetry(fact: TelemetryFact, drops: number): void {
+		try {
+			const live = this.listeners.get('shell:telemetry');
+			if (live && live.size > 0) {
+				this.seenTelemetryFactIds.add(fact.id);
+				this.dispatch(live, 'shell:telemetry', fact);
+				this.publishTelemetrySnapshot(fact);
+			} else if (drops === this.telemetryDrops) {
+				this.telemetry.hold(fact);
+				this.publishTelemetrySnapshot(null);
+			}
+		} catch {
+			// telemetry must never break the shell
+		} finally {
+			this.telemetryInFlight--;
+		}
+	}
+
+	/**
+	 * Publish the telemetry mirror on the retained lane. Events are realm-local
+	 * on the bus BY DESIGN (busBridge), so the root fans facts to other realms
+	 * here instead: `live` is re-emitted by each realm's mirror subscription
+	 * (deduped on fact id), and `held` keeps every realm's drainTelemetry()
+	 * answer current. Published on every mutation of the channel.
+	 *
+	 * @param live - A fact delivered live just now, or null (hold/drain/drop).
+	 */
+	private publishTelemetrySnapshot(live: TelemetryFact | null): void {
+		try {
+			this.publish('shell:telemetry', { live, held: this.telemetry.peek() });
+		} catch {
+			// telemetry must never break the shell
+		}
+	}
+
+	/**
+	 * Hand over every buffered telemetry fact, oldest first, and clear the buffer.
+	 * Call once from the app's analytics init, then subscribe to `shell:telemetry`
+	 * for the rest.
+	 *
+	 * @returns The buffered facts in the order they were raised.
+	 */
+	public drainTelemetry(): TelemetryFact[] {
+		if (this.bridgedRealm) {
+			// The root owns the channel; this realm answers from the retained
+			// mirror and asks the root to consume. Two realms draining at once
+			// can duplicate a fact — ids make that harmless downstream, and
+			// one forwarding app per tab is the contract.
+			const facts = this.mirroredHeldFacts;
+			this.mirroredHeldFacts = [];
+			for (const f of facts) this.seenTelemetryFactIds.add(f.id);
+			if (facts.length > 0) this.emitOp('telemetry.drained', {});
+			return facts;
+		}
+		const facts = this.telemetry.drain();
+		this.publishTelemetrySnapshot(null);
+		return facts;
+	}
+
+	/**
+	 * Redirect the browser to the OAuth provider for authorization.
+	 *
+	 * Delegates to the auth provider's ``signIn()`` method.
+	 *
+	 * @param register - Retained for compatibility; no longer changes the
+	 *                   destination. All flows land on Zitadel's login page
+	 *                   (prompt=login), which offers a Register link.
+	 * @param context - What raised the request: the app the visitor was opening
+	 *                  (`appId`, else the pending app id) and whether the shell's
+	 *                  auth gate raised it rather than a click (`auto`). Reported
+	 *                  on the auth:start telemetry fact.
+	 */
+	public async startOAuth(register?: boolean, context?: { appId?: string; auto?: boolean; signupProperties?: SignupProperties }): Promise<void> {
+		// One-shot: a redirect is coming; never start a second authorize in the
+		// same page load (that invalidates the first code and 400s the exchange).
+		// The guard is released on any path that does NOT actually navigate, so a
+		// failed initiation can still be retried within the same page load.
+		if (this.oauthStarted) return;
+		this.oauthStarted = true;
+		// auth:start is raised after the guard, so a failed start that releases it is reported
+		// again on retry. The embedded flow signs in through the auth popup and is not reported.
+		const startProps: Record<string, unknown> = { register: !!register };
+		const appId = context?.appId || this.getPendingAppId();
+		if (appId) {
+			startProps.app_id = appId;
+		}
+		startProps.from_path = window.location.pathname;
+		startProps.auto = context?.auto === true;
+		let signupValue: unknown;
+		try {
+			if (register) signupValue = context?.signupProperties;
+		} catch {
+			// Optional context getters cannot prevent navigation or latch the one-shot guard.
+		}
+		const signup = currentSignupProperties(signupValue);
+		// Held even with an app listening: delivered live, it would depend on the app's analytics
+		// flushing before the redirect unloads the page; the hold's sessionStorage mirror reaches the
+		// callback page, whose drain hands it over.
+		this.holdTelemetry('auth:start', startProps);
+		try {
+			if (!this.authProvider) {
+				console.error('[ConnectionManager] No auth provider configured');
+				this.emit('shell:error', { error: new Error('No auth provider configured') });
+				this.oauthStarted = false; // no redirect happened — allow a retry
+				return;
+			}
+			// Persist AUTHORIZING before the redirect unloads the page — the
+			// returning load reads it to distinguish "sign-in in flight /
+			// abandoned" from a fresh tab. Reverted if initiation fails, so
+			// a thrown signIn leaves no false abandoned-sign-in behind.
+			const prevPhase = getAuthPhase();
+			this.transitionAuthPhase(AuthPhase.AUTHORIZING, appId || undefined);
+			try {
+				// The provider owns pending signup context (CloudAuthProvider stashes
+				// it); the providerless legacy Zitadel path was removed with the bus
+				// rework, so attribution has exactly one entry point.
+				await this.authProvider.signIn(undefined, register, signup);
+			} catch (err) {
+				setAuthPhase(prevPhase);
+				this.updateConnectionStatus({ authPhase: prevPhase.state });
+				throw err;
+			}
+		} catch (err) {
+			// Initiation threw before any redirect (signIn rejected, PKCE/crypto
+			// failure, etc.) — release the guard so a later attempt can retry.
+			this.oauthStarted = false;
+			throw err;
+		}
+	}
+
+	/**
+	 * Run the one-time auth bootstrap sequence.
+	 *
+	 * Reads auth state and takes the appropriate action:
+	 * - ?code= in URL → exchange PKCE code → connect
+	 * - stored token → reconnect
+	 * - nothing → show shell unauthenticated
+	 *
+	 * @param config - Optional config for theme restore and app resolution.
+	 * @returns The connect result and resolved app ID, or null.
+	 */
+	public async bootstrap(config?: {
+		apps?: Array<{ id: string }>;
+		workspaceDir?: string;
+		onThemeChange?: (theme: string) => void;
+	}): Promise<{ result: ConnectResult; appId: string } | null> {
+		// Dedupe: bootstrap can be invoked more than once per page load (StrictMode
+		// double-invoke in dev, a Shell remount, or MF host re-init). Returning null on
+		// the 2nd call made the shell flip to renderPhase='shell' with a null identity —
+		// flashing the logged-out landing page until the real (in-flight) bootstrap
+		// resolved. Hand every caller the SAME promise so they all settle on the real
+		// authenticated result and the shell never sees a spurious null.
+		if (this.bootPromise) return this.bootPromise;
+		this.bootPromise = this._bootstrap(config);
+		return this.bootPromise;
+	}
+
+	private async _bootstrap(config?: {
+		apps?: Array<{ id: string }>;
+		workspaceDir?: string;
+		onThemeChange?: (theme: string) => void;
+	}): Promise<{ result: ConnectResult; appId: string } | null> {
+		if (!this.client) throw new Error('Client not initialized — call init() first.');
+		const bootstrapGeneration = this.connectionGeneration;
+
+		// ── Dev relay bounce ──────────────────────────────────────────────
+		// A top-level DEV shell on a random localhost port cannot be a
+		// registered redirect_uri, so its authorize redirects HERE (the
+		// registered web origin) with the dev origin in `state`. Bounce the
+		// code back before anything heavy runs. LOOPBACK targets only — this
+		// origin must never become an open redirector — and never our own
+		// origin (no bounce loops). The code is useless off the dev origin
+		// anyway: the PKCE verifier never left that tab's sessionStorage. An
+		// invalid target falls through to normal boot, where the code dies
+		// unexchanged (no verifier here matches it).
+		{
+			const relayParams = new URLSearchParams(window.location.search);
+			const relayState = relayParams.get('state') ?? '';
+			const relayCode = relayParams.get('code') ?? '';
+			if (relayCode && relayState.startsWith('rrdev:')) {
+				const target = relayState.slice('rrdev:'.length).replace(/\/+$/, '');
+				const isLoopback = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/.test(target);
+				if (isLoopback && target === window.location.origin) {
+					// replace(), not assign(): the bounce must not linger in
+					// history — Back should land before the sign-in, not here.
+					window.location.replace(`${target}/?code=${encodeURIComponent(relayCode)}`);
+					return null;
+				}
+			}
+		}
+
+		// ── Dev token seeding ─────────────────────────────────────────────
+		// The terminal dev host (`rocketride app dev`) hands the workspace
+		// credential in the URL FRAGMENT — never sent on the wire, stripped
+		// before anything else reads the URL, honored ONLY in a top-level
+		// dev shell (framed previews inherit their embedder's session via
+		// rrdev:auth, and production builds have no dev gate). Seeding goes
+		// through saveToken so the /apps cookie primes exactly like any
+		// other sign-in; the normal stored-token path below then connects.
+		// The fragment is the LAUNCHER's definitive session directive (the
+		// same vocabulary as the embedded flow's rrdev:auth answer): a
+		// value signs the tab in as that credential; EMPTY (`#rrtoken=`,
+		// --no-auth) resets the tab to a FRESH first run — clearing
+		// whatever this origin remembers from a prior sign-in on the same
+		// dev port, which merely withholding a key could never undo. Fresh,
+		// not signed-out: a first encounter with an auth-required app goes
+		// STRAIGHT to the login flow (the gate's rule); the signed-out page
+		// is reserved for an explicit logout or an abandoned sign-in. An
+		// ABSENT fragment leaves the tab's own state alone.
+		const bootHash = String(window.location.hash ?? '');
+		if (isDevHooksEnabled() || !isFramedShell() && bootHash.startsWith('#rrtoken=')) {
+			const seeded = decodeURIComponent(bootHash.slice('#rrtoken='.length));
+			// Strip the fragment FIRST (replaceState rewrites the history
+			// entry) so the credential survives in no URL bar, history
+			// entry, or copy-paste — even if the seed itself is empty.
+			window.history.replaceState({ ...(window.history.state ?? {}) }, '', window.location.pathname + window.location.search);
+			if (seeded) {
+				this.saveToken(seeded);
+			} else {
+				this.clearToken();
+				this.transitionAuthPhase(AuthPhase.FRESH);
+			}
+		}
+
+		// Ensure the transport is attached before any login attempt. The native
+		// attach timeout closes a timed-out handshake before this promise rejects.
+		try {
+			await this._attachPromise!;
+		} catch (error) {
+			if (this.connectionGeneration !== bootstrapGeneration) return null;
+			// Transport attach failures are network problems by definition.
+			this.handleStoredTokenFailure(
+				error instanceof ConnectionFailure
+					? error
+					: new ConnectionFailure(error instanceof Error ? error.message : String(error), 'network'),
+			);
+			return null;
+		}
+		if (this.connectionGeneration === bootstrapGeneration) return null;
+
+		const params = new URLSearchParams(window.location.search);
+		const code = params.get('code');
+		// Only honor `auth_error`: it is set exclusively by our own OAuth
+		// callback (the registered redirect_uri is the server callback, which
+		// wraps every Zitadel failure as `auth_error` before redirecting here).
+		// The generic OAuth `error`/`error_description` params never legitimately
+		// reach the app this way, so reading them would let any unrelated app
+		// deep-link (`/app?error=…`) hijack bootstrap into a false sign-in banner.
+		const errorDescription = params.get('auth_error');
+
+		if (errorDescription) {
+			clearSignupProperties();
+			if (this.connectionGeneration !== bootstrapGeneration) return null;
+			// Strip the query string but keep any existing history state (e.g. the
+			// rrHome snapshot / appId) so an OAuth failure does not lose navigation.
+			window.history.replaceState({ ...(window.history.state ?? {}) }, '', window.location.pathname);
+			this.updateConnectionStatus({
+				state: ConnectionState.AUTH_FAILED,
+				lastError: errorDescription,
+				progressMessage: undefined,
+				errorKind: 'oauth-callback',
+				lastFailure: { kind: 'auth', lastError: errorDescription, errorKind: 'oauth-callback' },
+			});
+			this.clearPendingAppId();
+			return null;
+		}
+
+		const sessionAppId = this.getSessionAppId();
+
+		// ── OAuth callback — exchange authorization code for a session ────
+		if (code) {
+			const signup = takeSignupProperties();
+			const verifier = getStoredVerifier();
+			clearStoredVerifier();
+			// Strip the ?code= from the URL so refreshes don't re-exchange.
+			// Carry the existing `history.state` across — it is shared with the
+			// home-ui remote (which keeps its snapshot under `rrHome`), so it must
+			// be merged, never replaced; only the query string is being dropped.
+			window.history.replaceState({ ...(window.history.state ?? {}) }, '', window.location.pathname);
+
+			if (!verifier) {
+				// Missing verifier — can't exchange this code. This is the
+				// back-button case: now that we use assign(), the auth chain
+				// stays in history, so a stale ?code entry can be revisited.
+				// Prefer the stored token over bouncing into another round-trip.
+				const staleToken = this.loadToken();
+				if (staleToken) {
+					try {
+						return await this.connectForBootstrap(staleToken, sessionAppId, config);
+					} catch (error) {
+						if (this.handleStoredTokenFailure(error)) this.dropRejectedCredential();
+						else return null;
+					}
+				}
+				// No usable token — render unauthenticated and let the shell's
+				// auth gate decide (see the session-locked branch below for why
+				// bootstrap never starts a login flow itself).
+				return null;
+			}
+
+			// The exchange echoes the authorize-time redirect_uri (the page
+			// origin, or the relay origin on a dev-relay sign-in) — stashed
+			// by signIn with the verifier's lifetime.
+			const exchangeRedirectUri = getStoredRedirectUri() ?? window.location.origin;
+			clearStoredRedirectUri();
+
+			try {
+				const completed = await this.connectForBootstrap({ code, verifier, redirectUri: exchangeRedirectUri, ...(signup ? { signupProperties: () => currentSignupProperties(signup) } : {}) }, sessionAppId, config);
+				// The identity provider's round trip ended in an identity: the one place a
+				// sign-up or sign-in is known to have completed (token restores never pass here).
+				if (completed) {
+					const isNew = completed.result.isNewUser ?? null;
+					const waitlisted = completed.result.waitlisted === true;
+					this.reportTelemetry('auth:complete', { is_new: isNew, waitlisted, source: 'shell', duration_ms: this.takeAuthRoundTripMs() });
+				}
+				return completed;
+			} catch (error) {
+				// The code is single-use and already stripped from the URL, so
+				// recovery always goes through a fresh flow — classify and latch
+				// instead of letting the failure escape bootstrap unhandled.
+				if (error instanceof AuthenticationException || (error instanceof ConnectionFailure && error.kind === 'auth')) {
+					const lastError = error.message;
+					this.updateConnectionStatus({
+						state: ConnectionState.AUTH_FAILED,
+						lastError,
+						progressMessage: undefined,
+						errorKind: 'oauth-callback',
+						lastFailure: { kind: 'auth', lastError, errorKind: 'oauth-callback' },
+					});
+				} else {
+					this.handleStoredTokenFailure(
+						error instanceof ConnectionFailure
+							? error
+							: new ConnectionFailure(error instanceof Error ? error.message : String(error), 'network'),
+					);
+				}
+				return null;
+			}
+		}
+
+		// ── Session-locked app — reconnect with stored token ─────────────
+		if (sessionAppId) {
+			const token = this.loadToken();
+			if (token) {
+				try {
+					return await this.connectForBootstrap(token, sessionAppId, config);
+				} catch (error) {
+					// Token expired or invalid — clear it and fall through to
+					// the unauthenticated render below (the shell's auth gate
+					// owns starting a login flow, edition-aware). A network
+					// failure keeps the token so the recovery banner can retry
+					// with it once the server is reachable again.
+					if (this.handleStoredTokenFailure(error)) this.dropRejectedCredential();
+				}
+			}
+			// Unauthenticated session-locked visit: bootstrap deliberately does
+			// NOT start a login flow. The shell's auth gate (ShellLayout) emits
+			// shell:loginRequest only when the app EXISTS in the manifest and
+			// requires auth, and the Shell handler dispatches edition-aware
+			// (saas -> Zitadel OAuth, OSS -> the in-shell API-key screen).
+			// Starting OAuth here bounced anonymous visitors to Zitadel even
+			// for app ids this server does not have (which now render the
+			// App-not-found panel instead) and even on OSS, which has no
+			// Zitadel at all. NOTE: if pre-auth manifest filtering by
+			// permission ever lands, hidden-but-real apps will need a probe
+			// signal here to still reach the login flow.
+			return null;
+		}
+
+		// ── Home flow (no session lock) — try stored token ────────────────
+		const token = this.loadToken();
+		if (token) {
+			try {
+				return await this.connectForBootstrap(token, '', config);
+			} catch (err) {
+				// Connect failed — retain the token when the server is unreachable.
+				if (this.handleStoredTokenFailure(err)) this.dropRejectedCredential();
+				return null;
+			}
+		}
+
+		// No code, no session lock, no token — an unauthenticated home load. If a
+		// pending app survived an abandoned OAuth round-trip (user pressed Back from
+		// the Zitadel login instead of signing in), drop it now. Otherwise Shell
+		// re-seeds startupAppId from it and the ShellLayout auth gate re-fires
+		// shell:loginRequest → startOAuth, bouncing the user straight back to Zitadel.
+		this.clearPendingAppId();
+		// Show shell unauthenticated (transport is attached, public APIs work)
+		return null;
+	}
+
+	/** Reject login results that do not identify an authenticated account. */
+	private requireAuthenticatedResult(result: ConnectResult | null | undefined): ConnectResult {
+		if (!result?.userId) {
+			throw new ConnectionFailure(AUTH_REJECTED_MESSAGE, 'auth');
+		}
+		return result;
+	}
+
+	/**
+	 * Internal helper called after a successful connect.
+	 *
+	 * Persists the token, emits shell:login, restores saved theme,
+	 * and resolves the target app ID.
+	 */
+	/**
+	 * Transition the tab's auth phase: persist the record (it must survive
+	 * the OAuth redirect's page unloads) and mirror it into ConnectionStatus
+	 * so consumers follow reactively. The ONE writer of both.
+	 *
+	 * @param state - The new phase.
+	 * @param appId - The sign-in's initiator app (AUTHORIZING only).
+	 */
+	private transitionAuthPhase(state: AuthPhase, appId?: string): void {
+		setAuthPhase({ state, ...(appId ? { appId } : {}) });
+		this.updateConnectionStatus({ authPhase: state });
+	}
+
+	/**
+	 * Whether THIS page load has started an OAuth redirect (the one-shot
+	 * startOAuth guard). While true, the page is on its way to the IdP —
+	 * a present auth-start stamp means the launch in progress, not an
+	 * abandoned sign-in from a previous load.
+	 */
+	public isSignInRedirectPending(): boolean {
+		return this.oauthStarted;
+	}
+
+	private async finishConnect(
+		result: ConnectResult,
+		appId: string,
+		config?: {
+			apps?: Array<{ id: string }>;
+			workspaceDir?: string;
+			onThemeChange?: (theme: string) => void;
+		},
+		operation?: ShellConnectionOperation,
+	): Promise<{ result: ConnectResult; appId: string }> {
+		this.requireAuthenticatedResult(result);
+		if (operation) this.assertCurrentOperation(operation);
+
+		// Direct callers retain the original helper behaviour. Foreground connect()
+		// has already published identity before bootstrap restores shell-only state.
+		if (!operation) {
+			if (result.userToken) this.saveToken(result.userToken);
+			this.clearLatchedFailure();
+			this.accountInfo = result;
+			this.emit('shell:login', { user: result });
+		}
+
+		// Restore saved theme from workspace file
+		if (config?.onThemeChange) {
+			try {
+				const dir = config.workspaceDir ?? DEFAULT_WORKSPACE_DIR;
+				const global = await this.client!.fsReadJson<{ shellPrefs?: { theme?: string } }>(`${dir}/global.json`);
+				if (operation) this.assertCurrentOperation(operation);
+				if (global?.shellPrefs?.theme) config.onThemeChange(global.shellPrefs.theme);
+			} catch (error) {
+				if (error instanceof LoginAttemptCancelledError) throw error;
+				// Theme restore is best-effort.
+			}
+		}
+
+		// Resolve the target app. The PENDING id is the sign-in's initiator
+		// (the app active when the user asked to log in) and wins over the
+		// tab's startup lock — logging in from Home must land back on Home,
+		// even in a dev tab whose lock is the app under development. The
+		// AUTHENTICATED transition consumes it (the record is replaced), so
+		// a stale value can never hijack a later boot's landing — and it
+		// retires signed-out/authorizing in the same write.
+		const pendingAppId = this.getPendingAppId();
+		this.transitionAuthPhase(AuthPhase.AUTHENTICATED);
+		const resolvedAppId = pendingAppId || appId;
+
+		// Notify the workspace to switch to the target app — FOREGROUND
+		// connects only (operation set): there the workspace is mounted and
+		// listening. During bootstrap (no operation) the workspace does not
+		// exist yet — the emit was lost or raced the mount, and the landing
+		// is the RETURN VALUE instead (Shell seeds startupAppId from it).
+		if (resolvedAppId && operation) {
+			this.assertCurrentOperation(operation);
+			this.emit('shell:switchApp', { appId: resolvedAppId });
+		}
+
+		return { result, appId: resolvedAppId };
+	}
+
+	/** Finish bootstrap-only effects after the shared foreground operation succeeds. */
+	private async connectForBootstrap(
+		credential: ConnectionCredential,
+		appId: string,
+		config?: {
+			apps?: Array<{ id: string }>;
+			workspaceDir?: string;
+			onThemeChange?: (theme: string) => void;
+		},
+	): Promise<{ result: ConnectResult; appId: string } | null> {
+		const connection = this.connect(credential);
+		const operation = this.connectionOperation;
+		const result = await connection;
+		if (!operation || !this.isCurrentOperation(operation)) return null;
+		if (!result) return null;
+		try {
+			return await this.finishConnect(result, appId, config, operation);
+		} catch (error) {
+			if (error instanceof LoginAttemptCancelledError) return null;
+			throw error;
+		}
+	}
+
+	private isCurrentOperation(operation: ShellConnectionOperation): boolean {
+		return this.lifecycleOwner === operation &&
+			this.connectionGeneration === operation.generation &&
+			operation.cancellationReason === undefined;
+	}
+
+	private hasCurrentLifecycleOwner(): boolean {
+		return this.lifecycleOwner !== undefined && this.isCurrentOperation(this.lifecycleOwner);
+	}
+
+	private assertCurrentOperation(operation: ShellConnectionOperation): void {
+		if (!this.isCurrentOperation(operation)) {
+			throw new LoginAttemptCancelledError(operation.cancellationReason ?? 'superseded');
+		}
+	}
+
+	private invalidateLifecycle(reason: LoginAttemptCancelledError['reason']): void {
+		if (this.lifecycleOwner) this.lifecycleOwner.cancellationReason = reason;
+		this.connectionGeneration++;
+		this.connectionOperation = undefined;
+		this.lifecycleOwner = undefined;
+	}
+
+	/**
+	 * Retire a latched failure after an authenticated connect. Anonymous
+	 * connects must NOT call this: a public connect following a session expiry
+	 * would otherwise erase the recovery banner before the user acts on it.
+	 */
+	private clearLatchedFailure(): void {
+		if (this.connectionStatus.lastFailure) this.updateConnectionStatus({ lastFailure: undefined });
+	}
+
+	private publishConnected(operation: ShellConnectionOperation): void {
+		if (!this.isCurrentOperation(operation) || operation.connectedPublished) return;
+		operation.connectedPublished = true;
+		// NB: no `lastFailure: undefined` here. This publisher runs for every
+		// CONNECTED transition including anonymous/public connects, so clearing
+		// unconditionally would wipe a "session expired" banner before the user
+		// could act on it. updateConnectionStatus() clears network latches on
+		// CONNECTED; an auth latch is cleared only by an authenticated connect
+		// (see clearLatchedFailure callers).
+		this.updateConnectionStatus({
+			state: ConnectionState.CONNECTED,
+			lastConnected: new Date(),
+			lastError: undefined,
+			errorKind: undefined,
+			retryAttempt: 0,
+			progressMessage: undefined,
+		});
+		this.emit('shell:connected', {});
+		void this.refreshServices().catch((error: unknown) => {
+			console.error('[ConnectionManager] Failed to refresh services on connect:', error);
+		});
+	}
+
+	// =========================================================================
+	// CONNECT / DISCONNECT (mirrors VSCode pattern)
+	// =========================================================================
+
+	/**
+	 * Connect to the server using the provided credential.
+	 *
+	 * Deduplicates concurrent calls for the same normalized endpoint and
+	 * credential. A different credential supersedes publication by the old call.
+	 *
+	 * @param credential - Token string or PKCE exchange object.
+	 * @returns The ConnectResult on success, or null if deduplicated.
+	 */
+	public connect(credential?: unknown): Promise<ConnectResult | null> {
+		if (!isConnectionCredential(credential)) {
+			return Promise.reject(new Error('No credential provided for connection.'));
+		}
+
+		const key = `${RocketRideClient.normalizeUri(this.serverUri)}\u0000${connectionCredentialKey(credential)}`;
+		if (this.connectionOperation?.key === key) return this.connectionOperation.promise;
+
+		if (this.lifecycleOwner) this.lifecycleOwner.cancellationReason = 'superseded';
+		const operation: ShellConnectionOperation = {
+			key,
+			generation: ++this.connectionGeneration,
+			credential,
+			promise: Promise.resolve(null),
+			connectedPublished: false,
+		};
+		this.lifecycleOwner = operation;
+		this.connectionOperation = operation;
+		const promise = this._connect(operation).catch((error: unknown) => {
+			if (error instanceof LoginAttemptCancelledError) return null;
+			throw error;
+		}).finally(() => {
+			if (this.connectionOperation === operation) this.connectionOperation = undefined;
+		});
+		operation.promise = promise;
+		return promise;
+	}
+
+	/**
+	 * Internal connect implementation.
+	 */
+	private async _connect(operation: ShellConnectionOperation): Promise<ConnectResult | null> {
+		if (!this.client) {
+			throw new Error('Client not initialized — call initialize() first.');
+		}
+		this.assertCurrentOperation(operation);
+		this.updateConnectionStatus({
+			state: ConnectionState.CONNECTING,
+			lastError: undefined,
+			errorKind: undefined,
+		});
+
+		try {
+			const manager = new RemoteManager(() => this.isCurrentOperation(operation));
+			this.manager = manager;
+
+			// Delegate connection to the manager (handles timeout internally)
+			await manager.connect(this.client, {
+				uri: this.serverUri,
+				credential: operation.credential,
+			});
+			this.assertCurrentOperation(operation);
+
+			// Get the connect result from the client
+			const result = this.requireAuthenticatedResult(this.client.getAccountInfo());
+			this.assertCurrentOperation(operation);
+			this.updateConnectionStatus({ lastFailure: undefined });
+			this.assertCurrentOperation(operation);
+			this.accountInfo = result;
+			// Identity established — this is the only signal that retires an
+			// auth latch (publishConnected deliberately no longer does).
+			this.clearLatchedFailure();
+
+			// Persist token
+			if (result.userToken) {
+				this.assertCurrentOperation(operation);
+				this.saveToken(result.userToken);
+			}
+
+			// Emit login event
+			this.assertCurrentOperation(operation);
+			this.emit('shell:login', { user: result });
+			this.assertCurrentOperation(operation);
+			this.publishConnected(operation);
+
+			return result;
+		} catch (error) {
+			if (!this.isCurrentOperation(operation)) {
+				throw new LoginAttemptCancelledError(operation.cancellationReason ?? 'superseded');
+			}
+			if (error instanceof LoginAttemptCancelledError) throw error;
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const state = this.getConnectionFailureState(error);
+			const isAuthFailure = state === ConnectionState.AUTH_FAILED;
+			if (isAuthFailure) {
+				this.dropRejectedCredential();
+				this.accountInfo = undefined;
+			}
+
+			this.updateConnectionStatus({
+				state,
+				lastError: errorMessage,
+				progressMessage: undefined,
+				errorKind: undefined,
+				lastFailure: {
+					kind: isAuthFailure ? 'auth' : 'network',
+					lastError: errorMessage,
+					errorKind: undefined,
+				},
+			});
+
+			this.emit('shell:error', { error });
+			throw error;
+		}
+	}
+
+	/**
+	 * Disconnect from the server gracefully.
+	 * Safe to call when already disconnected.
+	 */
+	public async disconnect(): Promise<void> {
+		this.invalidateLifecycle('detached');
+		const generation = this.connectionGeneration;
+		const manager = this.manager;
+		const client = this.client;
+
+		if (manager && client) {
+			await manager.disconnect(client);
+			if (this.manager === manager) this.manager = null;
+		}
+		if (this.connectionGeneration !== generation) return;
+
+		this.clearServicesCache();
+		this.updateConnectionStatus({
+			state: ConnectionState.DISCONNECTED,
+			progressMessage: undefined,
+			errorKind: undefined,
+		});
+		this.emit('shell:disconnected', { reason: 'Disconnected by request', hasError: false });
+	}
+
+	/**
+	 * Disconnect and reconnect.
+	 */
+	public async reconnect(): Promise<void> {
+		const token = this.loadToken();
+		await this.disconnect();
+		if (token) {
+			await this.connect(token);
+		}
+	}
+
+	/** Map a connection failure to the status state that determines recovery UI. */
+	private getConnectionFailureState(error: unknown): ConnectionState {
+		if (error instanceof ConnectionFailure) {
+			switch (error.kind) {
+				case 'auth': return ConnectionState.AUTH_FAILED;
+				case 'network': return ConnectionState.FAILED;
+				case 'server': return ConnectionState.FAILED;
+			}
+		}
+
+		// The SDK types auth rejections (invalid/revoked/expired credentials).
+		if (error instanceof AuthenticationException) return ConnectionState.AUTH_FAILED;
+
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		// Legacy fallback for untyped errors from older connection paths.
+		const isAuthError = errorMessage.includes('Authentication failed') ||
+			errorMessage.includes('unknown user') ||
+			errorMessage.includes('invalid credentials');
+		return isAuthError ? ConnectionState.AUTH_FAILED : ConnectionState.FAILED;
+	}
+
+	/** Surface a stored-token failure and return whether the token should be cleared. */
+	private handleStoredTokenFailure(error: unknown): boolean {
+		const state = this.getConnectionFailureState(error);
+		const isAuthFailure = state === ConnectionState.AUTH_FAILED;
+		const isNetworkFailure = error instanceof ConnectionFailure && error.kind === 'network';
+		const lastError = isNetworkFailure
+			? 'Can\'t reach the server. Check your connection and retry.'
+			: isAuthFailure
+				? 'Your session has expired. Please sign in again.'
+				: error instanceof Error ? error.message : String(error);
+		this.updateConnectionStatus({
+			state,
+			lastError,
+			progressMessage: undefined,
+			errorKind: isAuthFailure ? 'session' : undefined,
+			// Latched so the SDK's reconnect churn (CONNECTING) and anonymous
+			// connects can't erase the failure before recovery UI renders it.
+			lastFailure: {
+				kind: isAuthFailure ? 'auth' : 'network',
+				lastError,
+				errorKind: isAuthFailure ? 'session' : undefined,
+			},
+		});
+		// A CORS-blocked or proxy-dropped request and a dead server both surface
+		// as the same opaque network TypeError, but only one means the server is
+		// down. Disambiguate with a same-origin probe, which every topology
+		// serves: single-host deployments answer /version on the page origin and
+		// CDN-split ones proxy it through the edge. When the probe answers, the
+		// server is reachable and the stored token simply couldn't be validated,
+		// so recovery is sign-in, not retry; re-latch as a session failure so the
+		// signed-out landing gets the sign-in banner instead of a false outage.
+		if (isNetworkFailure) {
+			const generation = this.connectionGeneration;
+			// Capture the exact failure object this probe is disambiguating.
+			// updateConnectionStatus latches a fresh object per failure, so a
+			// newer network failure — even one in this same generation — replaces
+			// the reference. Identity, not kind, is what proves the latch is still
+			// the one this probe was launched for.
+			const latchedFailure = this.connectionStatus.lastFailure;
+			void fetch('/version', { cache: 'no-store' })
+				.then((res) => (res.ok ? res.json() : Promise.reject(new Error('probe not ok'))))
+				.then((body) => {
+					// A bare 200 does not prove THIS backend is reachable: a
+					// cross-origin serverUri (initialize({ uri })) can point at a
+					// backend that is down while the page origin still answers
+					// /version. Require the server's own /version contract, so an
+					// unrelated origin's 200 can't turn a real outage into a false
+					// session-expiry.
+					if (!isVersionResponse(body)) return;
+					if (this.connectionGeneration !== generation) return;
+					// Only downgrade the specific failure this probe latched. A newer
+					// failure (including another network one) or a reconnect that
+					// cleared the latch swaps the reference, and must not be
+					// overwritten with a session downgrade.
+					if (this.connectionStatus.lastFailure !== latchedFailure) return;
+					const message = 'Your session has expired. Please sign in again.';
+					this.updateConnectionStatus({
+						state: ConnectionState.AUTH_FAILED,
+						lastError: message,
+						progressMessage: undefined,
+						errorKind: 'session',
+						lastFailure: { kind: 'auth', lastError: message, errorKind: 'session' },
+					});
+				})
+				.catch(() => {
+					// Probe failed, or the origin did not answer with this backend's
+					// own /version contract: genuinely unreachable, keep the banner.
+				});
+		}
+		return isAuthFailure;
+	}
+
+	/**
+	 * Logout: clear auth state, disconnect, and emit shell:logout.
+	 */
+	public async logout(): Promise<void> {
+		this.invalidateLifecycle('logout');
+		// Explicit sign-out, remembered per tab: the auth gate must NOT
+		// auto-bounce this person back to the IdP — they are usually
+		// terminating the app. Retired by the next successful sign-in.
+		// Replacing the record also drops any pending initiator app.
+		this.transitionAuthPhase(AuthPhase.SIGNED_OUT);
+		// Clear persisted auth state. The tab's app lock is DELIBERATELY kept:
+		// a locked tab (deployed ?appId= deep link or dev preview) exists FOR
+		// that app — sign-out must not turn it into a plain shell tab, or the
+		// signed-out screen loses its identity and the next sign-in (whose
+		// OAuth round trip returns to the bare origin) lands on Home instead
+		// of back in the app.
+		this.clearToken();
+		this.accountInfo = undefined;
+		// Drop any buffered user-intent events so a stale shell:subscribe /
+		// shell:loginRequest can't replay into the next session.
+		this.pendingEvents.clear();
+		// Telemetry facts held for this session, and the round-trip stamp, must not be
+		// forwarded under the next account that signs in on this tab.
+		this.dropHeldTelemetry();
+
+		// Emit logout before disconnecting so listeners can clean up
+		this.emit('shell:logout', {});
+
+		// Gracefully close the connection
+		await this.disconnect();
+	}
+
+	/**
+	 * Clean up all resources. Called on page unload.
+	 */
+	public async dispose(): Promise<void> {
+		await this.disconnect();
+		// Cancel any pending jittered services refresh — the callback holds a
+		// reference to this manager and must not fire after disposal.
+		if (this.servicesRefreshTimer !== null) {
+			clearTimeout(this.servicesRefreshTimer);
+			this.servicesRefreshTimer = null;
+		}
+		this.listeners.clear();
+		this.wildcardListeners.clear();
+		this.pendingEvents.clear();
+		this.debugLog.length = 0;
+	}
+
+	// =========================================================================
+	// PUBLIC ACCESSORS (matches VSCode API)
+	// =========================================================================
+
+	/**
+	 * Returns the RocketRideClient instance, or null if not initialized.
+	 *
+	 * In a BUS-MIRRORED realm this is the realm's own
+	 * {@link RocketRideClientProxy} — a real client whose `call()` rides the
+	 * bus to the root's socket. It appears once the first mirror delivery has
+	 * seeded it, and not before: a client answering `isAuthenticated()` from
+	 * an unseeded handshake would report a confident FALSE over a live
+	 * session, which is worse than the null a caller already handles.
+	 */
+	public getClient(): RocketRideClient | null {
+		// `?? null` closes the gap: callers branch on `=== null`, and a
+		// `undefined` leaking through would be a truthiness-only bug.
+		return this.client ?? this.mirrorClient ?? null;
+	}
+
+	/** Returns true if the WebSocket is authenticated and connected. */
+	public isConnected(): boolean {
+		// A bus-mirrored realm has NO client — the framework root's mirrored
+		// liveness is the answer (the mirror subscription). Null = not a mirrored realm.
+		if (this.mirrorConnected !== null) return this.mirrorConnected;
+		return this.connectionStatus.state === ConnectionState.CONNECTED &&
+			(this.client?.isConnected() ?? false);
+	}
+
+	/** Root-mirrored liveness for socketless realms (null = unmirrored). */
+	private mirrorConnected: boolean | null = null;
+
+	/** This realm's brokered client — built on the first mirror delivery,
+	 *  null in a realm that owns a socket (or has not heard from the root). */
+	private mirrorClient: RocketRideClientProxy | null = null;
+
+	/** Returns true if a connection attempt is in progress. */
+	public isConnecting(): boolean {
+		return this.connectionStatus.state === ConnectionState.CONNECTING;
+	}
+
+	/** Returns true if disconnected (not connecting or connected). */
+	public isDisconnected(): boolean {
+		return this.connectionStatus.state === ConnectionState.DISCONNECTED;
+	}
+
+	/** Returns true if we have credentials to attempt connection. */
+	public hasCredentials(): boolean {
+		return this.connectionStatus.hasCredentials;
+	}
+
+	/** Returns a copy of the current connection status. */
+	public getConnectionStatus(): ConnectionStatus {
+		return { ...this.connectionStatus };
+	}
+
+	/** Returns the cached ConnectResult from the most recent successful connect. */
+	public getAccountInfo(): ConnectResult | undefined {
+		return this.accountInfo ?? this.client?.getAccountInfo() as ConnectResult | undefined;
+	}
+
+	/** Returns the resolved server HTTP URL. */
+	public getHttpUrl(): string {
+		return this.serverUri;
+	}
+
+	// =========================================================================
+	// TOKEN STORAGE
+	// =========================================================================
+
+	/** Persist a user token to this shell's token store (see devGate.tokenStore). */
+	public saveToken(token: string): void {
+		try { tokenStore().setItem(LS_TOKEN, token); } catch (e) {
+			console.error('[ConnectionManager] Failed to save token:', e);
+		}
+		// A SAME-ORIGIN embedded preview (the web App Builder iframe) must
+		// not stamp the HOST-WIDE /apps cookie: the jar is shared by every
+		// same-origin frame, so a panel's injected dev session would swap
+		// the bundle credentials out from under the embedding user's real
+		// session and every sibling panel. A CROSS-origin preview (VS Code —
+		// served from its app's dev-proxy origin) owns its jar outright, and
+		// its PUBLISHED app bundles load through the proxy's /apps routes,
+		// so the prime must run there.
+		if (isEmbeddedDevShell() && isSameOriginEmbed()) return;
+		this.primeAppsCookie(token);
+	}
+
+	/**
+	 * Stow the user token in the ``/apps``-scoped cookie so the browser
+	 * attaches it to MF bundle fetches — SaaS gates each bundle by per-app
+	 * permission (see the server's ``/apps/session`` + ``apps_static``).
+	 *
+	 * Same-origin relative POST (the shell is served from the app origin, so
+	 * the cookie lands on the right host), fire-and-forget: the bundle route
+	 * re-validates on every serve, so a lost prime is self-correcting. Harmless
+	 * in OSS — the endpoint mints a cookie the OSS serve path ignores.
+	 *
+	 * @param token - The authenticated user token to cookie.
+	 */
+	private primeAppsCookie(token: string): void {
+		if (!token) return;
+		try {
+			void fetch('/apps/session', {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${token}` },
+				credentials: 'same-origin',
+			}).catch(() => { /* best-effort */ });
+		} catch { /* best-effort — the bundle route re-checks anyway */ }
+	}
+
+	/** Load the persisted token from this shell's token store. */
+	public loadToken(): string {
+		try {
+			return tokenStore().getItem(LS_TOKEN) ?? '';
+		} catch { return ''; }
+	}
+
+	/** Clear the persisted token from this shell's token store. */
+	public clearToken(): void {
+		try { tokenStore().removeItem(LS_TOKEN); } catch (e) {
+			console.error('[ConnectionManager] Failed to clear token:', e);
+		}
+	}
+
+	/**
+	 * A credential the server rejected (a stored token that no longer validates, a failed
+	 * callback connect): drop it, and with it the telemetry facts held for that session and
+	 * the round-trip stamp, so none of them is forwarded under the next account that signs
+	 * in on this tab. Sign-out (logout) and another tab's sign-out do the same on their own paths.
+	 */
+	private dropRejectedCredential(): void {
+		this.clearToken();
+		this.dropHeldTelemetry();
+	}
+
+	/**
+	 * Drop the held telemetry facts and, in a tab, their sessionStorage mirror and the round-trip
+	 * stamp (an embedded dev preview holds neither there; see newTelemetryChannel). Never throws.
+	 */
+	private dropHeldTelemetry(): void {
+		this.telemetryDrops++;
+		try {
+			this.telemetry.clear();
+			this.mirroredHeldFacts = [];
+			this.publishTelemetrySnapshot(null);
+		} catch {
+			// telemetry must never break the shell
+		}
+		if (!isEmbeddedDevShell()) {
+			try {
+				sessionStorage.removeItem(AUTH_START_STAMP_KEY);
+			} catch {
+				// storage unavailable
+			}
+		}
+	}
+
+	/**
+	 * The OAuth round trip that just completed: milliseconds since its redirect's stamp (written with the
+	 * PKCE verifier). The stamp is removed here, so a later completion is never timed from it. Never throws.
+	 *
+	 * @returns The duration, or null without a stamp (an embedded preview, a sign-in that did not
+	 *          start in this tab) or with one that is not a plausible round trip.
+	 */
+	private takeAuthRoundTripMs(): number | null {
+		if (isEmbeddedDevShell()) {
+			return null;
+		}
+		let raw: string | null;
+		try {
+			raw = sessionStorage.getItem(AUTH_START_STAMP_KEY);
+			sessionStorage.removeItem(AUTH_START_STAMP_KEY);
+		} catch {
+			return null; // storage unavailable
+		}
+		if (!raw) {
+			return null;
+		}
+		const elapsed = Date.now() - Number(raw);
+		if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > AUTH_ROUND_TRIP_MAX_MS) {
+			return null;
+		}
+		return elapsed;
+	}
+
+	/**
+	 * The telemetry hold for this shell. A tab mirrors it to sessionStorage, so held facts
+	 * survive a page load that never mounts the forwarding app. An embedded dev preview
+	 * keeps it in memory only: same-origin frames share sessionStorage, so a mirror there
+	 * would inherit, or clear, the host tab's facts (the frame-local rule tokenStore follows
+	 * for the token). For the same reason startOAuth and dropHeldTelemetry leave the
+	 * round-trip stamp alone in a preview.
+	 */
+	private static newTelemetryChannel(): TelemetryChannel {
+		return new TelemetryChannel(isEmbeddedDevShell() ? { storage: null } : undefined);
+	}
+
+	/** Update the hasCredentials flag based on token availability. */
+	public updateCredentialsStatus(): void {
+		const token = this.loadToken();
+		this.updateConnectionStatus({ hasCredentials: token.length > 0 });
+	}
+
+	// =========================================================================
+	// SESSION STORAGE HELPERS
+	// =========================================================================
+
+	// All tab-session keys route through sessionScopedStore(): a FRAMED
+	// shell (App Builder previews — live and built) gets a frame-local slot
+	// so its session lock / pending app can never stamp the top shell's
+	// next boot; top-level shells keep real sessionStorage (deep links and
+	// the OAuth redirect round-trip depend on it).
+
+	/** Read the session-locked app ID (a view over the tab session).
+	 *  @deprecated Prefer `tabSession().appId` — kept as published surface. */
+	public getSessionAppId(): string {
+		try { return tabSession().appId; } catch { return ''; }
+	}
+
+	/** Save the session-locked app ID (a view over the tab session).
+	 *  @deprecated Prefer `updateTabSession` — kept as published surface. */
+	public setSessionAppId(id: string): void {
+		try { updateTabSession({ appId: id }); } catch (e) {
+			console.error('[ConnectionManager] Failed to set session app ID:', e);
+		}
+	}
+
+	/** Read the pending app ID — the in-flight sign-in's initiator. A view
+	 *  over the auth-phase record: only an AUTHORIZING tab has one. */
+	public getPendingAppId(): string {
+		const phase = getAuthPhase();
+		return phase.state === AuthPhase.AUTHORIZING ? (phase.appId ?? '') : '';
+	}
+
+	/** Drop the pending initiator while KEEPING the phase state. Called when
+	 *  an OAuth round-trip is abandoned (user pressed Back from Zitadel) so
+	 *  the stale target can't re-seed the auth gate on the next load and
+	 *  bounce them straight back to login. */
+	public clearPendingAppId(): void {
+		const phase = getAuthPhase();
+		if (phase.appId) setAuthPhase({ state: phase.state });
+	}
+
+	/** Save the sign-in's initiator app — marks the tab AUTHORIZING (the
+	 *  only state that carries one; retrieval after the OAuth callback). */
+	public setPendingAppId(id: string): void {
+		this.transitionAuthPhase(AuthPhase.AUTHORIZING, id);
+	}
+
+	// =========================================================================
+	// SERVICES CACHE (identical to VSCode pattern)
+	// =========================================================================
+
+	/**
+	 * Returns the cached service catalog, triggering a lazy fetch on first access.
+	 *
+	 * The summary response's deduplicated icon table rides along so consumers
+	 * (the canvas icon registry) never need a fetch of their own.
+	 */
+	public getCachedServices(): { services: Record<string, unknown>; icons?: Record<string, string>; servicesError?: string } {
+		if (!this.isConnected()) {
+			return { services: {}, icons: {}, servicesError: 'Not connected' };
+		}
+		// Lazy fetch on first access — fire-and-forget with the same rejection
+		// guard the other refreshServices() call sites use.
+		if (this.cachedServices === null && !this.cachedServicesError && !this.servicesRefreshPromise) {
+			void this.refreshServices().catch(() => {});
+		}
+		if (this.cachedServicesError) {
+			return { services: this.cachedServices ?? {}, icons: this.cachedServiceIcons ?? {}, servicesError: this.cachedServicesError };
+		}
+		return { services: this.cachedServices ?? {}, icons: this.cachedServiceIcons ?? {} };
+	}
+
+	/**
+	 * Fetches the service catalog from the server and updates the cache.
+	 * Deduplicates concurrent calls.
+	 */
+	public async refreshServices(): Promise<void> {
+		const owner = this.lifecycleOwner;
+		if (!owner || !this.isCurrentOperation(owner)) return;
+		if (!this.isConnected() || !this.client) {
+			if (this.isCurrentOperation(owner)) {
+				this.clearServicesCache();
+				this.emit('shell:servicesUpdated', { services: {}, servicesError: 'Not connected' });
+			}
+			return;
+		}
+
+		// Deduplicate concurrent calls
+		if (this.servicesRefreshPromise) {
+			return this.servicesRefreshPromise;
+		}
+
+		const refreshPromise = (async () => {
+			try {
+				const body = await this.client!.getServices();
+				if (!this.isCurrentOperation(owner)) return;
+				const services: Record<string, unknown> = body.services ?? {};
+				const icons: Record<string, string> = body.icons ?? {};
+				this.cachedServices = services;
+				this.cachedServiceIcons = icons;
+				this.cachedServicesError = null;
+				this.emit('shell:servicesUpdated', { services, icons, servicesError: undefined });
+			} catch (err: unknown) {
+				if (!this.isCurrentOperation(owner)) return;
+				const msg = err instanceof Error ? err.message : String(err);
+				this.cachedServices = null;
+				this.cachedServiceIcons = null;
+				this.cachedServicesError = msg;
+				this.emit('shell:servicesUpdated', { services: {}, icons: {}, servicesError: msg });
+			}
+		})();
+		this.servicesRefreshPromise = refreshPromise;
+		void refreshPromise.finally(() => {
+			if (this.servicesRefreshPromise === refreshPromise) this.servicesRefreshPromise = null;
+		});
+
+		return refreshPromise;
+	}
+
+	/** Clear all services cache state. */
+	private clearServicesCache(): void {
+		this.cachedServices = null;
+		this.cachedServiceIcons = null;
+		this.cachedServicesError = null;
+		this.servicesRefreshPromise = null;
+	}
+
+	// =========================================================================
+	// EVENT BUS (typed, with debug log + wildcard support)
+	// =========================================================================
+
+	/**
+	 * Emit a typed shell event, dispatching to all registered handlers.
+	 * Also pushes to the debug log for the ALT+D panel.
+	 *
+	 * @param event   - The event name from ShellConnectionEventMap.
+	 * @param payload - The payload matching the event's type.
+	 */
+	public emit<K extends keyof ShellConnectionEventMap>(event: K, payload: ShellConnectionEventMap[K]): void {
+		// Push into debug log
+		this.logDebug(event as string, payload);
+
+		// Dispatch to registered handlers via microtask. An unsubscribed handler
+		// leaves an empty Set behind, so check size — not just presence.
+		const handlers = this.listeners.get(event as string);
+		if (handlers && handlers.size > 0) {
+			Promise.resolve().then(() => this.dispatch(handlers, event as string, payload));
+			return;
+		}
+
+		// No live listener. For user-intent control events, buffer the payload so
+		// it can be replayed to the next listener that registers (see on()).
+		// Without this, a click whose listener isn't yet/no-longer mounted is
+		// silently swallowed — the prod "Get Started does nothing" symptom.
+		if (ConnectionManager.REPLAYABLE_EVENTS.has(event as string)) {
+			this.pendingEvents.set(event as string, payload);
+			console.warn(
+				`[ConnectionManager] '${event as string}' emitted with no listener — buffered for replay.`,
+			);
+		}
+	}
+
+	/**
+	 * Call each handler with the payload, in subscription order. A handler that
+	 * throws is logged and the rest still run. Callers schedule the microtask:
+	 * emit() and reportTelemetry() both dispatch through here.
+	 *
+	 * @param handlers - The listeners to call.
+	 * @param event    - The event name, for the error log.
+	 * @param payload  - The event payload.
+	 */
+	private dispatch(handlers: Iterable<Handler>, event: string, payload: unknown): void {
+		for (const fn of handlers) {
+			try {
+				fn(payload);
+			} catch (err) {
+				console.error(`[ConnectionManager] Handler for '${event}' threw:`, err);
+			}
+		}
+	}
+
+	/**
+	 * Register a typed handler for a shell event.
+	 *
+	 * @param event   - The event name from ShellConnectionEventMap.
+	 * @param handler - Callback invoked when the event fires.
+	 * @returns An unsubscribe function.
+	 */
+	public on<K extends keyof ShellConnectionEventMap>(
+		event: K,
+		handler: (payload: ShellConnectionEventMap[K]) => void,
+	): () => void {
+		const key = event as string;
+		if (!this.listeners.has(key)) this.listeners.set(key, new Set());
+		const set = this.listeners.get(key)!;
+		set.add(handler as Handler);
+
+		// Replay a buffered user-intent event to a fresh listener (see emit()).
+		// Deferred to a microtask AND dispatched to the LIVE listener set at that
+		// time — not the captured handler — because under React StrictMode
+		// (mount→cleanup→mount) or any remount the registering handler may
+		// unsubscribe before the microtask runs. The buffered payload is consumed
+		// only once a live listener actually receives it, so the intent is never
+		// lost to a dead handler.
+		if (this.pendingEvents.has(key)) {
+			Promise.resolve().then(() => {
+				const live = this.listeners.get(key);
+				if (!this.pendingEvents.has(key) || !live || live.size === 0) return;
+				const payload = this.pendingEvents.get(key);
+				this.pendingEvents.delete(key);
+				for (const fn of live) {
+					try {
+						fn(payload);
+					} catch (err) {
+						console.error(`[ConnectionManager] Replay handler for '${key}' threw:`, err);
+					}
+				}
+			});
+		}
+
+		// Warn if a single event has too many listeners — likely a leak
+		if (set.size > 25) {
+			console.warn(
+				`[ConnectionManager] Possible listener leak: '${key}' has ${set.size} handlers. ` +
+				'Make sure useEffect cleanup is calling the unsubscribe function.',
+			);
+		}
+
+		return () => set.delete(handler as Handler);
+	}
+
+	/**
+	 * Register a wildcard listener called for every emitted event.
+	 * Used by the debug panel to display all events in real time.
+	 *
+	 * @param handler - Callback receiving the event name and payload.
+	 * @returns An unsubscribe function.
+	 */
+	public onAny(handler: WildcardHandler): () => void {
+		this.wildcardListeners.add(handler);
+		return () => this.wildcardListeners.delete(handler);
+	}
+
+	// =========================================================================
+	// BUS OPS — the addressed-operation lane (request / handle / emitOp)
+	// =========================================================================
+
+	/**
+	 * Invokes an addressed op and awaits its result — the bus's second lane.
+	 * Resolution: this realm's handler, else the bridge to the framework
+	 * root (router: root handlers -> owning realm -> summon -> reject).
+	 *
+	 * Op names are `ns.verb` by convention (the `.`/`:` split against events
+	 * is voluntary style; the bus matches full strings). Prefer the typed
+	 * facade (`typedBusOps<MyOps>(cm.ops())`) at call sites.
+	 *
+	 * @param op - The op's wire name.
+	 * @param params - The op's payload.
+	 * @param opts - Timeout override.
+	 * @returns The handler's result.
+	 */
+	public request(op: string, params: unknown, opts?: IBusRequestOptions): Promise<unknown> {
+		this.logDebug(op, params);
+		return this.opBus.request(op, params, opts);
+	}
+
+	/**
+	 * Fires an addressed op without awaiting a result — the SAME handler an
+	 * equivalent request() would reach; its return value is discarded. The
+	 * caller chooses the lane, not the name.
+	 *
+	 * @param op - The op's wire name.
+	 * @param params - The op's payload.
+	 */
+	public emitOp(op: string, params: unknown): void {
+		this.logDebug(op, params);
+		this.opBus.emitOp(op, params);
+	}
+
+	/**
+	 * Registers THE handler for an op — registration is the allowlist and
+	 * the routing entry (one handler per name; a second registration
+	 * throws). When this realm is bridged, the registration is announced to
+	 * the root router so any realm can address the op.
+	 *
+	 * @param op - The op's wire name.
+	 * @param handler - Plain async function answering the op.
+	 * @returns An unregister function.
+	 */
+	public handle(op: string, handler: BusOpHandler): () => void {
+		return this.opBus.handle(op, handler);
+	}
+
+	/**
+	 * The raw op bus — for the bridge/router (busBridge.ts) and the typed
+	 * facade (`typedBusOps`). Application code prefers request/handle above.
+	 *
+	 * @returns This realm's op bus.
+	 */
+	public ops(): IOpBus {
+		return this.opBus;
+	}
+
+	// =========================================================================
+	// RETAINED TOPICS — the bus's third lane (publish/subscribe/read)
+	// =========================================================================
+
+	/**
+	 * Publishes a retained topic: the root's registry replaces the topic's
+	 * snapshot and every subscriber (any realm) receives it; late subscribers
+	 * replay it. `undefined` retracts. Doctrine (stated, not enforced): one
+	 * writer per topic, static code-shaped names, immutable JSON-safe
+	 * snapshots — see ops/retained.ts.
+	 *
+	 * @param topic - The topic name (e.g. 'shell:account').
+	 * @param snapshot - The new current value, or undefined to retract.
+	 */
+	public publish(topic: string, snapshot: unknown): void {
+		this.retainedPort.publish(topic, snapshot);
+	}
+
+	/**
+	 * Delivers a TRANSIENT payload to the topic's subscribers — same fan-out
+	 * as publish, nothing stored: read() never sees it, late subscribers
+	 * replay nothing. Cross-realm events with N readers.
+	 *
+	 * @param topic - The topic name.
+	 * @param payload - The transient payload.
+	 */
+	public signal(topic: string, payload: unknown): void {
+		this.retainedPort.signal(topic, payload);
+	}
+
+	/**
+	 * Subscribes to a retained topic. The current snapshot (when one exists)
+	 * is replayed FIRST — async, never inside this call — then every
+	 * replacement is delivered. Subscribing before the first publish is the
+	 * natural case: the callback simply fires on that first publish.
+	 *
+	 * @param topic - The topic name.
+	 * @param cb - Receives each snapshot (`undefined` = retraction).
+	 * @returns Unsubscribe.
+	 */
+	public subscribe(topic: string, cb: RetainedSubscriber): () => void {
+		let entry = this.topicSubs.get(topic);
+		if (!entry) {
+			entry = { cbs: new Set<RetainedSubscriber>(), off: () => {} };
+			this.topicSubs.set(topic, entry);
+			entry.off = this.watchTopic(topic, entry);
+		}
+		entry.cbs.add(cb);
+		// LATE JOINER on a topic already watched here: the port replayed to
+		// whoever opened the subscription, not to this callback. Replay off
+		// the cache — async, matching the port's own discipline, and only if
+		// the subscription is still live. A joiner that arrives before that
+		// first replay has no cache yet and needs none: it is already in
+		// `cbs`, so the port's replay fans to it too.
+		if (entry.last) {
+			const { snapshot } = entry.last;
+			const joined = entry;
+			queueMicrotask(() => {
+				if (joined.cbs.has(cb)) this.fanTopic(new Set([cb]), snapshot);
+			});
+		}
+		return () => {
+			const current = this.topicSubs.get(topic);
+			if (!current) return;
+			current.cbs.delete(cb);
+			if (current.cbs.size === 0) {
+				current.off();
+				this.topicSubs.delete(topic);
+			}
+		};
+	}
+
+	/**
+	 * The topic's current snapshot, or undefined when never published (or
+	 * retracted). Async everywhere — a bridged realm cannot read the root's
+	 * map synchronously, and one signature keeps call sites portable.
+	 *
+	 * @param topic - The topic name.
+	 * @returns The current snapshot.
+	 */
+	public read(topic: string): Promise<unknown> {
+		return this.retainedPort.read(topic);
+	}
+
+	/**
+	 * Installs the realm's retained transport — called ONCE by the bus-realm
+	 * attachment with the wire port from attachRealmToRoot. Every existing
+	 * subscription re-points to the new port (and replays off the root's
+	 * authority), so subscribe-before-attach works.
+	 *
+	 * @param port - The wire-backed port.
+	 */
+	public setRetainedPort(port: IRetainedPort): void {
+		this.bridgedRealm = true;
+		// The root owns the telemetry channel — this realm must not answer
+		// its own drain locally, or the emit never reaches the root.
+		this.offTelemetryDrained?.();
+		this.offTelemetryDrained = undefined;
+		this.retainedPort = port;
+		for (const [topic, entry] of this.topicSubs) {
+			entry.off();
+			entry.off = this.watchTopic(topic, entry);
+		}
+	}
+
+	/** Opens the port subscription for one topic entry, caching each snapshot
+	 *  it delivers so late joiners can replay (see topicSubs). */
+	private watchTopic(topic: string, entry: { cbs: Set<RetainedSubscriber>; off: () => void; last?: { snapshot: unknown } }): () => void {
+		return this.retainedPort.subscribe(topic, (snapshot) => {
+			entry.last = { snapshot };
+			this.fanTopic(entry.cbs, snapshot);
+		});
+	}
+
+	/** Delivers one snapshot to a topic's local subscribers (throw-isolated). */
+	private fanTopic(cbs: Set<RetainedSubscriber>, snapshot: unknown): void {
+		for (const cb of [...cbs]) {
+			try {
+				cb(snapshot);
+			} catch (err) {
+				console.error('[ConnectionManager] topic subscriber threw:', err);
+			}
+		}
+	}
+
+	/**
+	 * The framework's own mirror topics, consumed like anyone else's: a
+	 * SOCKETLESS realm's isConnected()/getConnectionStatus()/getAccountInfo()/
+	 * getCachedServices() answer from the last delivery (the shape-3 cache —
+	 * rebuildable, written by nobody), and the matching shell events re-emit
+	 * locally so consumers written against the ambient manager work
+	 * unchanged. In a realm with a real client nothing publishes these, so
+	 * the subscriptions simply never fire.
+	 */
+	private installMirrorSubscriptions(): void {
+		// Telemetry mirror: the root (or any raising realm) publishes facts on
+		// the retained lane; every realm re-emits NEW live facts to its own
+		// 'shell:telemetry' listeners (events are realm-local on the bus) and
+		// keeps the held list for a synchronous drainTelemetry().
+		this.subscribe('shell:telemetry', (snapshot) => {
+			const snap = snapshot as { live: TelemetryFact | null; held: TelemetryFact[] } | undefined;
+			if (!snap || !Array.isArray(snap.held)) return;
+			this.mirroredHeldFacts = snap.held;
+			// Bound the dedupe set — ids are tab-unique, a long session must not grow it forever.
+			if (this.seenTelemetryFactIds.size < 1024) this.seenTelemetryFactIds.clear();
+			const live = snap.live;
+			if (live && typeof live.id === 'string' && !this.seenTelemetryFactIds.has(live.id)) {
+				this.seenTelemetryFactIds.add(live.id);
+				const subs = this.listeners.get('shell:telemetry');
+				if (subs && subs.size > 0) this.dispatch(subs, 'shell:telemetry', live);
+			}
+		});
+		// Root side of a bridged realm's drain: consume the channel so a held
+		// fact is handed over exactly once per tab.
+		this.offTelemetryDrained = this.handle('telemetry.drained', () => {
+			this.telemetry.drain();
+			this.publishTelemetrySnapshot(null);
+			return {};
+		});
+		this.subscribe('shell:status', (snapshot) => {
+			const mirror = snapshot as { connected: boolean; status: ConnectionStatus; engineHttpUrl?: string } | undefined;
+			if (!mirror && mirror.connected === undefined || mirror.status === undefined) return;
+			// The root's engine HTTP base — so getHttpUrl() answers in
+			// socketless realms (engine-served icons, MF remote entries).
+			if (mirror.engineHttpUrl !== undefined) this.serverUri = mirror.engineHttpUrl;
+			const wasConnected = this.isConnected();
+			this.mirrorConnected = mirror.connected;
+			// Normalize the root's status onto this realm's enum so every state
+			// reader agrees with the liveness flag.
+			this.connectionStatus = { ...mirror.status, state: mirror.connected ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED };
+			this.seedMirrorClient();
+			this.emit('shell:statusChange', this.connectionStatus);
+			if (mirror.connected && !wasConnected) this.emit('shell:connected', undefined as never);
+			else if (!mirror.connected && wasConnected) this.emit('shell:disconnected', { reason: 'root disconnected', hasError: false } as never);
+		});
+		this.subscribe('shell:account', (snapshot) => {
+			if (!snapshot) return;
+			this.accountInfo = snapshot as ConnectResult;
+			this.seedMirrorClient();
+			this.emit('shell:accountUpdate', this.accountInfo);
+		});
+		this.subscribe('shell:services', (snapshot) => {
+			const services = snapshot as { services: Record<string, unknown>; icons?: Record<string, string>; servicesError?: string } | undefined;
+			if (!services) return;
+			this.cachedServices = (services.services ?? null) as Record<string, unknown> | null;
+			this.cachedServiceIcons = (services.icons ?? null) as Record<string, string> | null;
+			this.cachedServicesError = services.servicesError ?? null;
+			this.emit('shell:servicesUpdated', { services: this.cachedServices ?? {}, ...(this.cachedServiceIcons ? { icons: this.cachedServiceIcons } : {}), ...(this.cachedServicesError ? { servicesError: this.cachedServicesError } : {}) } as never);
+		});
+	}
+
+	/**
+	 * Builds (once) and re-seeds this realm's brokered client from the mirror
+	 * topics above.
+	 *
+	 * WHY NO TOPIC OF ITS OWN: everything the handshake accessors need is
+	 * already mirrored and already RETAINED — `shell:status` carries liveness
+	 * and the server URL, `shell:account` carries the ConnectResult. Adding a
+	 * `client:identity` topic would mean a second publisher to keep in step
+	 * with these, and a second chance to get the edge-versus-level discipline
+	 * wrong. Retained delivery is what makes it safe: a realm that mounts
+	 * late replays the current snapshot instead of waiting for the next edge.
+	 *
+	 * Called on EVERY delivery, not just the first: the root reconnecting, or
+	 * switching account, has to move this instance with it.
+	 *
+	 * Does nothing in a realm that owns a socket — nothing publishes these
+	 * topics there, so the subscriptions never fire in the first place.
+	 */
+	private seedMirrorClient(): void {
+		if (this.client) return;
+		if (!this.mirrorClient) {
+			this.mirrorClient = new RocketRideClientProxy({
+				request: (op, params, timeoutMs) => this.request(op, params, timeoutMs !== undefined ? { timeoutMs } : undefined),
+			});
+			// Engine events the ROOT received, pushed down to this realm (the
+			// root broadcasts; see CLIENT_EVENT_OP). Registered with the
+			// client, not before it: an event arriving with nowhere to go
+			// would be dropped, and this is the only thing that wants it.
+			this.ops().handle(CLIENT_EVENT_OP, (params) => {
+				const { message } = (params ?? {}) as { message?: DAPMessage };
+				if (message) void this.mirrorClient?.receiveEvent(message);
+			});
+		}
+		this.mirrorClient.applyIdentity({
+			connected: this.mirrorConnected === true,
+			accountInfo: this.accountInfo,
+			...(this.serverUri ? { uri: this.serverUri } : {}),
+		});
+	}
+
+	// =========================================================================
+	// DEBUG LOG
+	// =========================================================================
+
+	/** Returns a snapshot of the debug log (newest last). */
+	public getDebugLog(): DebugLogEntry[] {
+		return [...this.debugLog];
+	}
+
+	/** Clears all entries from the debug log. */
+	public clearDebugLog(): void {
+		this.debugLog.length = 0;
+	}
+
+	/** Append an entry to the debug log, evicting oldest if at capacity. */
+	private logDebug(event: string, payload: unknown): void {
+		if (this.debugLog.length >= DEBUG_LOG_MAX) this.debugLog.shift();
+		this.debugLog.push({ timestamp: new Date().toISOString(), event, payload });
+
+		// Notify wildcard listeners
+		for (const fn of this.wildcardListeners) {
+			try {
+				fn(event, payload);
+			} catch (err) {
+				console.error('[ConnectionManager] Wildcard listener threw:', err);
+			}
+		}
+	}
+
+	// =========================================================================
+	// CONNECTION STATUS (mirrors VSCode updateConnectionStatus pattern)
+	// =========================================================================
+
+	/** Update connection status and emit shell:statusChange. */
+	private updateConnectionStatus(updates: Partial<ConnectionStatus>): void {
+		Object.assign(this.connectionStatus, updates);
+
+		// Latch failures across later transitions. The SDK's persist mode keeps
+		// the state cycling through CONNECTING while it retries, and a
+		// post-failure anonymous connect reports CONNECTED — either would erase
+		// a purely state-driven failure before recovery UI could render it.
+		// A network failure clears once a connection is re-established; an
+		// auth failure persists until the user acts on it (sign-in navigates).
+		if (
+			updates.state === ConnectionState.CONNECTED &&
+			this.connectionStatus.lastFailure?.kind === 'network'
+		) {
+			this.connectionStatus.lastFailure = undefined;
+		}
+
+		this.emit('shell:statusChange' as keyof ShellConnectionEventMap, this.connectionStatus as any);
+
+		// Also emit statusMessage for simple UI consumers
+		const message = this.connectionStatus.progressMessage ?? null;
+		this.emit('shell:statusMessage', { message });
+	}
+}

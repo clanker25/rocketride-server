@@ -1,0 +1,307 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// SQL-UI — OVERVIEW PANEL (schema summary + tables grid)
+// =============================================================================
+
+import React, { useEffect, useMemo, useState } from 'react';
+import type { CSSProperties } from 'react';
+import { Banner, Button, Card, CardDataGrid, EmptyState, MiniCard, MiniContainer, monoEl, mutedEl } from 'shell';
+import type { GridCellComponent } from 'shell';
+import type { GridColumnDefinition } from 'shell';
+import type { SqlEndpoint, SqlSchemaTable } from '../connect';
+import type { SchemaState } from '../schema/schemaStore';
+import { refreshSchema } from '../schema/schemaStore';
+import { useSqlEnv } from '../sqlEnv';
+import { useTableRecordRequest } from '../navigation';
+import { designUri, getDocs, nextQueryDoc, tableDataUri } from '../docs';
+import type { QueryDocPayload } from '../docs';
+import { useSqlPageNav } from '../pageNav';
+import TableRecordPanel from '../components/TableRecordPanel';
+import { buildRelationGraph } from '../schema/relations';
+import { DatabaseIcon } from '../icons';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+/** Props for the {@link OverviewPanel} component. */
+export interface OverviewPanelProps {
+	/** The connection's endpoint. */
+	endpoint: SqlEndpoint;
+	/** The connection's schema snapshot. */
+	snapshot: SchemaState;
+
+}
+
+/** One row of the tables grid, derived from the schema snapshot. */
+interface TableRow extends Record<string, unknown> {
+	/** Table name (row identity). */
+	name: string;
+	/** Column count. */
+	columns: number;
+	/** Primary key columns joined for display ('—' when none). */
+	primaryKey: string;
+	/** Foreign key count. */
+	foreignKeys: number;
+}
+
+// =============================================================================
+// STYLES
+// =============================================================================
+
+const styles = {
+	// Panel column: metric row at natural height, grid fills the rest.
+	panel: {
+		display: 'flex',
+		flexDirection: 'column',
+		gap: 16,
+		height: '100%',
+		minHeight: 0,
+	} as CSSProperties,
+
+	staticRow: {
+		flexShrink: 0,
+	} as CSSProperties,
+
+	gridFill: {
+		flex: 1,
+		minHeight: 0,
+		display: 'flex',
+		flexDirection: 'column',
+	} as CSSProperties,
+};
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+/**
+ * The connection workbench's Overview page: schema metrics as MiniCards and
+ * the tables list as a LOCAL CardDataGrid. A row click (or a sidebar tree
+ * click routed through the table-record request store) opens the table's
+ * record drawer.
+ */
+export const OverviewPanel: React.FC<OverviewPanelProps> = ({ endpoint, snapshot }) => {
+	const env = useSqlEnv();
+	// In-workbench page navigation.
+	const pageNav = useSqlPageNav();
+
+	// Open record drawers, outermost first. A drawer opened FROM a drawer
+	// (following an inbound foreign key) pushes onto this stack, and the
+	// shell's DetailPanel renders the back arrow and the peel-away sliver.
+	const [stack, setStack] = useState<string[]>([]);
+
+	// Sidebar tree clicks arrive as table-record requests for this connection.
+	const request = useTableRecordRequest();
+	useEffect(() => {
+		if (request && request.key === endpoint.key) {
+			setStack([request.table]);
+		}
+	}, [request, endpoint.key]);
+
+	// Derive metric values + grid rows from the snapshot.
+	const tables = snapshot.schema?.tables ?? {};
+	const rows = useMemo<TableRow[]>(
+		() =>
+			Object.entries(tables).map(([name, def]) => ({
+				name,
+				columns: def.columns.length,
+				primaryKey: def.primary_key?.length ? def.primary_key.join(', ') : '—',
+				foreignKeys: def.foreign_keys?.length ?? 0,
+			})),
+		[tables],
+	);
+	const totalColumns = rows.reduce((sum, r) => sum + r.columns, 0);
+	const totalForeignKeys = rows.reduce((sum, r) => sum + r.foreignKeys, 0);
+
+	// The connection's declared-foreign-key graph, shared by every open
+	// drawer so "Referenced by" and the join finder agree with each other.
+	const graph = useMemo(() => buildRelationGraph(snapshot.schema), [snapshot.schema]);
+
+	/**
+	 * Full per-column contract for the tables grid (LOCAL mode).
+	 */
+	const columns = useMemo(
+		() =>
+			[
+				{
+					title: 'Table',
+					field: 'name',
+					rrType: 'string',
+					rrDefault: true,
+					rrDefaultSort: 'asc',
+					rrDescription: 'Table name as reflected from the database.',
+					headerSort: true,
+					formatter: (cell: GridCellComponent) => monoEl(String(cell.getValue() ?? '')),
+				},
+				{
+					title: 'Columns',
+					field: 'columns',
+					rrType: 'number',
+					rrDefault: true,
+					rrDescription: 'Number of columns in the table.',
+					width: 110,
+					hozAlign: 'right',
+					headerSort: true,
+					sorter: 'number',
+				},
+				{
+					title: 'Primary Key',
+					field: 'primaryKey',
+					rrType: 'string',
+					rrDefault: true,
+					rrDescription: 'Primary key column(s), or a dash when the table has none.',
+					width: 220,
+					headerSort: true,
+					formatter: (cell: GridCellComponent) => {
+						const value = String(cell.getValue() ?? '');
+						return value === '—' ? mutedEl(value) : monoEl(value);
+					},
+				},
+				{
+					title: 'Foreign Keys',
+					field: 'foreignKeys',
+					rrType: 'number',
+					rrDefault: true,
+					rrDescription: 'Number of foreign keys declared on the table.',
+					width: 130,
+					hozAlign: 'right',
+					headerSort: true,
+					sorter: 'number',
+				},
+			] satisfies GridColumnDefinition[],
+		[],
+	);
+
+	// ── Loading / error framing ──────────────────────────────────────────────
+
+	if (snapshot.status === 'error') {
+		return (
+			<div style={styles.panel}>
+				<Banner variant="error">Schema reflection failed: {snapshot.error}</Banner>
+				<div>
+					<Button
+						variant="primary"
+						onClick={() => { if (env.ready) void refreshSchema(env.getSession(endpoint), { fresh: true }); }}
+						disabled={!env.ready}
+					>
+						Retry
+					</Button>
+				</div>
+			</div>
+		);
+	}
+
+	if (snapshot.status !== 'ready') {
+		// First paint: framed progress state, never bare "Loading..." text.
+		return (
+			<EmptyState
+				icon={<DatabaseIcon />}
+				title="Reading schema"
+				description={`Reflecting tables, columns, and relations from ${endpoint.nodeName}...`}
+			/>
+		);
+	}
+
+	// ── Ready ────────────────────────────────────────────────────────────────
+
+	return (
+		<div style={styles.panel}>
+			{/* Schema metrics. */}
+			<div style={styles.staticRow}>
+				<MiniContainer columns={4}>
+					<MiniCard value={String(rows.length)} label="Tables" />
+					<MiniCard value={String(totalColumns)} label="Columns" />
+					<MiniCard value={String(totalForeignKeys)} label="Foreign Keys" />
+					<MiniCard value={snapshot.dialect} label="Dialect" />
+				</MiniContainer>
+			</div>
+
+			{/* Tables grid — fills the remaining height; row click inspects. */}
+			<div style={styles.gridFill}>
+				<Card noBodyPadding fill>
+					<CardDataGrid<TableRow>
+						title="Tables"
+						actions={
+							<Button
+								variant="ghost"
+								small
+								onClick={() => {
+									// Fresh create-table draft — the DESIGN page.
+									pageNav.openDesign(null);
+								}}
+							>
+								+ Create Table
+							</Button>
+						}
+						columns={columns}
+						data={rows}
+						tableId="sql-overview-tables"
+						paginate={false}
+						height="100%"
+						onRowClick={(row) => setStack([row.name])}
+						emptyTitle="No tables"
+						emptyDescription="The attached database reports no tables."
+					/>
+				</Card>
+			</div>
+
+			{/* Record drawers, outermost first. Following an inbound foreign
+			    key pushes another drawer on top rather than swapping this
+			    one, so the way back is the shell's own back arrow. */}
+			{stack.map((name, depth) => (
+				<TableRecordPanel
+					key={`${name}-${depth}`}
+					open
+					onClose={() => setStack((current) => current.slice(0, depth))}
+					database={snapshot.schema?.database ?? ''}
+					table={name}
+					def={(tables[name] as SqlSchemaTable | undefined) ?? null}
+					dialect={snapshot.dialect}
+					graph={graph}
+					refreshedAt={snapshot.refreshedAt}
+					onOpenTable={(next) => setStack((current) => [...current.slice(0, depth + 1), next])}
+					onOpenQuery={(sql, label) => {
+						// Generated SQL never runs by itself; `origin` lets the
+						// query surface say so on screen.
+						pageNav.openQuery({ sql, label, origin: 'generated' });
+						setStack([]);
+					}}
+					onBrowseData={() => {
+						// The table's data browser — the DATA page.
+						pageNav.openTableData(name);
+						setStack([]);
+					}}
+					onDesign={() => {
+						// The table's designer — the DESIGN page.
+						pageNav.openDesign(name);
+						setStack([]);
+					}}
+				/>
+			))}
+		</div>
+	);
+};
+
+export default OverviewPanel;

@@ -1,0 +1,480 @@
+// MIT License
+//
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// SHELL CONNECTION TYPES — shared contract for shell and VSCode hosts
+// =============================================================================
+//
+// Both hosts implement IConnectionManager with their own internals:
+//   - shell:  module singleton with typed event bus
+//   - VSCode:    class extending Node EventEmitter
+//
+// All shell events use the 'shell:*' prefix. The ShellConnectionEventMap
+// defines canonical event names and payload types that both hosts agree on.
+// =============================================================================
+
+import type { ConnectResult, DAPMessage, SignupProperties } from 'rocketride';
+import type { ConnectionStatus } from './connection';
+import type { CheckoutPlan, PromoValidation } from '../modules/checkout/types';
+import type { TelemetryFact } from '../util/telemetryChannel';
+
+// =============================================================================
+// APP ENTRY — minimal shape for app catalog events
+// =============================================================================
+
+/**
+ * Minimal app entry shape shared across hosts for event payloads.
+ *
+ * Both shell and VSCode emit `shell:appsUpdated` and `shell:subscribe`
+ * with app entries. This captures only the fields every host guarantees, so
+ * each host's richer concrete manifest type (shell's `AppManifestEntry`
+ * and the SDK's `AppManifestEntry`) structurally satisfies it and can be
+ * passed directly without a cast. Consumers that need host-specific fields
+ * narrow to their concrete manifest type.
+ *
+ * Deliberately has NO index signature: an index signature would force
+ * interface-typed manifest values (interfaces get no implicit index
+ * signature) to be cast, which is exactly the divergence this shape unifies.
+ */
+export interface ShellAppEntry {
+	/** Unique app identifier (e.g. 'rocketride.home'). */
+	id: string;
+	/** Display name. */
+	name: string;
+	/** Optional description. */
+	description?: string;
+}
+
+// =============================================================================
+// PLATFORM NOTIFICATIONS
+// =============================================================================
+
+/**
+ * One platform notification (the `shell:notify` payload).
+ *
+ * A discriminated union — narrow on `kind`. New notification kinds are
+ * APPENDED as union members; existing members never change shape, so
+ * consumer narrowing stays valid (the same append-only rule as the event
+ * map itself).
+ *
+ * Today every producer is PAGE-LOCAL (the event never rides the wire); a
+ * server-pushed feed may later emit the same event, so consumers must not
+ * assume the producer shares their realm beyond what the payload carries.
+ */
+export type ShellNotification =
+	/**
+	 * A store-VFS file changed — any write through the app-dev VFS seam.
+	 * `uri` is the full store path; `origin` identifies the writer (a
+	 * dev-session id, or a verb like 'scaffold') so writers can skip their
+	 * own echo; `rev` is a page-monotonic write counter so a consumer
+	 * hearing one change over several transports can dedupe.
+	 */
+	{ kind: 'onFsChange'; uri: string; origin: string; rev: number };
+
+// =============================================================================
+// EVENT MAP
+// =============================================================================
+
+/**
+ * Canonical map of all shell event names to their payload shapes.
+ *
+ * Both shell and VSCode emit and listen to events from this map.
+ * Hosts may augment the map with host-specific events via declaration
+ * merging, but the core events listed here must be consistent.
+ *
+ * Events are grouped by concern:
+ * - **Connection lifecycle**: connect/disconnect/status
+ * - **Server data**: push events, account updates, service catalog
+ * - **Auth**: login/logout flows
+ * - **UI coordination**: app switching, subscriptions, theme, sidebar
+ */
+export interface ShellConnectionEventMap {
+	// ── Connection lifecycle ─────────────────────────────────────────────
+
+	/** Fired when the WebSocket handshake completes and authentication succeeds. */
+	'shell:connected': Record<string, never>;
+
+	/** Fired when the WebSocket closes (cleanly or due to error). */
+	'shell:disconnected': { reason: string; hasError: boolean };
+
+	/**
+	 * Transient status bar text shown during connection state transitions.
+	 *
+	 * Examples: `"Reconnecting..."`, `"Authenticating..."`.
+	 * Pass `null` to clear the message.
+	 */
+	'shell:statusMessage': { message: string | null };
+
+	/**
+	 * Full connection state machine update.
+	 *
+	 * VSCode emits this with the complete `ConnectionStatus` object
+	 * (state, connectionMode, hasCredentials, retryAttempt, progressMessage, etc.).
+	 * Cloud-ui may emit a simpler version or omit it entirely.
+	 *
+	 * Both shell and VSCode now share the ConnectionStatus type from
+	 * shared/types/connection.ts.
+	 */
+	'shell:statusChange': ConnectionStatus;
+
+	/** Fired when a connection attempt or operation fails with an error. */
+	'shell:error': { error: Error | unknown };
+
+	// ── Server data ─────────────────────────────────────────────────────
+
+	/**
+	 * Every push event received from the RocketRide server over the WebSocket.
+	 *
+	 * Wraps the raw DAP event message so app plugins can subscribe to
+	 * server-pushed data without needing direct client access.
+	 */
+	'shell:event': { event: DAPMessage };
+
+	/**
+	 * Server-pushed account update (e.g. subscription change, profile edit,
+	 * environment variable change).
+	 *
+	 * Triggered by the `apaext_account` DAP event. The payload is the
+	 * updated `ConnectResult` containing identity, organizations, teams,
+	 * envKeys, and subscription status.
+	 */
+	'shell:accountUpdate': ConnectResult;
+
+	/**
+	 * The user's default organization changed. A pure NOTIFICATION — the
+	 * server never swaps a live connection's identity or dictates a
+	 * response; each client reacts its own way (the browser shell reloads,
+	 * VS Code reloads its window, an app webview with its own connection
+	 * does whatever suits it). Re-authenticating resolves the new default
+	 * org. Triggered by the `apaext_org_changed` DAP event.
+	 */
+	'shell:orgChanged': { orgId: string };
+
+	/**
+	 * The shell is about to RESCOPE to a different workspace in-process (the
+	 * browser shell's reaction to `shell:orgChanged` — reconnect + remount
+	 * instead of a page reload). Subscribers holding per-workspace work (dev
+	 * sessions, running previews, retained per-workspace topics) should stop
+	 * and release it now: the workspace subtree unmounts right after.
+	 */
+	'shell:workspaceWillChange': { orgId: string };
+
+	/**
+	 * The in-process workspace rescope finished: the connection is
+	 * re-authenticated under the new default org and the workspace subtree
+	 * has remounted against its stores. Counterpart of
+	 * `shell:workspaceWillChange`.
+	 */
+	'shell:workspaceChanged': { orgId: string };
+
+	/**
+	 * Emitted when the service catalog is fetched or refreshed.
+	 *
+	 * Contains the full services map, the summary's deduplicated icon
+	 * table, and an optional error string if the fetch failed.
+	 */
+	'shell:servicesUpdated': { services: Record<string, unknown>; icons?: Record<string, string>; servicesError?: string };
+
+	/**
+	 * The app catalog has changed — shell and app-store views should update.
+	 *
+	 * Emitted after authentication (ConnectResult includes entitled apps),
+	 * or when the server pushes an app-publish notification. The `apps` array
+	 * is the complete replacement set — consumers should discard their
+	 * previous list entirely.
+	 *
+	 * The `apps` array contains server app entries. Typed as a minimal
+	 * interface to avoid importing shell's AppManifestEntry into shared.
+	 * Hosts cast to their concrete AppManifestEntry type.
+	 */
+	'shell:appsUpdated': { apps: ShellAppEntry[] };
+
+	// ── Platform notifications ───────────────────────────────────────────
+
+	/**
+	 * The general platform notification bus — a typed union; narrow on
+	 * `kind` (see {@link ShellNotification}). Page-local today: emitted by
+	 * in-page producers (the app-dev VFS seam), never by the server.
+	 */
+	'shell:notify': ShellNotification;
+
+	// ── Dev tools ────────────────────────────────────────────────────────
+
+	/**
+	 * A dev tool's sidebar tab was selected in the host's sidebar chrome.
+	 *
+	 * Fired on EVERY selection (no deduplication). What activation means is
+	 * the TOOL's decision, made in its devToolSidebar code: a single-pane
+	 * tool opens its pane (`documents.open('', name)`); a per-document tool
+	 * ignores the event. The FIRST selection is also what lazily mounts the
+	 * tool's sidebar, so it arrives before the subscription exists — a tool
+	 * that opens on activation therefore also opens on MOUNT (mounting IS
+	 * the first activation) and uses this event for re-activations only.
+	 */
+	'shell:toolSidebarActivated': { appId: string };
+
+	/**
+	 * A dev tool's sidebar tab stopped being the selected one — the user
+	 * selected a different tab (another tool's, or a fixed mode). Fired
+	 * before the successor's `shell:toolSidebarActivated`, and only on a
+	 * real change: re-selecting the same tab deactivates nothing, and a
+	 * sidebar reload or an externally synced highlight emits neither event.
+	 * Typical use: a controller pauses discretionary work (polling,
+	 * watchers) while its panel is out of view.
+	 */
+	'shell:toolSidebarDeactivated': { appId: string };
+
+	// ── Auth ─────────────────────────────────────────────────────────────
+
+	/**
+	 * Successful authentication — identity is now available.
+	 *
+	 * Emitted after `connect()` resolves with valid credentials.
+	 * The `user` field contains the full `ConnectResult` with identity data.
+	 */
+	'shell:login': { user: ConnectResult };
+
+	/** User signed out — identity cleared, client disconnected. */
+	'shell:logout': Record<string, never>;
+
+	/**
+	 * Sign-in request initiated by the UI (e.g. "Get Started" button).
+	 *
+	 * Optional `appId` specifies which app to navigate to after auth completes.
+	 * Optional `register` marks a sign-up intent ("Get Started" CTAs vs. "Sign In"
+	 * controls); it no longer changes the destination. `auto` marks a request
+	 * the shell raised itself (the auth gate of an app that requires sign-in)
+	 * rather than a click; it is reported on the auth:start telemetry fact.
+	 */
+	'shell:loginRequest': { appId?: string; register?: boolean; auto?: boolean; signupProperties?: SignupProperties };
+
+	/** Sign-out request initiated by the UI (e.g. "Sign Out" button). */
+	'shell:logoutRequest': Record<string, never>;
+
+	// ── UI coordination ──────────────────────────────────────────────────
+
+	/** Switch the active app without going through the workspace dispatch. */
+	'shell:switchApp': { appId: string };
+
+	/**
+	 * User clicked "Subscribe" on a paid app in the marketplace.
+	 *
+	 * Opens the CheckoutModal. The `app` field is the manifest entry. The
+	 * optional `plan` preselects a tier and skips the picker — going straight
+	 * to payment (used by the web pricing page); omit it to show the picker.
+	 * The optional `promo` carries a discount code already validated on the
+	 * pricing page, so the skipped-picker checkout still applies the discount.
+	 */
+	'shell:subscribe': { app: ShellAppEntry; plan?: CheckoutPlan; promo?: PromoValidation | null };
+
+	/**
+	 * User cancelled a subscription for an app from the account/billing UI.
+	 * Consumers refresh their entitlement view for the given app.
+	 */
+	'shell:unsubscribe': { appId: string };
+
+	/** Navigate back to the My Apps launcher screen. */
+	'shell:myApps': Record<string, never>;
+
+	/**
+	 * A product-telemetry fact the shell observed (`auth:complete`). The shell
+	 * has no analytics transport; the active app forwards these to its own.
+	 * `auth:start` is never delivered here (the OAuth redirect follows at once):
+	 * it is kept in the connection manager's buffer, as are facts raised before
+	 * any app subscribed or whose last listener left before their dispatch, and
+	 * handed over by `drainTelemetry()`.
+	 */
+	'shell:telemetry': TelemetryFact;
+
+	/**
+	 * Request the shell open a built-in overlay (e.g. from a guest app's
+	 * profile/account menu, which can't render the shell's overlays directly).
+	 * The `id` selects which overlay to show.
+	 */
+	'shell:openOverlay': {
+		id: 'account' | 'settings' | 'environment';
+		/** Optional deep link: the settings nav section to open at (a registry
+		 *  section id or a rich-section id). Ignored by other overlays. */
+		section?: string;
+	};
+
+	/** Sidebar is starting to collapse — dependent UI can prepare. */
+	'shell:sidebarCollapsing': Record<string, never>;
+
+	/**
+	 * An app asking for the rail collapsed or expanded.
+	 *
+	 * The counterpart to `shell:sidebarCollapsing`, which only ever ran the
+	 * other way: the shell announced, and nothing an app could reach answered.
+	 * `AppDescriptor.sidebar` states the same preference declaratively and is
+	 * the better place for it — this exists because a descriptor is read only
+	 * once the app's bundle has loaded, and an app that wants the rail closed
+	 * wants it closed on the first frame, not after its own code arrives.
+	 *
+	 * The shell remembers the answer per app, so every later load of that app
+	 * renders closed rather than collapsing on the way in.
+	 */
+	'shell:setSidebarCollapsed': { collapsed: boolean };
+
+	/**
+	 * Theme tokens changed.
+	 *
+	 * Contains the full set of CSS custom property key/value pairs
+	 * for the new theme.
+	 */
+	'shell:themeChange': { tokens: Record<string, string> };
+
+	/**
+	 * A view became the active/focused view in the workspace. Panels that
+	 * defer measurement or data fetches until visible listen for this to
+	 * (re)initialize when their tab is activated.
+	 */
+	'shell:viewActivated': { viewId: string };
+
+	// ── App development platform ─────────────────────────────────────────
+
+	/**
+	 * The server-side app manifest changed for this user — a dev overlay was
+	 * registered/expired or an app version was published/deployed. The server
+	 * pushes the rebuilt account (shell:accountUpdate) alongside this signal;
+	 * consumers that maintain their own app caches use `source` to decide
+	 * whether/how to refresh (e.g. 'dev-overlay', 'publish', 'expiry').
+	 */
+	'shell:manifestRefresh': { source: string };
+
+	/**
+	 * An app's marketplace review status changed (submitted, withdrawn,
+	 * approved, rejected). Pushed to the developer org's connections (so App
+	 * Builder surfaces update badges and show the decision toast) and to
+	 * reviewer connections holding sys.app/sys.admin (so the admin queue
+	 * tracks the server live). `status` is the deployment's review state
+	 * ('submit' | 'private' | 'ready' | 'rejected' | 'failed'); optional
+	 * `version` is the registry version that transitioned; optional `notes`
+	 * carries reviewer notes on rejection.
+	 */
+	'app:statusChanged': { appId: string; version?: number; status: string; notes?: string };
+
+	/**
+	 * Files changed under a watched store prefix (app-dev project sources,
+	 * install-task outputs). Debounced server-side; `paths` is the coalesced
+	 * set of changed paths under `prefix`. App Builder file views and type
+	 * caches invalidate on this.
+	 */
+	'store:changed': { prefix: string; paths: string[] };
+}
+
+// =============================================================================
+// CONNECTION MANAGER INTERFACE
+// =============================================================================
+
+/**
+ * Minimal interface that both shell and VSCode connection managers implement.
+ *
+ * Each host has its own concrete implementation with additional host-specific
+ * methods, but consumers that need cross-host compatibility should program
+ * against this interface.
+ *
+ * The `on()` method returns an unsubscribe function (matching the shell
+ * pattern), not the EventEmitter `this` reference. VSCode's implementation
+ * wraps the Node EventEmitter to provide this API.
+ */
+export interface IConnectionManager {
+	/**
+	 * Returns the underlying RocketRideClient instance, or `null` if not
+	 * yet initialized.
+	 *
+	 * Typed as `unknown` so the shared package does not depend on the
+	 * concrete client type. Hosts should cast to `RocketRideClient` in
+	 * their own code.
+	 */
+	getClient(): unknown | null;
+
+	/** Returns `true` if the WebSocket is authenticated and connected. */
+	isConnected(): boolean;
+
+	/**
+	 * Returns the cached `ConnectResult` from the most recent successful
+	 * authentication, or `null` if never connected.
+	 *
+	 * Contains identity, organizations, teams, envKeys, subscription status.
+	 */
+	getAccountInfo(): unknown | null;
+
+	/**
+	 * Returns the cached service catalog.
+	 *
+	 * If the cache is empty and the client is connected, implementations
+	 * should trigger a lazy background fetch and emit `shell:servicesUpdated`
+	 * when the result arrives. The summary's deduplicated icon table rides
+	 * along with the services map.
+	 */
+	getCachedServices(): { services: Record<string, unknown>; icons?: Record<string, string>; servicesError?: string };
+
+	/**
+	 * Fetches the service catalog from the server and updates the cache.
+	 *
+	 * Deduplicates concurrent calls.  Emits `shell:servicesUpdated` on
+	 * completion (success or failure).
+	 */
+	refreshServices(): Promise<void>;
+
+	/**
+	 * Initiates a connection to the RocketRide server.
+	 *
+	 * @param credential - Optional authentication credential. Shape varies
+	 *   by host (token string, PKCE exchange object, etc.).
+	 */
+	connect(credential?: unknown): Promise<unknown>;
+
+	/**
+	 * Gracefully disconnects from the RocketRide server.
+	 *
+	 * Safe to call when already disconnected.
+	 */
+	disconnect(): Promise<void>;
+
+	/**
+	 * Registers a handler for a typed shell event.
+	 *
+	 * @param event   - The event name from `ShellConnectionEventMap`.
+	 * @param handler - Callback invoked when the event fires.
+	 * @returns An unsubscribe function — call it to remove the handler.
+	 */
+	on<K extends keyof ShellConnectionEventMap>(
+		event: K,
+		handler: (payload: ShellConnectionEventMap[K]) => void,
+	): () => void;
+
+	/**
+	 * Emits a typed shell event, dispatching to all registered handlers.
+	 *
+	 * Public so that any code (sidebar, home app, plugins) can fire UI
+	 * coordination events through the connection manager.
+	 *
+	 * @param event   - The event name from `ShellConnectionEventMap`.
+	 * @param payload - The payload matching the event's type.
+	 */
+	emit<K extends keyof ShellConnectionEventMap>(
+		event: K,
+		payload: ShellConnectionEventMap[K],
+	): void;
+}
