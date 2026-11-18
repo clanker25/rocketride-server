@@ -1,0 +1,111 @@
+# llm_minimax
+
+A RocketRide LLM node that connects MiniMax models to a pipeline via the MiniMax cloud API or a self-hosted OpenAI-compatible server.
+
+## What it does
+
+Provides MiniMax chat models as an `llm` invoke connection for agents and other nodes that need an LLM, and can also be used directly via lanes. It works against the MiniMax cloud API or a self-hosted OpenAI-compatible server (vLLM, SGLang, MLX, or Ollama).
+
+The MiniMax API is OpenAI-compatible, so the node uses **langchain-openai** (`ChatOpenAI`) pointed at the configured base URL, with `temperature: 0` and the profile's output-token limit as `max_tokens`. Config validation at save time runs a minimal one-token probe through the **openai** SDK and surfaces provider errors as warnings.
+
+MiniMax M2-series models return chain-of-thought wrapped in `<think>...</think>` inside the `content` field; the node strips that block so downstream pipeline nodes only see the final answer.
+
+## Lanes
+
+| Lane in     | Lane out  | Description                                          |
+| ----------- | --------- | ---------------------------------------------------- |
+| `questions` | `answers` | Send a question directly, receive a generated answer |
+
+## Profiles
+
+Default: **MiniMax M2** (`minimax-m2`).
+
+| Profile | Model | Context | Output |
+| ------- | ----- | ------- | ------ |
+| `minimax-m2` **(default)** | `MiniMax-M2` | 204,800 | 65,536 |
+| `minimax-m3` | `MiniMax-M3` | 1,000,000 | 131,072 |
+| `minimax-m2-7` | `MiniMax-M2.7` | 204,800 | 65,536 |
+| `minimax-m2-7-highspeed` | `MiniMax-M2.7-highspeed` | 204,800 | 65,536 |
+| `minimax-m2-7-local` | `MiniMaxAI/MiniMax-M2.7` | 204,800 | 8,192 |
+
+<details>
+<summary><strong>View 13 more models</strong></summary>
+
+| Profile | Model | Context | Output |
+| ------- | ----- | ------- | ------ |
+| `custom` | _(user-specified)_ | 200,000 | 8,192 |
+| `minimax-m2-1` | `MiniMax-M2.1` | 204,800 | 65,536 |
+| `minimax-m2-1-highspeed` | `MiniMax-M2.1-highspeed` | 204,800 | 65,536 |
+| `minimax-m2-5` | `MiniMax-M2.5` | 204,800 | 65,536 |
+| `minimax-m2-5-highspeed` | `MiniMax-M2.5-highspeed` | 204,800 | 65,536 |
+| `minimax-m2-local` | `MiniMaxAI/MiniMax-M2` | 204,800 | 8,192 |
+| `minimax-m2-5-local` | `MiniMaxAI/MiniMax-M2.5` | 204,800 | 8,192 |
+| `minimax-01` | `minimax-01` | 1,000,192 | 900,172 |
+| `minimax-m1` | `minimax-m1` | 1,000,000 | 40,000 |
+| `minimax-m2-her` | `minimax-m2-her` | 65,536 | 2,048 |
+| `minimax-m2-7-free` | `minimax-m2.7:free` | 196,608 | 176,947 |
+| `minimax-m3-batch` | `minimax-m3:batch` | 524,288 | 471,859 |
+| `minimax-m3-free` | `minimax-m3:free` | 1,048,576 | 943,718 |
+
+</details>
+
+The `-highspeed` variants are MiniMax's faster tier of the same generation. MiniMax M3 is multimodal at the API level, though this node exposes only text.
+
+## Configuration
+
+Choose a profile to set the model and token limits. Cloud profiles target MiniMax's API; local profiles prefill the Hugging Face model path and a local OpenAI-compatible server, while `custom` exposes the model, context budget, output limit (8,192 tokens by default), and server URL for manual configuration.
+
+### Server base URL
+
+Use `https://api.minimax.io/v1` for the international cloud API or `https://api.minimaxi.com/v1` for China. Local profiles default to vLLM or SGLang at `http://localhost:8000/v1`; change the URL when using MLX, Ollama, or another OpenAI-compatible server.
+
+## Authentication
+
+Cloud profiles require a MiniMax API key in `apikey`. The key requirement is enforced by base-URL match: if `serverbase` contains `api.minimax` (covers both `api.minimax.io` international and `api.minimaxi.com` China) and no key is set, the node raises `MiniMax API key is required for cloud profiles.` at startup.
+
+Local profiles (vLLM / SGLang / MLX / Ollama) have no `apikey` field; local OpenAI-compatible servers accept any token, so the node passes a dummy key (`sk-local-dummy-key`).
+
+## Notes
+
+### Local deployment
+
+MiniMax's open-weight M2-family models are MIT-licensed 230B-parameter MoE models with about 10B parameters active per token. They require substantial memory:
+
+- **Linux + GPU (at least 96 GB total VRAM):** Run vLLM or SGLang on port `8000` and use the profile's Hugging Face model path.
+- **Apple Silicon Mac Studio (at least 128 GB unified memory):** Run MLX on port `8080`, set the server URL to `http://localhost:8080/v1`, and use a quantized build such as `mlx-community/MiniMax-M2.7-4bit`.
+- **Ollama on lower-memory systems:** Set the server URL to `http://localhost:11434/v1` and use the tag you pulled. Verify that the tag exists before configuring it.
+
+These models do not fit on a typical laptop without aggressive quantization. M2.7 is a reasoning model whose API separates `message.content` from `message.reasoning_content`, so allow a generous output budget even for short prompts.
+
+## Upstream docs
+
+- [MiniMax platform documentation](https://platform.minimaxi.com/document/)
+- [MiniMax API reference (OpenAI-compatible)](https://www.minimax.io/platform/document/ChatCompletion)
+- [MiniMax local deployment guide](https://platform.minimax.io/docs/guides/local-deploy)
+
+---
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `minimax.profile` | `string` | **Model**<br/>MiniMax LLM model | `"minimax-m2"` |
+| `minimax.serverbase` | `string` | **Server base URL**<br/>OpenAI-compatible base URL for the MiniMax endpoint (e.g. https://api.minimax.io/v1 for international, https://api.minimaxi.com/v1 for China). | `"https://api.minimax.io/v1"` |
+| `model` | `string` | **Model**<br/>MiniMax model |  |
+| `modelOutputTokens` | `integer` | **Output Tokens**<br/>Most tokens the model may write in one reply (at least 1,024). Leave it empty to keep the node's default. Reasoning models count their thinking against this limit: set it well above the reply you expect, or they can spend it all thinking and return nothing. It cannot exceed Tokens; a larger value is lowered to it. |  |
+| `modelTotalTokens` | `number` | **Tokens**<br/>Total Tokens |  |
+
+## Dependencies
+
+- `openai`
+- `langchain-openai`
+- `langchain-core`
+- `langchain`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/llm_minimax)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

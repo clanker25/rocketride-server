@@ -1,0 +1,151 @@
+# llm_openai_api
+
+A RocketRide LLM node that connects any OpenAI-compatible API endpoint to a pipeline.
+
+## What it does
+
+Connects any OpenAI-compatible API endpoint to your pipeline. Use this node for
+providers that implement the OpenAI API spec (Featherless, Together, Groq, Ollama,
+LM Studio, and others) but do not have a dedicated RocketRide node. Used primarily as an
+`llm` invoke connection by agents and other nodes that need an LLM, but can also be used
+directly via lanes.
+
+Built on **langchain-openai** (`ChatOpenAI`) over the official **openai** SDK. The chat
+client is created with `temperature: 0` for deterministic output, and `max_tokens` is set
+from the shared LLM base's output-token budget (default 4096, minimum 1024). When
+`base_url` is empty, the SDK falls back to the default OpenAI endpoint.
+
+When the node configuration is saved, it validates the settings by sending a 1-token `"Hi"`
+completion request to the configured endpoint (10-second timeout) and surfaces any provider
+error (bad key, unknown model, unreachable URL) as a warning with the provider's status code
+and message, truncated to 500 characters.
+
+## Lanes
+
+| Lane in     | Lane out  | Description                                          |
+| ----------- | --------- | ---------------------------------------------------- |
+| `questions` | `answers` | Send a question directly, receive a generated answer |
+
+## Profiles
+
+Generic endpoint default: **Custom OpenAI-compatible endpoint** (`custom`).
+Nebius preset default: **Llama 3.3 70B Instruct** (`llama-3-3-70b`).
+
+The directory documents the generic endpoint and the Nebius branded preset in one
+combined profile table.
+
+| Profile | Model | Context tokens | Source |
+| ------- | ----- | -------------- | ------ |
+| Generic `custom` **(default)** | _(user-specified)_ | 32,768 | Any OpenAI-compatible API |
+| `llama-3-3-70b` **(default)** | `meta-llama/Llama-3.3-70B-Instruct` | 131,072 | Nebius Token Factory |
+| `qwen3-235b` | `Qwen/Qwen3-235B-A22B` | 131,072 | Nebius Token Factory |
+| `deepseek-v3` | `deepseek-ai/DeepSeek-V3` | 131,072 | Nebius Token Factory |
+
+## Configuration
+
+Choose `custom` for a generic provider and set its model ID, base URL, context limit,
+output limit (4,096 tokens unless changed) and API key. Choose one of the named Nebius profiles when using Token Factory; those
+profiles pin the model ID, endpoint, and context limit.
+
+### Generic OpenAI-compatible endpoints
+
+Set `base_url` to the provider's OpenAI-compatible API root and `model` to its exact
+model identifier. When `base_url` is empty, the OpenAI SDK uses its default endpoint.
+Use a positive `modelTotalTokens` value that matches the selected model.
+
+### Nebius preset
+
+`services.nebius.json` registers **Nebius** (`llm_nebius://`) as a branded preset of
+this node. It uses the same Python implementation and pins the base URL to
+`https://api.tokenfactory.nebius.com/v1/`. The three named Nebius profiles in the
+combined table require no model or endpoint edits.
+
+Nebius profiles default the API key to the `${ROCKETRIDE_NEBIUS_KEY}` environment
+substitution, so no per-node key entry is needed when that variable is set. The Nebius
+service also exposes its own `custom` option for another Token Factory model, retaining
+the pinned endpoint, environment-backed key, and 131,072-token context limit, with an
+output limit of 4,096 tokens unless changed. The
+combined table represents the duplicate `custom` key once, using the generic service's
+merged 32,768-token default.
+
+## Authentication
+
+For `custom`, provide the API key expected by the configured endpoint. Nebius named
+profiles use `${ROCKETRIDE_NEBIUS_KEY}` by default; replace it only when the credential
+must be supplied directly in the node configuration.
+
+## Notes
+
+### Error handling and retries
+
+Provider errors are mapped to friendly messages and classified for retry:
+
+| Provider exception    | Retried | Surfaced as                                     |
+|-----------------------|---------|-------------------------------------------------|
+| `AuthenticationError` | no      | `Invalid API key.`                              |
+| `APIError`            | no      | `An error occurred with the API.`               |
+| `RateLimitError`      | yes     | `Rate limit exceeded. Please try again later.`  |
+| `APIConnectionError`  | yes     | `Failed to connect to the API.`                 |
+
+Anything else falls through to the shared LLM base's default retry and mapping logic.
+
+### Testing
+
+`services.json` includes a `test` block that runs the `custom` profile against a local
+test server with a mocked `langchain_openai`, so no real API key is required.
+`ROCKETRIDE_MOCK` must point to `nodes/test/mocks`.
+
+### Model sync (Nebius service only)
+
+The profiles in `services.nebius.json` are maintained by the `sync_models` tooling
+(`llm_nebius` provider, `ROCKETRIDE_NEBIUS_KEY`), which reads Nebius Token Factory's
+own model list. New profiles are written with the Nebius base URL and the same
+`${ROCKETRIDE_NEBIUS_KEY}` reference the existing ones use.
+
+Token limits come only from Nebius: it runs open-weight models on its own hardware,
+so the context window is its choice, and the same model is served with a different
+window by every other host. The sync runs **only** with that key, because Nebius IDs
+(`Qwen/Qwen3-235B-A22B`) appear in no other catalogue and a keyless run would mark
+these profiles deprecated — see [Why some providers need their own key](https://github.com/rocketride-org/rocketride-server/blob/develop/tools/sync_models/README.md#why-some-providers-need-their-own-key).
+
+The generic `services.json` profiles are **not** synced: the model is whatever the
+user types for their own OpenAI-compatible endpoint.
+
+---
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+### OpenAI-Compatible API (`services.json`)
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `base_url` | `string` | **Base URL**<br/>API base URL (e.g. https://api.featherless.ai/v1) |  |
+| `model` | `string` | **Model**<br/>Model name (e.g. zai-org/GLM-5, meta-llama/Llama-3-70b) |  |
+| `modelOutputTokens` | `integer` | **Output Tokens**<br/>Most tokens the model may write in one reply (at least 1,024). Leave it empty to keep the node's default. Reasoning models count their thinking against this limit: set it well above the reply you expect, or they can spend it all thinking and return nothing. It cannot exceed Tokens; a larger value is lowered to it. |  |
+| `modelTotalTokens` | `number` | **Tokens**<br/>Total Tokens |  |
+| `openai_api.profile` | `string` | **Model**<br/>Profile selection | `"custom"` |
+
+### Nebius (`services.nebius.json`)
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `base_url` | `string` | **Base URL**<br/>OpenAI-compatible base URL. Defaults to Nebius Token Factory. |  |
+| `model` | `string` | **Model**<br/>Nebius Token Factory model id (e.g. meta-llama/Llama-3.3-70B-Instruct). Full list: https://tokenfactory.nebius.com/models |  |
+| `modelOutputTokens` | `integer` | **Output Tokens**<br/>Most tokens the model may write in one reply (at least 1,024). Leave it empty to keep the node's default. Reasoning models count their thinking against this limit: set it well above the reply you expect, or they can spend it all thinking and return nothing. It cannot exceed Tokens; a larger value is lowered to it. |  |
+| `modelTotalTokens` | `number` | **Tokens**<br/>Total Tokens |  |
+| `openai_api.profile` | `string` | **Model**<br/>Nebius Token Factory model | `"llama-3-3-70b"` |
+
+## Dependencies
+
+- `openai`
+- `langchain-openai`
+- `langchain-core`
+- `langchain`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/llm_openai_api)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

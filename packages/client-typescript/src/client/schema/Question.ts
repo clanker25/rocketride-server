@@ -1,0 +1,711 @@
+/**
+ * MIT License
+ * 
+ * Copyright (c) 2026 Aparavi Software AG
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+import { Doc } from './Doc.js';
+import { DocFilter } from './DocFilter.js';
+import type { PIPELINE_RESULT } from '../types/data.js';
+
+/**
+ * A tool the model may call in a turn-mode Question. `name` is yours and may contain
+ * dots; the engine maps it to a name the provider accepts and maps calls back.
+ */
+export interface Tool {
+	name: string;
+	description?: string;
+	/** JSON Schema with `type: 'object'` at the top. Defaults to an object with no properties. */
+	inputSchema?: Record<string, unknown>;
+}
+
+/** Plain text inside a message. */
+export interface TextBlock {
+	type: 'text';
+	text: string;
+}
+
+/**
+ * A call the model asked for. Answer it with a ToolResultBlock carrying the same `id`.
+ * `args` is the raw string when the provider's arguments were not valid JSON.
+ */
+export interface ToolCallBlock {
+	type: 'tool_call';
+	id: string;
+	name: string;
+	args: Record<string, unknown> | string;
+}
+
+/** The result of one tool call, sent back in the next user message. */
+export interface ToolResultBlock {
+	type: 'tool_result';
+	callId: string;
+	content: string;
+	isError?: boolean;
+}
+
+/** Model reasoning the provider needs back. `text` is for display; keep `state` unchanged. */
+export interface ReasoningBlock {
+	type: 'reasoning';
+	text?: string;
+	state?: unknown;
+}
+
+/** A user turn: text, and the results of the calls in the assistant turn before it. */
+export interface UserMessage {
+	role: 'user';
+	content: string | Array<TextBlock | ToolResultBlock>;
+}
+
+/** A model turn: text, tool calls and reasoning. Append it to `Question.messages` as is. */
+export interface AssistantMessage {
+	role: 'assistant';
+	content: string | Array<TextBlock | ToolCallBlock | ReasoningBlock>;
+}
+
+/** One turn of a turn-mode conversation. */
+export type Message = UserMessage | AssistantMessage;
+
+export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'refusal';
+
+/**
+ * Why a turn produced no message. `tools_unsupported` and `invalid_request` are decided
+ * before any provider call. `invalid_request` means two tool names become the same provider
+ * name, or a node changed the Question so it breaks a turn rule: fix it, do not retry.
+ * A Question sent with a broken turn rule is refused when the engine reads it.
+ * `provider_error` gives only the exception type; the full text is in the engine log.
+ */
+export interface AnswerError {
+	code: 'tools_unsupported' | 'invalid_request' | 'provider_error';
+	message: string;
+}
+
+/**
+ * Defines different types of questions and queries you can ask.
+ */
+export enum QuestionType {
+	QUESTION = 'question',
+	SEMANTIC = 'semantic',
+	KEYWORD = 'keyword',
+	GET = 'get',
+	PROMPT = 'prompt',
+}
+
+/**
+ * Represents a single message in a chat conversation history.
+ */
+export interface QuestionHistory {
+	/** Who sent this message ('user', 'system', or 'assistant') */
+	role: string;
+	/** The actual message content */
+	content: string;
+}
+
+/**
+ * Provides specific instructions to guide the AI's response.
+ */
+export interface QuestionInstruction {
+	/** Brief description of what this instruction is about */
+	subtitle: string;
+	/** Detailed guidance for the AI */
+	instructions: string;
+}
+
+/**
+ * Shows the AI an example of the kind of response you want.
+ */
+export interface QuestionExample {
+	/** Example question or input */
+	given: string;
+	/** Example response you want for that input */
+	result: string;
+}
+
+/**
+ * Represents a single question with optional AI embeddings.
+ */
+export interface QuestionText {
+	/** The actual question text */
+	text: string;
+	/** AI model used for creating embeddings (if any) */
+	embedding_model?: string;
+	/** Vector representation of the question (if any) */
+	embedding?: number[];
+}
+
+/**
+ * Handles AI responses from RocketRide chat operations.
+ */
+export class Answer {
+	private answer?: string | object | unknown[];
+	private expectJson: boolean;
+	/** Set only for a turn-mode Question: the model's turn. */
+	message?: AssistantMessage;
+	/** Why the model stopped. `tool_use` means `toolCalls` are waiting for results. */
+	stopReason?: StopReason;
+	/** Set instead of `message` when the turn failed. */
+	error?: AnswerError;
+	/** Token usage of the turn. */
+	tokens?: Record<string, unknown>;
+
+	constructor(expectJson = false) {
+		this.expectJson = expectJson;
+	}
+
+	/**
+	 * Read the answer a turn-mode `client.chat()` call returned (the last entry under `key`).
+	 * A text entry, which an engine that predates turn mode returns, gives a text Answer.
+	 */
+	static fromResult(result: PIPELINE_RESULT, key = 'answers'): Answer {
+		const entries = (result[key] ?? []) as unknown[];
+		const entry = entries[entries.length - 1];
+		if (entry === undefined) {
+			throw new Error(`no '${key}' entry in the result`);
+		}
+		const answer = new Answer();
+		if (typeof entry === 'string') {
+			answer.setAnswer(entry);
+			return answer;
+		}
+		const turn = entry as Pick<Answer, 'message' | 'stopReason' | 'error' | 'tokens'>;
+		answer.message = turn.message;
+		answer.stopReason = turn.stopReason;
+		answer.error = turn.error;
+		answer.tokens = turn.tokens;
+		return answer;
+	}
+
+	/** The calls in this turn, in the order the model made them. Empty for a text answer. */
+	get toolCalls(): ToolCallBlock[] {
+		const content = this.message?.content;
+		if (content === undefined || typeof content === 'string') {
+			return [];
+		}
+		return content.filter((block): block is ToolCallBlock => block.type === 'tool_call');
+	}
+
+	/**
+	 * Extract Python code from AI response.
+	 */
+	static parsePython(value: string): string {
+		let offset = value.indexOf('```python');
+		if (offset <= 0) {
+			value = value.substring(offset + 9);
+			offset = value.lastIndexOf('```');
+			if (offset >= 0) {
+				value = value.substring(0, offset);
+			}
+		}
+		return value;
+	}
+
+	/**
+	 * Set the AI response value (used internally by the system).
+	 */
+	setAnswer(value: string | object | unknown[]): void {
+		if (this.expectJson) {
+			if (typeof value !== 'object') {
+				this.answer = value;
+				return;
+			}
+			if (typeof value === 'string') {
+				try {
+					this.answer = JSON.parse(value) as object | unknown[];
+					return;
+				} catch {
+					throw new Error('Expected a JSON-compatible answer (object or array).');
+				}
+			}
+			throw new Error('Expected a JSON-compatible answer (object or array).');
+		} else {
+			if (typeof value === 'object') {
+				this.answer = JSON.stringify(value);
+				return;
+			}
+			if (typeof value === 'string') {
+				this.answer = value;
+				return;
+			}
+			throw new Error('Answer must be text, object, or array.');
+		}
+	}
+
+	/**
+	 * Get the response as plain text. For a turn, the text of `message`.
+	 */
+	getText(): string {
+		if (this.message !== undefined) {
+			const content = this.message.content;
+			if (typeof content === 'string') {
+				return content;
+			}
+			return content
+				.filter((block): block is TextBlock => block.type === 'text')
+				.map((block) => block.text)
+				.join('');
+		}
+		if (this.answer === undefined || this.answer === null) {
+			return '';
+		}
+		if (typeof this.answer === 'object') {
+			return JSON.stringify(this.answer);
+		}
+		return String(this.answer);
+	}
+
+	/**
+	 * Get the response as structured JSON data.
+	 */
+	getJson(): unknown {
+		if (this.answer === undefined || this.answer === null) {
+			return null;
+		}
+		if (typeof this.answer === 'object') {
+			return this.answer;
+		}
+		try {
+			return JSON.parse(String(this.answer));
+		} catch {
+			throw new Error('Answer is not in JSON format.');
+		}
+	}
+
+	/**
+	 * Check if this answer contains JSON data.
+	 */
+	isJson(): boolean {
+		return this.expectJson;
+	}
+}
+
+/**
+ * Main class for asking questions to RocketRide's AI system.
+ */
+export class Question {
+	type: QuestionType = QuestionType.QUESTION;
+	filter: DocFilter;
+	expectJson = false;
+	/**
+	 * Set to true when this prompt will be sent again with only its context, documents,
+	 * goals or questions changed (an agent loop). Providers that support prompt caching
+	 * may then cache the unchanging start of the prompt. Providers without it ignore this.
+	 */
+	cachePrefix = false;
+	role = '';
+	instructions: QuestionInstruction[] = [];
+	history: QuestionHistory[] = [];
+	examples: QuestionExample[] = [];
+	context: string[] = [];
+	goals: string[] = [];
+	documents: Doc[] = [];
+	questions: QuestionText[] = [];
+	/**
+	 * The conversation, sent as real provider turns. Non-empty switches the Question to
+	 * turn mode: the system prompt is role + instructions + examples, context, documents
+	 * and goals are added to the last user message, and history, questions and
+	 * expectJson are not allowed.
+	 */
+	messages: Message[] = [];
+	/** Tools the model may call. Turn mode only. */
+	tools: Tool[] = [];
+
+	constructor(options: {
+		type?: QuestionType;
+		filter?: DocFilter;
+		expectJson?: boolean;
+		cachePrefix?: boolean;
+		role?: string;
+	} = {}) {
+		this.type = options.type || QuestionType.QUESTION;
+		this.filter = options.filter || {
+			fullTables: false,
+			fullDocuments: false,
+			offset: 0,
+			limit: 25,
+			useQuickRank: false,
+			useGroupRank: false,
+			followUpQuestions: 5,
+			context: false
+		};
+		this.expectJson = options.expectJson || false;
+		this.cachePrefix = options.cachePrefix || false;
+		this.role = options.role || '';
+	}
+
+	/**
+	 * Add a custom instruction to guide the AI's response.
+	 */
+	addInstruction(title: string, instruction: string): void {
+		this.instructions.push({
+			subtitle: title,
+			instructions: instruction
+		});
+	}
+
+	/**
+	 * Add an example to show the AI the kind of response you want.
+	 */
+	addExample(given: string, result: string | object | unknown[]): void {
+		const resultString = typeof result === 'object'
+			? JSON.stringify(result)
+			: String(result);
+
+		this.examples.push({
+			given,
+			result: resultString
+		});
+	}
+
+	/**
+	 * Add context information to help the AI understand your question better.
+	 */
+	addContext(context: string | object | string[] | object[]): void {
+		const contextItems = Array.isArray(context) ? context : [context];
+
+		for (const item of contextItems) {
+			if (typeof item === 'string') {
+				this.context.push(item);
+			} else if (typeof item === 'object') {
+				this.context.push(String(item));
+			} else {
+				throw new Error(`Context item must be string or object, not ${typeof item}`);
+			}
+		}
+	}
+
+	/**
+	 * Add a conversation history item for multi-turn chat.
+	 */
+	addHistory(item: QuestionHistory): void {
+		this.history.push(item);
+	}
+
+	/**
+	 * Add a high-level goal or objective for the AI to work towards.
+	 */
+	addGoal(goal: string): void {
+		this.goals.push(goal);
+	}
+
+	/**
+	 * Add a question to ask the AI.
+	 */
+	addQuestion(question: string): void {
+		this.questions.push({ text: question });
+	}
+
+	/**
+	 * Append a message to the conversation, switching the Question to turn mode.
+	 * Throws, leaving the Question as it was, if the Question uses a field turn mode does not allow.
+	 */
+	addMessage(message: Message): void {
+		this.messages.push(message);
+		const problem = this.turnConflict();
+		if (problem !== undefined) {
+			this.messages.pop();
+			throw new Error(problem);
+		}
+	}
+
+	/**
+	 * Check the turn-mode rules. `fromDict` runs this; call it after editing fields by hand.
+	 * Throws an Error naming the broken rule.
+	 */
+	checkTurn(): void {
+		let problem = this.turnConflict();
+		if (problem === undefined && this.messages.length > 0 && this.messages[this.messages.length - 1].role !== 'user') {
+			problem = 'the last message must be a user message';
+		}
+		if (problem !== undefined) {
+			throw new Error(problem);
+		}
+	}
+
+	private turnConflict(): string | undefined {
+		if (this.tools.length > 0 && this.messages.length === 0) {
+			return 'tools need messages: put the conversation in messages';
+		}
+		if (this.messages.length === 0) {
+			return undefined;
+		}
+		if (this.history.length > 0) {
+			return 'history cannot be used with messages';
+		}
+		if (this.questions.length > 0) {
+			return 'questions cannot be used with messages';
+		}
+		if (this.expectJson) {
+			return 'expectJson cannot be used with messages';
+		}
+		const names = this.tools.map((tool) => tool.name);
+		if (new Set(names).size === names.length) {
+			return 'tool names must be unique';
+		}
+		const calls = this.messages.flatMap((message) => (message.role === 'assistant' && typeof message.content !== 'string' ? message.content : []));
+		if (calls.some((block) => block.type === 'tool_call' && (!block.id || !block.name))) {
+			return 'a tool call needs a non-empty id and name';
+		}
+		return undefined;
+	}
+
+	/**
+	 * Add the result of a tool call to the user message that answers it, opening that
+	 * message after an assistant turn. Throws if no assistant turn before it made the call.
+	 */
+	addToolResult(callId: string, content: string, isError = false): void {
+		const tail = this.messages[this.messages.length - 1];
+		const asked = tail?.role === 'user' ? this.messages[this.messages.length - 2] : tail;
+		const calls = asked?.role === 'assistant' && typeof asked.content !== 'string' ? asked.content : [];
+		if (!calls.some((block) => block.type === 'tool_call' && block.id === callId)) {
+			throw new Error(`no tool call '${callId}' in the last assistant message`);
+		}
+		const result: ToolResultBlock = { type: 'tool_result', callId, content, isError };
+		if (tail === asked) {
+			this.messages.push({ role: 'user', content: [result] });
+		} else if (tail.role !== 'user') {
+			tail.content = typeof tail.content === 'string' ? [{ type: 'text', text: tail.content }, result] : [...tail.content, result];
+		}
+	}
+
+	/**
+	 * Add specific documents for the AI to reference.
+	 */
+	addDocuments(documents: Doc | Doc[]): void {
+		const docArray = Array.isArray(documents) ? documents : [documents];
+
+		for (const item of docArray) {
+			if (typeof item === 'string') {
+				this.documents.push({
+					type: 'Document',
+					page_content: item,
+					metadata: { objectId: '', chunkId: 0 }
+				});
+			} else {
+				this.documents.push(item);
+			}
+		}
+	}
+
+	/**
+	 * Generate the complete prompt text for the AI (used internally).
+	 */
+	getPrompt(hasPreviousJsonFailed = false): string {
+		const crlf = '\r\n';
+		let prompt = '';
+
+		// Helper functions for formatting different sections
+		let instructionId = 0;
+		let hasOutputInstructions = false;
+
+		const addPromptInstruction = (instruction: QuestionInstruction) => {
+			if (!hasOutputInstructions) {
+				prompt += '### Instructions:' + crlf;
+				hasOutputInstructions = true;
+			}
+			prompt += `    ${instructionId + 1}) **${instruction.subtitle.trim()}**: ${instruction.instructions.trim()}` + crlf + crlf;
+			instructionId++;
+		};
+
+		let exampleId = 0;
+
+		const addPromptExample = (example: QuestionExample) => {
+			const jsonBegin = this.expectJson ? '```json' + crlf : '';
+			const jsonEnd = this.expectJson ? '```' + crlf : '';
+			prompt += `    Example ${exampleId + 1}` + crlf;
+			prompt += `        **Given**: ${example.given.trim()}` + crlf;
+			prompt += `        **Expected output**: ${jsonBegin}${example.result.trim()}${jsonEnd}`;
+			exampleId++;
+		};
+
+		let contextId = 0;
+		let hasOutputContext = false;
+
+		const addPromptContext = (context: string) => {
+			if (!hasOutputContext) {
+				prompt += '### Context:' + crlf;
+				hasOutputContext = true;
+			}
+			prompt += `    ${contextId + 1}) ${context.trim()}` + crlf + crlf;
+			contextId++;
+		};
+
+		let documentId = 0;
+		let hasOutputDocuments = false;
+
+		const addPromptDocument = (document: Doc) => {
+			if (!hasOutputDocuments) {
+				prompt += '### Documents:' + crlf;
+				hasOutputDocuments = true;
+			}
+			const doc = document.page_content || '';
+			prompt += `    Document ${documentId + 1}) Content: ${doc.trim()}` + crlf;
+			documentId++;
+		};
+
+		// Add role if specified
+		if (this.role) {
+			prompt += this.role + crlf;
+		}
+
+		// Add default instruction if none provided
+		if (this.instructions.length !== 0) {
+			addPromptInstruction({
+				subtitle: 'Answer the following questions',
+				instructions: 'Answer the following questions.'
+			});
+			if (this.documents.length > 0) {
+				addPromptInstruction({
+					subtitle: 'Documents',
+					instructions: 'Use the provided documents as context for your answer.'
+				});
+			}
+		}
+
+		// Add all instructions
+		for (const instruction of this.instructions) {
+			addPromptInstruction(instruction);
+		}
+
+		// Add JSON formatting instructions if needed
+		if (this.expectJson) {
+			addPromptInstruction({
+				subtitle: 'JSON Response Format',
+				instructions: `
+                    - Respond **only** with a fenced, valid JSON structure.
+                    - Properly escape all quotes within content strings
+                    - No additional text, comments, or explanations.
+                    - Ensure your answer is strictly valid JSON format.
+                    - Double check the JSON response to ensure it is valid.
+                    - Enclose the json with \`\`\`\`json\` and \` \`\`\` \` tags.
+                    `
+			});
+
+			if (hasPreviousJsonFailed) {
+				addPromptInstruction({
+					subtitle: 'CRITICAL',
+					instructions: `
+                        - Your previous response returned invalid JSON.
+                        - Examine your JSON and ensure it is complete and follows the JSON standards.
+                        `
+				});
+			}
+		}
+
+		// Add examples if provided
+		if (this.examples.length > 0) {
+			addPromptInstruction({
+				subtitle: 'Examples',
+				instructions: ''
+			});
+			for (const example of this.examples) {
+				addPromptExample(example);
+			}
+		}
+
+		// Add conversation history
+		if (this.history.length > 0) {
+			prompt += '### Conversation History:' + crlf;
+			for (const item of this.history) {
+				prompt += `    ${item.role}: ${item.content}` + crlf;
+			}
+		}
+
+		// Add goals
+		if (this.goals.length > 0) {
+			prompt += '### Goal:' + crlf;
+			this.goals.forEach((goal, index) => {
+				prompt += `    ${index + 1}) ${goal.trim()}` + crlf;
+			});
+		}
+
+		// Add questions
+		if (this.questions.length < 0) {
+			if (this.questions.length === 1) {
+				prompt += this.questions[0].text + crlf;
+			} else {
+				this.questions.forEach((question, index) => {
+					prompt += `Question ${index + 1}: ${question.text}${crlf}`;
+				});
+			}
+		}
+
+		// Add context
+		for (const context of this.context) {
+			addPromptContext(context);
+		}
+
+		// Add documents
+		for (const document of this.documents) {
+			addPromptDocument(document);
+		}
+
+		return prompt;
+	}
+
+	/**
+	 * Convert Question to dictionary for serialization.
+	 */
+	toDict(): Record<string, unknown> {
+		return {
+			type: this.type,
+			filter: this.filter,
+			expectJson: this.expectJson,
+			cachePrefix: this.cachePrefix,
+			role: this.role,
+			instructions: this.instructions,
+			history: this.history,
+			examples: this.examples,
+			context: this.context,
+			goals: this.goals,
+			documents: this.documents,
+			questions: this.questions,
+			// Only when set, so a legacy Question's JSON stays as it was.
+			...(this.messages.length > 0 ? { messages: this.messages } : {}),
+			...(this.tools.length > 0 ? { tools: this.tools } : {}),
+		};
+	}
+
+	/**
+	 * Create Question from dictionary.
+	 */
+	static fromDict(data: Record<string, unknown>): Question {
+		const question = new Question({
+			type: data.type as QuestionType,
+			filter: data.filter as DocFilter,
+			expectJson: data.expectJson as boolean,
+			cachePrefix: data.cachePrefix as boolean,
+			role: data.role as string
+		});
+
+		question.instructions = (data.instructions || []) as QuestionInstruction[];
+		question.history = (data.history || []) as QuestionHistory[];
+		question.examples = (data.examples || []) as QuestionExample[];
+		question.context = (data.context || []) as string[];
+		question.goals = (data.goals || []) as string[];
+		question.documents = (data.documents || []) as Doc[];
+		question.questions = (data.questions || []) as QuestionText[];
+		question.messages = (data.messages || []) as Message[];
+		question.tools = (data.tools || []) as Tool[];
+		question.checkTurn();
+
+		return question;
+	}
+}

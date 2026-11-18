@@ -1,0 +1,13 @@
+# Plugin Bedrock core
+langchain-aws
+
+# LangChain deps
+langchain-core
+langchain
+
+# Version check of langchain-aws
+packaging
+
+# AWS SDK deps
+boto3
+botocore

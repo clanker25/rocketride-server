@@ -1,0 +1,79 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+from typing import Optional
+
+from rocketlib import Entry, IInstanceBase
+from .IGlobal import IGlobal
+
+
+class IInstance(IInstanceBase):
+    IGlobal: IGlobal  # Reference to a global context providing recognizer functionality
+
+    #
+    # Current object context properties
+    #
+    target_object_text: str = ''
+    has_classifications: bool = False
+    _anonymize_error: Optional[BaseException] = None
+
+    def open(self, object: Entry):
+        self.target_object_text = ''
+        self.has_classifications = False
+        self._anonymize_error = None
+
+    def writeText(self, text: str):
+        self.target_object_text = self.target_object_text + text
+        # Prevent further writeText, Anonymization would resume the writeText lane at closing
+        self.preventDefault()
+
+    def writeClassifications(self, classifications: dict, classificationPolicy: dict, classificationRules: dict):
+        self.has_classifications = True
+        try:
+            self.target_object_text = self.IGlobal.recognizer.handleClassifications(
+                classifications, self.target_object_text, classificationPolicy, classificationRules
+            )
+        except Exception as exc:
+            self._anonymize_error = exc
+            raise
+
+    def closing(self):
+        # The engine still calls closing() after writeClassifications raised, and
+        # target_object_text then still holds the unredacted input: emit nothing.
+        if self._anonymize_error is not None:
+            raise RuntimeError('Cannot emit text after failed anonymization') from self._anonymize_error
+        if not self.has_classifications:
+            # No classifications received - anonymize with the configured entity types
+            self.target_object_text = self.IGlobal.recognizer.process(
+                self.target_object_text, self.IGlobal.recognizer.labels
+            )
+
+        # Resume the writeText lane
+        self.instance.writeText(self.target_object_text)
+
+    def close(self):
+        """Call from engLib, process object startup."""
+        # Reset current object context
+        self.current_object = None
+        self.target_object_path = None
+        self.target_object_text = None
