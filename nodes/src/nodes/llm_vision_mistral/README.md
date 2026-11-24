@@ -1,0 +1,102 @@
+# llm_vision_mistral
+
+A RocketRide node that sends images to Mistral AI's vision-capable models and returns text analysis.
+
+## What it does
+
+Accepts either a single image (via the `image` lane) or a stream of image documents (via the `documents` lane, e.g. from a frame grabber), calls the configured Mistral vision model, and returns the model's response as text or as text documents.
+
+Uses the official **mistralai** Python SDK with a custom `httpx` client (120 s timeout, redirects followed) to handle large image payloads. Token counting uses the **mistral-common** tokenizer, with per-model tokenizers loaded strictly; the v3 tokenizer is used as a fallback when no model-specific tokenizer is available.
+
+All requests are sent with **temperature 0.0** for deterministic output. Transient failures (timeouts, connection errors, 5xx responses) are retried up to 3 times with exponential backoff. The base delay scales with model size: 2.0 s for `large` models, 1.5 s for `medium`, 1.0 s for all others. API errors are translated into user-friendly messages covering authentication failures, rate limits, quota exhaustion, content-policy violations, and image-processing errors.
+
+## Lanes
+
+| Lane in     | Lane out    | Description                                                                    |
+| ----------- | ----------- | ------------------------------------------------------------------------------ |
+| `image`     | `text`      | Analyze a single image, receive text                                           |
+| `documents` | `documents` | Analyze image documents, return text analysis with original metadata preserved |
+
+## Profiles
+
+Default: **Mistral Large 3 - Premier Vision (256k tokens)** (`mistral-large-3`).
+
+| Profile | Model | Context tokens |
+| ------- | ----- | -------------- |
+| `mistral-large-3` **(default)** | `mistral-large-2512` | 256,000 |
+| `mistral-medium-3.1` | `mistral-medium-2508` | 128,000 |
+| `mistral-small-3.2` | `mistral-small-2506` | 128,000 |
+| `ministral-14b-3` | `ministral-14b-2512` | 256,000 |
+| `ministral-8b-3` | `ministral-8b-2512` | 256,000 |
+| `ministral-3b-3` | `ministral-3b-2512` | 256,000 |
+
+## Configuration
+
+Choose a profile for the quality, latency, and context window the task needs, then set
+the API key and prompts. The profile supplies the model identifier and token limit.
+
+On the `image` lane, incoming image bytes are buffered across chunks, base64-encoded
+with the source MIME type, and sent to the model with the analysis prompt. The answer
+is written downstream as text.
+
+On the `documents` lane, only documents of type `Image` are processed. Other document
+types and images with empty content are skipped with a warning. The document's
+`page_content` is expected to be base64-encoded PNG. Each answer is emitted as a
+`Text` document that preserves the original metadata (`chunkId`, `time_stamp`, and
+other fields). A failed chunk is logged and skipped without stopping the batch.
+Documents the node does not convert — the original `Image` documents, skipped
+types, and failed chunks — do not flow downstream.
+
+### System Instructions and Analysis Prompt
+
+Use **System Instructions** to define the model's role and behavior. Use **Analysis
+Prompt** to describe what to extract or explain from every image.
+
+## Authentication
+
+Provide a Mistral AI API key in the `apikey` field for the selected profile. The node validates the key format at startup: if you supply an OpenAI key (starting with `sk-`) or a Google AI/Gemini key (starting with `AI`), initialization fails immediately with a specific error message pointing to the wrong provider.
+
+## Notes
+
+### Image input
+
+The node accepts images in the following formats:
+
+- **HTTP(S) URL**: passed to the Mistral API as-is.
+- **Data URI** (`data:image/...` or `data:application/...`): passed as-is.
+- **Local file path**: read from disk, base64-encoded, and sent as a data URI. Files over **10 MB** are rejected. MIME type is inferred from the file extension (`.jpg`/`.jpeg` -> `image/jpeg`, `.png` -> `image/png`, `.gif` -> `image/gif`, `.webp` -> `image/webp`; any unrecognized extension defaults to `image/jpeg`).
+
+### Model sync
+
+Profiles are maintained by the `sync_models` tooling (`llm_vision_mistral` provider, `ROCKETRIDE_MISTRAL_KEY`). Only models Mistral reports as vision-capable (`capabilities.vision`) are added, and each new one is verified with a real image before it appears here.
+
+The sync runs **only** with that key: this node stores Mistral's versioned IDs (`mistral-medium-2508`), which OpenRouter does not list, so a keyless run would mark working profiles deprecated. Without the key the provider is skipped and nothing changes — see [Why some providers need their own key](https://github.com/rocketride-org/rocketride-server/blob/develop/tools/sync_models/README.md#why-some-providers-need-their-own-key).
+
+## Upstream docs
+
+- [Mistral vision documentation](https://docs.mistral.ai/capabilities/vision/)
+
+---
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `image_vision_mistral.profile` | `string` | **Vision Model**<br/>Select the Mistral vision model to use | `"mistral-large-3"` |
+| `model` | `string` | **Model**<br/>Mistral Vision model |  |
+| `modelTotalTokens` | `number` | **Tokens**<br/>Maximum context length in tokens |  |
+| `vision.prompt` | `string` | **Analysis Prompt**<br/>Describe what you want to analyze or extract from the image |  |
+| `vision.systemPrompt` | `string` | **System Instructions**<br/>Define the model's role and behavior for image analysis |  |
+
+## Dependencies
+
+- `mistralai`
+- `mistral-common[sentencepiece]`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/llm_vision_mistral)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->

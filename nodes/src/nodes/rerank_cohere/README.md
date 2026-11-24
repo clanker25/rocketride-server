@@ -1,0 +1,122 @@
+# rerank_cohere
+
+A RocketRide rerank node that reorders retrieved documents by relevance to the query using Cohere's Rerank API.
+
+## About Cohere
+
+Cohere provides the Rerank API used by this node to score a query against a list of document strings. The node sends the configured model, query, document list, and requested result count to that API, then uses the returned relevance scores to construct RocketRide documents.
+
+## What it does
+
+Takes questions that already carry retrieved documents and reorders those documents by how well they match the query. Cohere scores each document, results are sorted by relevance, cut to the top N, and anything below the minimum score threshold is dropped. Put it downstream of a retrieval or vector-store node so it can rerank the documents attached to each question.
+
+Uses the **cohere** Python SDK (`ClientV2`). Supports the `rerank-english-v3.0` (default) and `rerank-v3.5` models, or any custom model name.
+
+Key behavior to know:
+
+- The incoming question is **deep-copied** before processing, so shared question objects in fan-out pipelines are never mutated.
+- The query text is taken from the question's **first** question entry; a missing or whitespace-only query raises an error.
+- Documents whose `page_content` is missing, non-string, or whitespace-only are **silently skipped** (Cohere rejects whitespace-only documents). If no usable document content remains, the node raises an error.
+- Reranked documents preserve the original document `metadata`; the `score` field is replaced with Cohere's `relevance_score`.
+- The `min_score` filter is applied **after** the top-N cut, so you can receive fewer than `top_n` results.
+- Config validation only checks presence and format of required fields. It does **not** make a live API call, so a Cohere outage or rate limit at config time cannot surface a misleading error.
+
+---
+
+## Lanes
+
+| Lane in     | Lane out    | Description                                   |
+|-------------|-------------|-----------------------------------------------|
+| `questions` | `documents` | Reranked documents ordered by relevance score |
+| `questions` | `answers`   | An answer with the reranked documents         |
+
+The `documents` lane is written only when at least one document survives the `min_score` filter. The `answers` lane is **always** written, so downstream nodes receive a result even when every document was filtered out: the answer text is the surviving documents' content joined by blank lines (empty string if none survived).
+
+## Profiles
+
+Default: **Rerank v3.0** (`rerank-english-v3.0`). The **Model** dropdown
+selects a preconfigured profile:
+
+| Profile               | Title       | Model                           |
+|-----------------------|-------------|---------------------------------|
+| `rerank-english-v3.0` **(default)** | Rerank v3.0 | `rerank-english-v3.0` |
+| `rerank-v3.5`         | Rerank v3.5 | `rerank-v3.5`                   |
+| `custom`              | Custom      | _(free-form model name)_        |
+
+All preset profiles expose `top_n`, `min_score`, and the API key; `custom`
+additionally takes a free-form model name.
+
+## Configuration
+
+Select a preset for the supplied model name, or use Custom to enter a model name. Most tuning is the trade-off between how many candidates Cohere considers worth returning and how selective the local score filter should be.
+
+### Model
+
+The named profiles provide their declared model values. Use Custom only when the API key is authorized for the name entered; the node rejects an empty or whitespace-only model before it can make a request.
+
+### Top N and Min Score
+
+`top_n` determines how many results are requested from Cohere before local filtering. It must be an integer of at least 1; whole-number numeric values are accepted, while booleans and fractional values are rejected. Keep the default of 5 for a small candidate set, increase it when later pipeline stages need more alternatives, and lower it to limit the resulting context.
+
+`min_score` is then applied to those returned results and must be between 0.0 and 1.0. The default 0.0 preserves all returned results. Raise it to remove weak matches, but expect fewer than `top_n` documents because the threshold is applied after Cohere's top-N result set has been returned.
+
+---
+
+## Authentication
+
+A Cohere API key is required. Set it in the node's **API Key** field. The node fails to initialize (with a warning) if the key is missing or blank.
+
+The built-in pipeline test cases require the `ROCKETRIDE_RERANK_COHERE_KEY` environment variable to run against the live API.
+
+---
+
+## Notes
+
+### API failures
+
+Cohere API errors are mapped to a custom exception hierarchy whose class names let retry/circuit-breaker heuristics classify them correctly:
+
+| Cohere error           | Raised as                   | Retryable |
+|------------------------|-----------------------------|-----------|
+| `UnauthorizedError`    | `RerankAuthenticationError` | No        |
+| `BadRequestError`      | `RerankBadRequestError`     | No        |
+| `TooManyRequestsError` | `RerankRateLimitError`      | Yes       |
+| `InternalServerError`  | `RerankServerError`         | Yes       |
+| Any other exception    | `RerankServerError`         | Yes       |
+
+### Wiring with a vector store
+
+Reranking sits between the vector store and the LLM. The store enriches the question with its matches and emits it on the `questions` lane; this node reranks those documents and emits the reordered set on `documents`; the prompt and LLM then build their context from the reranked `documents`:
+
+```text
+… → embedding → store ──questions──▶ rerank_cohere ──documents──▶ prompt → llm → response
+```
+
+To maximise quality, **retrieve generously and rerank down**: give the reranker more candidates than the store would return on its own, then keep a small `top_n` here (for example `5`) for the final context. The store's default candidate pool on the data lane is 25, so the widening must go above that. Only the Chroma store (`store_chroma`) exposes a **Top K** field for this; set it comfortably above the default, for example `50`. A value such as `20` is below the default and narrows retrieval instead of widening it. A complete, runnable pipeline is at [`examples/rag-rerank-pipeline.pipe`](../../../../examples/rag-rerank-pipeline.pipe).
+
+## Upstream docs
+
+- [Cohere Rerank API reference](https://docs.cohere.com/reference/rerank)
+
+---
+
+<!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `min_score` | `number` | **Min Score**<br/>Minimum relevance score threshold (0.0-1.0) |  |
+| `model` | `string` | **Model**<br/>Cohere rerank model name | `"rerank-english-v3.0"` |
+| `rerank_cohere.profile` | `string` | **Model**<br/>Rerank model | `"rerank-english-v3.0"` |
+| `top_n` | `number` | **Top N**<br/>Number of top results to return |  |
+
+## Dependencies
+
+- `cohere` `>=6.1.0,<7.0.0`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/rerank_cohere)
+<!-- ROCKETRIDE:GENERATED:PARAMS END -->
